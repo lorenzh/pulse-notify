@@ -10,8 +10,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test",
-    "lint": "biome check .",
+    "test": "node --test --experimental-test-coverage --test-coverage-lines=80 --test-coverage-exclude=\"**/*.test.ts\" --test-coverage-exclude=\"test/**\" --test-coverage-exclude=\"**/test/**\" --test-coverage-exclude=\"dist/**\"",
+    "lint": "biome check . && node tools/sonarjs/node_modules/eslint/bin/eslint.js --config tools/sonarjs/eslint.config.js .",
     "format": "biome check --write .",
     "prepare": "lefthook install || true",
     "check": "npm run lint && npm run typecheck && npm run test",
@@ -25,5 +25,8 @@
   },
   "dependencies": {
     "@lorenzh/pulse-contract": "github:lorenzh/pulse-contract#c78f73bc91e3d417a3da5693c81ba9db80fa1524"
-  }
+  },
+  "workspaces": [
+    "tools/sonarjs"
+  ]
 }

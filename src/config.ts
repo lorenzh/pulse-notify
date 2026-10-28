@@ -12,6 +12,24 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function parseChecks(value: unknown, id: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || !value.every((c) => typeof c === "string")) {
+    throw new ConfigError(`channel "${id}": checks must be an array of strings`);
+  }
+  return value as string[];
+}
+
+function isHttpUrl(url: unknown): url is string {
+  if (typeof url !== "string") return false;
+  try {
+    const protocol = new URL(url).protocol;
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 function parseChannel(raw: unknown, index: number): ChannelConfig {
   const where = `channels[${index}]`;
   if (!isObject(raw)) throw new ConfigError(`${where} must be an object`);
@@ -19,27 +37,12 @@ function parseChannel(raw: unknown, index: number): ChannelConfig {
   if (typeof id !== "string" || id === "") {
     throw new ConfigError(`${where}.id must be a non-empty string`);
   }
-  let checks: string[] | undefined;
-  if (raw.checks !== undefined) {
-    if (!Array.isArray(raw.checks) || !raw.checks.every((c) => typeof c === "string")) {
-      throw new ConfigError(`channel "${id}": checks must be an array of strings`);
-    }
-    checks = raw.checks as string[];
-  }
+  const checks = parseChecks(raw.checks, id);
   const base = checks === undefined ? { id } : { id, checks };
   if (type === "webhook") {
-    const url = raw.url;
-    let valid = false;
-    if (typeof url === "string") {
-      try {
-        const protocol = new URL(url).protocol;
-        valid = protocol === "http:" || protocol === "https:";
-      } catch {
-        valid = false;
-      }
-    }
-    if (!valid) throw new ConfigError(`channel "${id}": webhook needs a valid http(s) url`);
-    return { ...base, type: "webhook", url: url as string };
+    if (!isHttpUrl(raw.url))
+      throw new ConfigError(`channel "${id}": webhook needs a valid http(s) url`);
+    return { ...base, type: "webhook", url: raw.url };
   }
   if (type === "file") {
     if (typeof raw.path !== "string" || raw.path === "") {

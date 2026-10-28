@@ -144,5 +144,6 @@ export function incident(over: Partial<Incident> & { id: number }): Incident {
 }
 
 export function httpCheck(id: string, name: string): Check {
+  // eslint-disable-next-line sonarjs/no-clear-text-protocols -- fixture URL is never requested
   return { id, name, url: "http://example.invalid", intervalMs: 1000 };
 }

@@ -6,6 +6,10 @@ pulse is an uptime monitor with a status page. This repository is its notifier: 
 
 pulse is built by Paragon Factory agents from the issues in [pulse-meta](https://github.com/lorenzh/pulse-meta).
 
+## Checks
+
+`npm run lint` runs Biome and SonarJS via ESLint (cognitive complexity ≤ 15); `npm test` runs the tests and requires line coverage ≥ 80 %.
+
 ## Configuration
 
 `PULSE_NOTIFY_CONFIG` points to a JSON file (required):
