@@ -1,8 +1,2 @@
-pre-commit:
-  commands:
-    biome:
-      glob: "*.{js,ts,json,jsonc}"
-      run: npx --no-install biome check --no-errors-on-unmatched --files-ignore-unknown=true {staged_files}
-    eslint:
-      glob: "*.{js,ts}"
-      run: node tools/sonarjs/node_modules/eslint/bin/eslint.js --config tools/sonarjs/eslint.config.js --no-warn-ignored {staged_files}
+extends:
+  - node_modules/@lorenzh/pulse-config/lefthook.yml

@@ -19,7 +19,7 @@ repository. Node 24+ with native type stripping, ESM, npm, strict TypeScript (`t
 | Tests whose name matches                                      | `node --test --test-name-pattern "<text>"` |
 | Typecheck                                                     | `npm run typecheck`                        |
 | Lint and format check / apply fixes                           | `npm run lint` / `npm run format`          |
-- A change is done when `npm run check` passes; the pre-commit hook runs only Biome. Never run `git commit --no-verify`, and never weaken `biome.json`, `tsconfig.json`, or CI to pass.
+- A change is done when `npm run check` passes; the pre-commit hook runs only Biome. Never run `git commit --no-verify`, and never weaken the shared config (`biome.json`, `tsconfig.json`, CI) to pass.
 
 ## Repository boundaries
 
@@ -101,3 +101,7 @@ repository. Node 24+ with native type stripping, ESM, npm, strict TypeScript (`t
 - Channels are sender functions in `src/channels/` (`webhook.ts`, `file.ts`), created by `createWebhookSender` and `createFileSender` and wired in `src/notifier.ts`. Channel config types are in `src/types.ts`.
 - `src/delivery.ts` takes `send`, `sleep`, and `ledger` as injected dependencies.
 - Tests live in `test/`, not next to the code, with helpers in `test/support.ts` (a local fake API server). They use fake senders or a local server on `127.0.0.1`, never a real webhook or mail server.
+
+## Shared tooling configuration
+
+The shared tooling configuration lives in `lorenzh/pulse-config`. The other pulse repositories use it through `extends` (Biome, TypeScript, Lefthook), a one-line ESLint config and `uses:` (CI). A rule change is made in `pulse-config` and reaches a target when its pin is updated. "Never weaken `biome.json`, `tsconfig.json` or CI" refers to the shared config.

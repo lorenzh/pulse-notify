@@ -14,18 +14,4 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: npm
-      - name: npm ci
-        run: npm ci
-      - name: Lint
-        run: npm run lint
-      - name: Typecheck
-        run: npm run typecheck
-      - name: Test
-        run: npm run test
+    uses: lorenzh/pulse-config/.github/workflows/check.yml@a3432e0451bb24397e77e48a5ee2e9d46913bd05

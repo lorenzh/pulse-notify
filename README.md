@@ -99,3 +99,7 @@ npm run format  # Biome: apply formatting and safe lint fixes
 `npm ci` installs a Lefthook pre-commit hook that runs `biome check` on the staged files and rejects the commit if they are badly formatted or fail lint. Run `npm run format` to fix them.
 
 Licensed under the MIT licence, see [LICENSE](LICENSE).
+
+## Shared tooling configuration
+
+The shared tooling configuration lives in `lorenzh/pulse-config`. The other pulse repositories use it through `extends` (Biome, TypeScript, Lefthook), a one-line ESLint config and `uses:` (CI). A rule change is made in `pulse-config` and reaches a target when its pin is updated. "Never weaken `biome.json`, `tsconfig.json` or CI" refers to the shared config.
