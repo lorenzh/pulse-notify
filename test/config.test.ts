@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -58,6 +58,7 @@ test("loadConfigFile reports unreadable and malformed files", () => {
   const good = join(dir, "good.json");
   writeFileSync(good, JSON.stringify({ channels: [file] }));
   assert.equal(loadConfigFile(good).channels[0]?.id, "f");
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("loadSettings applies defaults and validates", () => {

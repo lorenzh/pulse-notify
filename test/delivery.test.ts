@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { ChannelDelivery, MAX_ATTEMPTS } from "../src/delivery.ts";
 import { Ledger } from "../src/ledger.ts";
 import type { Notification } from "../src/types.ts";
@@ -21,8 +21,15 @@ function note(key: string): Notification {
   };
 }
 
+const dirs: string[] = [];
+after(() => {
+  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+});
+
 function setup(send: (n: Notification) => Promise<void>) {
-  const ledger = new Ledger(join(mkdtempSync(join(tmpdir(), "notify-del-")), "s.json"));
+  const dir = mkdtempSync(join(tmpdir(), "notify-del-"));
+  dirs.push(dir);
+  const ledger = new Ledger(join(dir, "s.json"));
   const logger = spyLogger();
   const sleeps: number[] = [];
   const delivery = new ChannelDelivery({
