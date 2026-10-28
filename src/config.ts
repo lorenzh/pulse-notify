@@ -26,6 +26,7 @@ function isHttpUrl(url: unknown): url is string {
     const protocol = new URL(url).protocol;
     return protocol === "http:" || protocol === "https:";
   } catch {
+    // An unparseable URL is simply not an HTTP URL.
     return false;
   }
 }

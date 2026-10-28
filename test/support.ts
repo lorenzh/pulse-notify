@@ -89,7 +89,7 @@ export async function startFakeApi(): Promise<FakeApi> {
 export interface ReceivedRequest {
   method: string | undefined;
   headers: IncomingMessage["headers"];
-  body: any;
+  body: unknown;
   status: number;
 }
 
@@ -122,6 +122,7 @@ export async function startReceiver(): Promise<Receiver> {
       try {
         body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       } catch {
+        // Non-JSON payloads are recorded with a null body.
         body = null;
       }
       receiver.requests.push({ method: req.method, headers: req.headers, body, status });
@@ -146,4 +147,12 @@ export function incident(over: Partial<Incident> & { id: number }): Incident {
 export function httpCheck(id: string, name: string): Check {
   // eslint-disable-next-line sonarjs/no-clear-text-protocols -- fixture URL is never requested
   return { id, name, url: "http://example.invalid", intervalMs: 1000 };
+}
+
+/** Narrows a received body to a JSON object, failing the test otherwise. */
+export function asRecord(body: unknown): Record<string, unknown> {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new Error("expected a JSON object body");
+  }
+  return body as Record<string, unknown>;
 }

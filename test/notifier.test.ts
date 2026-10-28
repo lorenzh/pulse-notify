@@ -7,6 +7,7 @@ import { Ledger } from "../src/ledger.ts";
 import { Notifier } from "../src/notifier.ts";
 import type { ChannelConfig, Schedule, Sleep } from "../src/types.ts";
 import {
+  asRecord,
   type FakeApi,
   httpCheck,
   incident,
@@ -58,13 +59,14 @@ function make(opts: { channels?: ChannelConfig[]; sleep?: Sleep; schedule?: Sche
   });
 }
 
-function lines(): any[] {
+function lines(): Record<string, unknown>[] {
   try {
     return readFileSync(filePath(), "utf8")
       .split("\n")
       .filter(Boolean)
-      .map((l) => JSON.parse(l));
+      .map((l) => asRecord(JSON.parse(l)));
   } catch {
+    // No ledger file yet means nothing has been delivered.
     return [];
   }
 }
@@ -115,7 +117,7 @@ test("opened and resolved are delivered once each despite an outage; restart sen
   await n.tick();
   await n.idle();
   assert.equal(rx.accepted().length, 2);
-  const resolved = rx.accepted()[1]?.body;
+  const resolved = asRecord(rx.accepted()[1]?.body);
   assert.equal(resolved.key, "1:resolved");
   assert.equal(resolved.event, "resolved");
   assert.equal(resolved.time, "2026-01-01T12:05:00.000Z");
@@ -192,7 +194,7 @@ test("a resolved event is sent even when opened failed", async () => {
   await n.tick();
   await n.idle();
   assert.deepEqual(
-    rx.accepted().map((r) => r.body.key),
+    rx.accepted().map((r) => asRecord(r.body).key),
     ["1:resolved"],
   );
 });
@@ -203,7 +205,7 @@ test("an incident opened and resolved between polls yields opened then resolved"
   await n.tick();
   await n.idle();
   assert.deepEqual(
-    rx.accepted().map((r) => r.body.key),
+    rx.accepted().map((r) => asRecord(r.body).key),
     ["1:opened", "1:resolved"],
   );
 });
@@ -227,8 +229,8 @@ test("an empty checks list means all checks; unknown check name falls back to th
   api.incidents = [incident({ id: 1, checkId: "ghost", reason: null })];
   await n.tick();
   await n.idle();
-  assert.equal(rx.accepted()[0]?.body.checkName, "ghost");
-  assert.equal(rx.accepted()[0]?.body.reason, null);
+  assert.equal(asRecord(rx.accepted()[0]?.body).checkName, "ghost");
+  assert.equal(asRecord(rx.accepted()[0]?.body).reason, null);
 });
 
 test("first start with existing incidents sends nothing; later incidents are new", async () => {
@@ -248,7 +250,7 @@ test("first start with existing incidents sends nothing; later incidents are new
   await n.tick();
   await n.idle();
   assert.deepEqual(
-    rx.accepted().map((r) => r.body.key),
+    rx.accepted().map((r) => asRecord(r.body).key),
     ["1:resolved", "3:opened"],
   );
 });
