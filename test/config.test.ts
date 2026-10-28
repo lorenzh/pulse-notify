@@ -26,6 +26,7 @@ const invalid: [string, unknown, RegExp][] = [
   ["webhook without url", { channels: [{ id: "x", type: "webhook" }] }, /valid http\(s\) url/],
   [
     "webhook bad scheme",
+    // eslint-disable-next-line sonarjs/no-clear-text-protocols -- test needs a non-http scheme
     { channels: [{ id: "x", type: "webhook", url: "ftp://a/b" }] },
     /valid http\(s\) url/,
   ],
