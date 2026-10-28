@@ -91,3 +91,5 @@ npm run format  # Biome: apply formatting and safe lint fixes
 ```
 
 `npm ci` installs a Lefthook pre-commit hook that runs `biome check` on the staged files and rejects the commit if they are badly formatted or fail lint. Run `npm run format` to fix them.
+
+Licensed under the MIT licence, see [LICENSE](LICENSE).

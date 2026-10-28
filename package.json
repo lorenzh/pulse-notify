@@ -1,6 +1,7 @@
 {
   "name": "@lorenzh/pulse-notify",
   "version": "0.0.0",
+  "license": "MIT",
   "description": "Sends incident notifications (opened, resolved) to configured channels.",
   "type": "module",
   "private": true,
