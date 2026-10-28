@@ -1,0 +1,24 @@
+{
+  "name": "@lorenzh/pulse-notify",
+  "version": "0.0.0",
+  "description": "Sends incident notifications (opened, resolved) to configured channels.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "prepare": "lefthook install || true",
+    "check": "npm run lint && npm run typecheck && npm run test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.3",
+    "@types/node": "^26.6.5",
+    "lefthook": "2.2.2",
+    "typescript": "^7.0.2"
+  }
+}
