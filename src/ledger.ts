@@ -11,7 +11,8 @@ import { dirname } from "node:path";
 
 import type { Notification } from "./types.ts";
 
-export type LedgerStatus = "seeded" | "pending" | "delivered" | "failed";
+/** `dropped`: a reminder that was not sent because its incident resolved first. */
+export type LedgerStatus = "seeded" | "pending" | "delivered" | "failed" | "dropped";
 
 interface LedgerData {
   version: 1;
@@ -25,6 +26,19 @@ function isLedgerData(value: unknown): value is LedgerData {
   if (typeof value !== "object" || value === null) return false;
   const { version, channels } = value as { version?: unknown; channels?: unknown };
   return version === 1 && typeof channels === "object" && channels !== null;
+}
+
+const REMINDER_KEY = /^(\d+):reminder:(\d+)$/;
+
+/** Removes the settled reminder keys of the same incident that are older than `key`. */
+function pruneReminders(entries: Record<string, LedgerStatus>, key: string): void {
+  const latest = REMINDER_KEY.exec(key);
+  if (!latest) return;
+  for (const other of Object.keys(entries)) {
+    const match = REMINDER_KEY.exec(other);
+    if (!match || match[1] !== latest[1]) continue;
+    if (Number(match[2]) < Number(latest[2]) && entries[other] !== "pending") delete entries[other];
+  }
 }
 
 export interface PendingEntry {
@@ -111,6 +125,7 @@ export class Ledger {
     if (this.has(channelId, key)) return false;
     const next = structuredClone(this.#data);
     const entries = next.channels[channelId] ?? {};
+    pruneReminders(entries, key);
     entries[key] = "pending";
     next.channels[channelId] = entries;
     next.payloads ??= {};
@@ -121,7 +136,7 @@ export class Ledger {
     return true;
   }
 
-  settle(channelId: string, key: string, status: "delivered" | "failed"): void {
+  settle(channelId: string, key: string, status: "delivered" | "failed" | "dropped"): void {
     if (this.status(channelId, key) !== "pending") {
       throw new Error(`cannot settle ${channelId}/${key}: not pending`);
     }

@@ -116,6 +116,7 @@ test("opened and resolved are delivered once each despite an outage; restart sen
     reason: "HTTP 503",
     time: "2026-01-01T12:00:00.000Z",
     timeMs: Date.UTC(2026, 0, 1, 12, 0, 0),
+    openedMs: Date.UTC(2026, 0, 1, 12, 0, 0),
   };
   assert.deepEqual(rx.accepted()[0]?.body, expectedOpened);
   assert.equal(rx.accepted()[0]?.headers["idempotency-key"], "1:opened");
@@ -346,6 +347,7 @@ test("restart resends a pending notification from the ledger once", async () => 
     reason: "HTTP 503",
     time: "2026-01-01T12:00:00.000Z",
     timeMs: Date.UTC(2026, 0, 1, 12, 0, 0),
+    openedMs: Date.UTC(2026, 0, 1, 12, 0, 0),
   };
   const ledger = new Ledger(statePath());
   ledger.seed("hook", []);

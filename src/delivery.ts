@@ -21,6 +21,8 @@ export interface ChannelDeliveryOptions {
   logger: Logger;
   /** Called when a notification leaves the worker, whatever the outcome. */
   release?: (key: string) => void;
+  /** True when a queued notification is out of date and must not be sent (a late reminder). */
+  isStale?: (notification: Notification) => boolean;
   /** Called once per event that ended as delivered or failed. */
   onOutcome?: (outcome: "delivered" | "failed") => void;
 }
@@ -28,6 +30,7 @@ export interface ChannelDeliveryOptions {
 type Outcome =
   | { kind: "delivered"; attempts: number }
   | { kind: "failed"; attempts: number; error: unknown }
+  | { kind: "dropped" }
   | { kind: "stopped" };
 
 /** Delay before retry `n` (1, 2, ...): `min(initial * 2^(n-1), max)`. */
@@ -120,6 +123,7 @@ export class ChannelDelivery {
     const limit = this.#opts.retryAttempts ?? DEFAULT_RETRY_ATTEMPTS;
     for (let attempt = 1; ; attempt++) {
       if (this.#stopped) return { kind: "stopped" };
+      if (this.#opts.isStale?.(notification)) return { kind: "dropped" };
       try {
         await send(notification, this.#abort.signal);
         return { kind: "delivered", attempts: attempt };
@@ -151,6 +155,10 @@ export class ChannelDelivery {
         key: notification.key,
         ...errorFields(err),
       });
+      return;
+    }
+    if (outcome.kind === "dropped") {
+      logger.log("info", "stale reminder dropped", { channel: channelId, key: notification.key });
       return;
     }
     this.#opts.onOutcome?.(outcome.kind);

@@ -51,21 +51,26 @@ Top level:
 
 Every channel:
 
-| Key      | Required | Meaning                                                                                          |
-| -------- | -------- | ------------------------------------------------------------------------------------------------ |
-| `id`     | yes      | Non-empty string, unique in the file. The delivery ledger is keyed by it.                        |
-| `type`   | yes      | `webhook` or `file`                                                                              |
-| `checks` | no       | Array of check ids. Absent or empty means all checks. Unknown ids are allowed and match nothing. |
+| Key                  | Required | Meaning                                                                                                       |
+| -------------------- | -------- | ------------------------------------------------------------------------------------------------------------- |
+| `id`                 | yes      | Non-empty string, unique in the file. The delivery ledger is keyed by it.                                     |
+| `type`               | yes      | `webhook`, `file`, `slack`, `teams` or `email`                                                                |
+| `checks`             | no       | Check ids or `*` globs. Absent or empty means all checks. Unknown ids are allowed and match nothing.          |
+| `excludeChecks`      | no       | Check ids or `*` globs to skip. Wins over `checks`. See [routing](channels.md#routing).                       |
+| `remindEverySeconds` | no       | Integer of at least 60. Sends a `reminder` while an incident is open. See [reminders](channels.md#reminders). |
 
 Per type:
 
-| Type      | Key    | Required | Meaning                                               |
-| --------- | ------ | -------- | ----------------------------------------------------- |
-| `webhook` | `url`  | yes      | A valid `http:` or `https:` URL                       |
-| `file`    | `path` | yes      | Non-empty file path. The parent directory is created. |
+| Type             | Key                        | Required | Meaning                                                                                                                                                |
+| ---------------- | -------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `webhook`        | `url`                      | yes      | A valid `http:` or `https:` URL. `http:` to a remote host logs a warning.                                                                              |
+| `webhook`        | `secretEnv` / `secretFile` | no       | Signing secret, see [webhook.md](channels/webhook.md#signing)                                                                                          |
+| `file`           | `path`                     | yes      | Non-empty file path. The parent directory is created.                                                                                                  |
+| `slack`, `teams` | `urlEnv` / `urlFile`       | one of   | Where the `https:` webhook URL is read from; `statusUrl`, `hideReason` are optional. See [slack.md](channels/slack.md), [teams.md](channels/teams.md). |
+| `email`          | `smtp`, `from`, `to`       | yes      | See [email.md](channels/email.md).`subjectPrefix`, `statusUrl`, `hideReason` are optional.                                                             |
 
 Unknown keys are rejected at startup, for example `notify.json: unknown key "check" in channels[0]`. Check the spelling of `checks`. Details of each channel are in [channels.md](channels.md).
 
-Do not put secrets in a webhook URL if you share the config file or its logs. pulse-notify does not log the URL, but your config file holds it in clear text.
+Secrets and credential URLs (Slack, Teams, SMTP password, webhook signing secret) are read from environment variables or files, see [secrets](channels.md#secrets). Relative secret file paths are relative to the working directory. Do not put secrets in a webhook `url`: the config file holds it in clear text. pulse-notify does not log URLs.
 
 An invalid config stops startup with `pulse-notify: <message>` and exit code 2. The messages are listed in [troubleshooting.md](troubleshooting.md).

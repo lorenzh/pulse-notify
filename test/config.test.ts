@@ -22,7 +22,7 @@ const invalid: [string, unknown, RegExp][] = [
   ["channel not object", { channels: ["x"] }, /must be an object/],
   ["missing id", { channels: [{ type: "file", path: "p" }] }, /id/],
   ["duplicate id", { channels: [file, file] }, /duplicate channel id "f"/],
-  ["unknown type", { channels: [{ id: "x", type: "email" }] }, /unknown type "email"/],
+  ["unknown type", { channels: [{ id: "x", type: "sms" }] }, /unknown type "sms"/],
   ["webhook without url", { channels: [{ id: "x", type: "webhook" }] }, /valid http\(s\) url/],
   [
     "webhook bad scheme",
@@ -141,4 +141,136 @@ test("loadSettings parses the retry schedule and validates it", () => {
       }),
     /at least PULSE_NOTIFY_RETRY_DELAY_MS/,
   );
+});
+
+const slack = { id: "s", type: "slack", urlEnv: "SLACK_URL" };
+const env = { SLACK_URL: "https://hooks.example.com/T0/secret", PW: "pw-1", SIGN: "key-1" };
+const source = {
+  env,
+  readFile: (path: string): string => {
+    if (path === "/run/url") return "https://hooks.example.com/from-file\n";
+    if (path === "/run/empty") return "\n";
+    throw new Error("ENOENT");
+  },
+};
+const email = {
+  id: "m",
+  type: "email",
+  smtp: { host: "smtp.example.com", port: 587, username: "u", passwordEnv: "PW" },
+  from: "pulse@example.com",
+  to: ["ops@example.com"],
+};
+
+test("new channel types parse and read their secrets from env or file", () => {
+  const config = parseConfig(
+    {
+      channels: [
+        { ...slack, statusUrl: "https://status.example.com", hideReason: true },
+        { id: "t", type: "teams", urlFile: "/run/url", remindEverySeconds: 60 },
+        email,
+        { ...hook, secretEnv: "SIGN", excludeChecks: ["x*"] },
+      ],
+    },
+    "cfg.json",
+    source,
+  );
+  const [s, t, m, w] = config.channels;
+  assert.equal(s?.type === "slack" && s.url, env.SLACK_URL);
+  assert.equal(t?.type === "teams" && t.url, "https://hooks.example.com/from-file");
+  assert.equal(t?.remindEverySeconds, 60);
+  assert.equal(m?.type === "email" && m.smtp.tls, "starttls");
+  assert.equal(m?.type === "email" && m.smtp.password, "pw-1");
+  assert.equal(w?.type === "webhook" && w.secret, "key-1");
+  assert.deepEqual(w?.excludeChecks, ["x*"]);
+});
+
+test("old webhook and file configs parse as before", () => {
+  const config = parseConfig({ channels: [hook, file] }, "cfg.json", source);
+  assert.deepEqual(config.channels, [hook, file]);
+});
+
+test("secret errors name the channel and key, never the value", () => {
+  const cases: [unknown, RegExp][] = [
+    [{ channels: [{ ...slack, urlEnv: "NOPE" }] }, /channel "s": urlEnv: NOPE is missing or empty/],
+    [
+      { channels: [{ id: "s", type: "slack", urlFile: "/run/missing" }] },
+      /channel "s": urlFile: cannot read file/,
+    ],
+    [
+      { channels: [{ id: "s", type: "slack", urlFile: "/run/empty" }] },
+      /urlFile: \/run\/empty is missing or empty/,
+    ],
+    [{ channels: [{ id: "s", type: "slack" }] }, /urlEnv or urlFile is required/],
+    [{ channels: [{ ...slack, urlFile: "/run/url" }] }, /only one of urlEnv and urlFile/],
+    [{ channels: [{ ...hook, secretEnv: "NOPE" }] }, /channel "h": secretEnv: NOPE is missing/],
+    [{ channels: [{ ...email, smtp: { ...email.smtp, passwordEnv: "NOPE" } }] }, /passwordEnv/],
+  ];
+  for (const [raw, message] of cases) {
+    assert.throws(() => parseConfig(raw, "cfg.json", source), message);
+  }
+  assert.throws(
+    () =>
+      parseConfig({ channels: [{ ...slack }] }, "cfg.json", source) &&
+      parseConfig({ channels: [{ ...slack, url: env.SLACK_URL }] }, "cfg.json", source),
+    /unknown key "url"/,
+  );
+});
+
+test("slack and teams need https, except on loopback", () => {
+  const withUrl = (url: string) => ({
+    channels: [{ id: "s", type: "slack", urlEnv: "U" }],
+    url,
+  });
+  const run = (url: string) =>
+    parseConfig({ channels: withUrl(url).channels }, "cfg.json", {
+      env: { U: url },
+      readFile: () => "",
+    });
+  assert.throws(() => run("http://hooks.example.com/x"), /urlEnv must hold an https url/);
+  assert.throws(() => run("not a url"), /does not hold a valid url/);
+  assert.doesNotThrow(() => run("https://hooks.example.com/x"));
+  assert.doesNotThrow(() => run("http://127.0.0.1:9/x"));
+});
+
+test("remindEverySeconds, statusUrl, hideReason and addresses are validated", () => {
+  const bad: [unknown, RegExp][] = [
+    [{ ...file, remindEverySeconds: 59 }, /remindEverySeconds/],
+    [{ ...file, remindEverySeconds: 90.5 }, /remindEverySeconds/],
+    [{ ...file, remindEverySeconds: "60" }, /remindEverySeconds/],
+    [{ ...slack, statusUrl: "mailto:ops@example.com" }, /statusUrl/],
+    [{ ...slack, hideReason: "yes" }, /hideReason/],
+    [{ ...hook, hideReason: true }, /unknown key "hideReason"/],
+    [{ ...hook, statusUrl: "https://x.example" }, /unknown key "statusUrl"/],
+    [{ ...file, excludeChecks: "a" }, /excludeChecks must be an array/],
+    [{ ...email, from: "a@b.c\r\nBcc: x@y.z" }, /from must be a single-line/],
+    [{ ...email, to: [] }, /non-empty array/],
+    [{ ...email, to: ["ok@example.com\nBcc: x@y.z"] }, /to must be a single-line/],
+    [{ ...email, to: ["not an address"] }, /email address/],
+    [{ ...email, subjectPrefix: "a\nb" }, /subjectPrefix/],
+    [{ ...email, smtp: { ...email.smtp, port: 0 } }, /smtp.port/],
+    [{ ...email, smtp: { ...email.smtp, tls: "maybe" } }, /smtp.tls/],
+    [{ ...email, smtp: { ...email.smtp, extra: 1 } }, /unknown key "extra"/],
+    [{ ...email, smtp: { ...email.smtp, tls: "none" } }, /refused with tls "none"/],
+    [{ ...email, smtp: { host: "h", port: 25, passwordEnv: "PW" } }, /needs a username/],
+  ];
+  for (const [channel, message] of bad) {
+    assert.throws(() => parseConfig({ channels: [channel] }, "cfg.json", source), message);
+  }
+});
+
+test("smtp without login and tls none on loopback are allowed", () => {
+  const config = parseConfig(
+    {
+      channels: [
+        {
+          ...email,
+          smtp: { host: "127.0.0.1", port: 25, tls: "none", username: "u", passwordEnv: "PW" },
+        },
+        { ...email, id: "n", smtp: { host: "smtp.example.com", port: 25 } },
+      ],
+    },
+    "cfg.json",
+    source,
+  );
+  assert.equal(config.channels.length, 2);
 });

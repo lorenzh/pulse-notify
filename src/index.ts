@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { ConfigError, loadConfigFile, loadSettings } from "./config.ts";
 import { closeHealthServer, createHealthServer } from "./health.ts";
@@ -96,7 +97,10 @@ export function main(
   signals.on("SIGTERM", shutdown);
 
   const settings = loadSettings(env);
-  const config = loadConfigFile(settings.configPath);
+  const config = loadConfigFile(settings.configPath, {
+    env,
+    readFile: (path) => readFileSync(path, "utf8"),
+  });
   const logger = createLogger(deps.write, Date.now, settings.logLevel);
   logRef.logger = logger;
   const ledger = openLedger(settings.statePath);
