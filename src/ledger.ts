@@ -102,6 +102,11 @@ export class Ledger {
     return entries && Object.hasOwn(entries, key) ? entries[key] : undefined;
   }
 
+  /** Keys of the channel with their status. */
+  entries(channelId: string): [string, LedgerStatus][] {
+    return Object.entries(this.#data.channels[channelId] ?? {});
+  }
+
   has(channelId: string, key: string): boolean {
     return this.status(channelId, key) !== undefined;
   }

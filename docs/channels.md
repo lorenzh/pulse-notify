@@ -71,7 +71,7 @@ Set `remindEverySeconds` (an integer of at least 60) on a channel to get a "stil
 
 - The event is `reminder`, the key is `<incidentId>:reminder:<n>` with `n = floor((now - openedAt) / interval)`. The first reminder comes one interval after the incident opened.
 - `time` and `timeMs` are the reminder time. `openedMs` gives the incident's start, so the age is `timeMs - openedMs`. Chat and email messages show it as `Open for`.
-- After a restart nothing is repeated, because `n` is derived from the clock and the ledger holds the key.
+- After a restart, a pending reminder is held until the first successful poll, then dropped if its incident resolved or a newer reminder exists. Nothing is repeated, because `n` is derived from the clock and the ledger holds the key.
 - After an outage of pulse-notify or the channel only the latest due reminder is sent, not one for every missed interval.
 - A new channel starts with the current `n`: reminders for incidents that are already open begin at the next interval.
 - A resolved incident gets no reminder. A reminder that is still queued or retrying when its incident resolves is dropped (the ledger marks it `dropped`), so `resolved` never follows a late reminder.

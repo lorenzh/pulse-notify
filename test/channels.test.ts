@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
@@ -37,6 +37,7 @@ beforeEach(async () => {
   logger = spyLogger();
   mails = [];
   failMail = undefined;
+  mailCalls = 0;
   mailHook = undefined;
   api.checks = [httpCheck("example", "Example site"), httpCheck("other", "Other")];
 });
@@ -48,8 +49,10 @@ afterEach(async () => {
 });
 
 let mailHook: (() => void) | undefined;
+let mailCalls = 0;
 
 const sendMail: SendMail = async (smtp, message) => {
+  mailCalls++;
   mailHook?.();
   if (failMail) throw failMail;
   mails.push({ smtp, message });
@@ -250,7 +253,10 @@ test("an SMTP error that never clears ends as failed", async () => {
   );
   failMail = new Error("SMTP RCPT TO failed: 550 no");
   await openIncident(n);
+  assert.ok(mailCalls > 0);
   assert.ok(logger.entries.some((e) => e.msg === "notification delivery failed"));
+  const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+  assert.equal(state.channels.m["1:opened"], "failed");
 });
 
 test("routing: checks pattern and excludeChecks apply to every channel type", async () => {
@@ -294,5 +300,9 @@ test("no secret, URL or password appears in logs or metrics", async () => {
   failMail = new Error("SMTP boom");
   await openIncident(n);
   const dump = JSON.stringify(logger.entries) + metrics.render();
+  assert.ok(mailCalls > 0);
+  assert.ok(logger.entries.some((e) => e.msg === "notification delivery failed"));
+  const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+  assert.equal(state.channels.m["1:opened"], "failed");
   for (const secret of secrets) assert.equal(dump.includes(secret), false, secret);
 });

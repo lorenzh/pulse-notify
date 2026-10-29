@@ -159,7 +159,8 @@ class Session {
     if (line !== undefined) this.#socket.write(`${line}\r\n`);
     const reply = await guarded(this.#read(), guard, what);
     if (!accept(reply.code)) {
-      const text = (reply.lines[0] ?? "").slice(0, 200);
+      // AUTH replies can echo credentials, so only the code is reported.
+      const text = what === "AUTH" ? "" : (reply.lines[0] ?? "").slice(0, 200);
       throw new SmtpError(`SMTP ${what} failed: ${reply.code} ${text}`.trim());
     }
     return reply;

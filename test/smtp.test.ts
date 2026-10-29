@@ -194,3 +194,23 @@ test("a line break in an address is rejected", async () => {
     /line break/,
   );
 });
+
+test("an AUTH failure reports the code only, not the reply text", async () => {
+  const credentials = Buffer.from("\0user\0pw", "utf8").toString("base64");
+  const stub = await startSmtpStub({
+    auth: ["PLAIN"],
+    replies: { "AUTH PLAIN": `535 bad ${credentials}\r\n` },
+  });
+  try {
+    await assert.rejects(
+      sendMail(options(stub.port, { username: "user", password: "pw" }), message),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.equal(err.message, "SMTP AUTH failed: 535");
+        return true;
+      },
+    );
+  } finally {
+    await stub.close();
+  }
+});

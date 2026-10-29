@@ -6,7 +6,7 @@ import { afterEach, beforeEach, test } from "node:test";
 import { detectEvents, seedKeys } from "../src/detector.ts";
 import { Ledger } from "../src/ledger.ts";
 import { Notifier } from "../src/notifier.ts";
-import type { Sleep } from "../src/types.ts";
+import type { Notification, Sleep } from "../src/types.ts";
 import {
   asRecord,
   type FakeApi,
@@ -194,4 +194,72 @@ test("detector: reminders are off without a plan and wait for opened", () => {
   );
   assert.deepEqual(seedKeys([open], plan), ["7:opened", "7:reminder:2"]);
   assert.deepEqual(seedKeys([open]), ["7:opened"]);
+});
+
+function reminder(n: number): Notification {
+  return {
+    key: `1:reminder:${n}`,
+    event: "reminder",
+    incidentId: 1,
+    checkId: "example",
+    checkName: "Example site",
+    reason: null,
+    time: new Date(OPENED).toISOString(),
+    timeMs: OPENED,
+    openedMs: OPENED,
+  };
+}
+
+test("a reminder pending at restart of a resolved incident is dropped, not sent", async () => {
+  const ledger = new Ledger(join(dir, "state.json"));
+  ledger.seed("hook", ["1:opened"]);
+  ledger.claim("hook", "1:reminder:1", reminder(1));
+  api.incidents = [incident({ id: 1, openedAt: OPENED, resolvedAt: OPENED + MINUTE })];
+  clock = OPENED + 10 * MINUTE;
+  const n = make();
+  n.start();
+  await n.tick();
+  await n.idle();
+  await n.stop();
+  assert.deepEqual(keys(), ["1:resolved"]);
+  const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+  assert.equal(state.channels.hook["1:reminder:1"], "dropped");
+});
+
+test("a held reminder of an open incident is sent after the first poll", async () => {
+  const ledger = new Ledger(join(dir, "state.json"));
+  ledger.seed("hook", ["1:opened"]);
+  ledger.claim("hook", "1:reminder:1", reminder(1));
+  api.incidents = [incident({ id: 1, openedAt: OPENED })];
+  clock = OPENED + 10 * MINUTE;
+  const n = make();
+  n.start();
+  await n.idle();
+  assert.deepEqual(keys(), []);
+  await n.tick();
+  await n.idle();
+  await n.stop();
+  assert.deepEqual(keys(), ["1:reminder:1"]);
+});
+
+test("after failed intervals only the latest reminder is delivered", async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const n = make(async () => gate);
+  await poll(n);
+  api.incidents = [incident({ id: 1, openedAt: OPENED })];
+  await poll(n);
+  rx.up = false;
+  for (let i = 1; i <= 4; i++) {
+    clock = OPENED + i * 10 * MINUTE;
+    await n.tick();
+    if (i === 1) await logger.waitFor((e) => e.msg === "delivery attempt failed");
+  }
+  rx.up = true;
+  release();
+  await n.idle();
+  await n.stop();
+  assert.deepEqual(keys(), ["1:opened", "1:reminder:4"]);
 });
