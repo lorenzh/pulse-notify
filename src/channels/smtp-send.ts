@@ -21,6 +21,26 @@ export class SmtpError extends Error {
   }
 }
 
+/** A socket that opens no connection once cancelled, even if nodemailer connects it late. */
+class CancellableSocket extends Socket {
+  isCancelled = false;
+
+  constructor() {
+    super();
+    const connect = Socket.prototype.connect;
+    // Replaces `connect` on this instance; overriding the overloaded method does not typecheck.
+    Object.defineProperty(this, "connect", {
+      value: (...args: unknown[]): this =>
+        this.isCancelled ? this : Reflect.apply(connect, this, args),
+    });
+  }
+
+  cancel(): void {
+    this.isCancelled = true;
+    this.destroy();
+  }
+}
+
 function assertSafe(smtp: SmtpOptions, message: MailMessage): void {
   for (const value of [smtp.host, message.from, message.subject, ...message.to]) {
     if (/[\r\n]/.test(value)) throw new SmtpError("SMTP address or subject contains a line break");
@@ -144,7 +164,8 @@ function refuseHeloFallback(socket: Socket, fail: (err: Error) => void): void {
  */
 export const sendMail: SendMail = async (smtp, message) => {
   assertSafe(smtp, message);
-  const socket = new Socket();
+  if (smtp.signal?.aborted) throw new SmtpError("SMTP send aborted");
+  const socket = new CancellableSocket();
   // Nodemailer reports socket errors through its own listeners; this one only keeps an error
   // after cancellation from being unhandled.
   socket.on("error", () => {});
@@ -155,14 +176,16 @@ export const sendMail: SendMail = async (smtp, message) => {
   let detach: () => void = () => {};
   const limit = new Promise<never>((_, reject) => {
     if (smtp.tls === "none") refuseHeloFallback(socket, reject);
-    cancel = (smtp.schedule ?? defaultSchedule)(
-      () => reject(new SmtpError(`SMTP send timed out after ${smtp.timeoutMs}ms`)),
-      smtp.timeoutMs,
-    );
+    cancel = (smtp.schedule ?? defaultSchedule)(() => {
+      socket.cancel();
+      reject(new SmtpError(`SMTP send timed out after ${smtp.timeoutMs}ms`));
+    }, smtp.timeoutMs);
     const signal = smtp.signal;
     if (!signal) return;
-    const onAbort = (): void => reject(new SmtpError("SMTP send aborted"));
-    if (signal.aborted) onAbort();
+    const onAbort = (): void => {
+      socket.cancel();
+      reject(new SmtpError("SMTP send aborted"));
+    };
     signal.addEventListener("abort", onAbort, { once: true });
     detach = () => signal.removeEventListener("abort", onAbort);
   });
@@ -191,6 +214,6 @@ export const sendMail: SendMail = async (smtp, message) => {
     detach();
     transporter.close();
     // After a send nodemailer has ended the socket; after a timeout or abort this closes it.
-    socket.destroy();
+    socket.cancel();
   }
 };

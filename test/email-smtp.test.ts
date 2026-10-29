@@ -507,3 +507,63 @@ test("ehloNameFrom cleans a host name and isEhloName validates names", () => {
     assert.equal(isEhloName(bad), false, JSON.stringify(bad));
   }
 });
+
+async function settle(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 150));
+}
+
+for (const isSilent of [true, false]) {
+  const kind = isSilent ? "silent" : "accepting";
+  test(`an abort right after the call opens no connection (${kind} server)`, async () => {
+    const stub = await startSmtpStub({ isSilent });
+    const controller = new AbortController();
+    try {
+      const sending = sendMail(options(stub.port, { signal: controller.signal }), message);
+      controller.abort();
+      await assert.rejects(sending, /aborted/);
+      await settle();
+      assert.equal(stub.accepted, 0);
+      assert.equal(stub.open, 0);
+      assert.equal(stub.messages.length, 0);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  test(`a timeout right after the call opens no connection (${kind} server)`, async () => {
+    const stub = await startSmtpStub({ isSilent });
+    const timers: (() => void)[] = [];
+    try {
+      const schedule = (fn: () => void): (() => void) => {
+        timers.push(fn);
+        return () => {};
+      };
+      const sending = sendMail(options(stub.port, { schedule }), message);
+      timers[0]?.();
+      await assert.rejects(sending, /timed out/);
+      await settle();
+      assert.equal(stub.accepted, 0);
+      assert.equal(stub.open, 0);
+      assert.equal(stub.messages.length, 0);
+    } finally {
+      await stub.close();
+    }
+  });
+}
+
+test("a signal that is already aborted rejects before any connection", async () => {
+  const stub = await startSmtpStub();
+  const controller = new AbortController();
+  controller.abort();
+  try {
+    await assert.rejects(
+      sendMail(options(stub.port, { signal: controller.signal }), message),
+      /aborted/,
+    );
+    await settle();
+    assert.equal(stub.accepted, 0);
+    assert.equal(stub.messages.length, 0);
+  } finally {
+    await stub.close();
+  }
+});
