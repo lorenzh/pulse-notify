@@ -49,7 +49,7 @@ The types `Incident` and `Check` come from [pulse-contract](https://github.com/l
 ```
 
 - Sends a `POST` to `url` with the payload as body.
-- Headers: `content-type: application/json` and `idempotency-key: <key>`. Use the key to drop duplicates on your side.
+- Headers: `content-type: application/json` and `idempotency-key: <key>`, in the form `<incident id>:<event>`. Delivery is at least once, so use the key to drop duplicates on your side.
 - A 2xx status is success. Any other status is a failure. Redirects are not followed, so a 3xx is a failure.
 - Each attempt times out after `PULSE_NOTIFY_TIMEOUT_MS` (default 5000 ms). The error is `timeout after <ms>ms`. A failed status gives `webhook responded with status <code>`.
 
@@ -59,6 +59,12 @@ The types `Incident` and `Check` come from [pulse-contract](https://github.com/l
 { "id": "log", "type": "file", "path": "./incidents.jsonl" }
 ```
 
+In Docker, only `/data` is writable. Use this config there:
+
+```json
+{ "id": "log", "type": "file", "path": "/data/incidents.jsonl" }
+```
+
 - Appends the payload as one JSON line to `path`. The parent directory is created if it is missing.
 - The file is never truncated or rotated by pulse-notify.
 - A write error (for example a permission error) is a failed attempt and is retried like any other.
@@ -66,7 +72,7 @@ The types `Incident` and `Check` come from [pulse-contract](https://github.com/l
 
 ## Delivery and retries
 
-- At most once. Before the first send, `(channel, key)` is recorded as `pending` in the ledger, then `delivered` or `failed`. A claim is never sent again.
+- At least once. Before the first send, `(channel, key)` is recorded as `pending` in the ledger, then `delivered` or `failed`. A retry can deliver an event twice, so receivers must deduplicate by the key. The key is `<incident id>:<event>` (for example `12:opened`), sent as the `idempotency-key` header.
 - Each event gets 4 attempts: the first and 3 retries. The wait between attempts is `PULSE_NOTIFY_RETRY_DELAY_MS` (default 1000 ms).
 - After the fourth failure the event is logged at error level (channel, key, attempts, last error), marked `failed` and never retried, not even after a restart.
 - Each channel has its own FIFO queue and worker. A slow or failing channel delays neither other channels nor polling.

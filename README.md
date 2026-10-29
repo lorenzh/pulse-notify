@@ -16,6 +16,8 @@ Requires Node 24 or newer and a running pulse-api. Write a config file such as `
 { "channels": [{ "id": "log", "type": "file", "path": "./incidents.jsonl" }] }
 ```
 
+In Docker, use `"path": "/data/incidents.jsonl"` instead. Only `/data` is writable there.
+
 ```sh
 npm ci
 PULSE_NOTIFY_CONFIG=./notify.json PULSE_API_URL=http://localhost:3000 npm start

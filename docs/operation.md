@@ -13,7 +13,7 @@ pulse-notify keeps one state file, the delivery ledger. Its path is `PULSE_NOTIF
 
 Backup: copy the file. It is replaced atomically, so a copy is always a whole file. Restoring is putting the file back with pulse-notify stopped. This was not tested as a procedure beyond that.
 
-If you delete the ledger, every channel counts as new on the next start. It records the current incidents as `seeded` and sends nothing for them. If you remove a channel id and add it back later, it is seeded again the same way, so incidents that happened meanwhile are not sent.
+If you delete the ledger, every channel counts as new on the next start. It records the current incidents as `seeded` and sends nothing for them. If you remove a channel id and add it back later, it is not seeded again: the ledger keeps the channel. The re-added channel receives the incidents from the time it was removed.
 
 ## Restart behavior
 
