@@ -4,15 +4,21 @@ pulse-notify reads environment variables and one JSON config file. Both are read
 
 ## Environment variables
 
-| Variable                      | Default                 | Meaning                                                     |
-| ----------------------------- | ----------------------- | ----------------------------------------------------------- |
-| `PULSE_NOTIFY_CONFIG`         | required                | Path to the channel config file                             |
-| `PULSE_API_URL`               | `http://localhost:3000` | pulse-api base URL                                          |
-| `PULSE_NOTIFY_STATE`          | `./notify-state.json`   | Delivery ledger file, see [operation.md](operation.md)      |
-| `PULSE_NOTIFY_POLL_MS`        | `5000`                  | Poll interval in milliseconds, at least 1                   |
-| `PULSE_NOTIFY_RETRY_DELAY_MS` | `1000`                  | Delay between delivery attempts in milliseconds, 0 or more  |
-| `PULSE_NOTIFY_TIMEOUT_MS`     | `5000`                  | Timeout per webhook attempt and per api request, at least 1 |
+| Variable                          | Default                 | Meaning                                                                                           |
+| --------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------- |
+| `PULSE_NOTIFY_CONFIG`             | required                | Path to the channel config file                                                                   |
+| `PULSE_API_URL`                   | `http://localhost:3000` | pulse-api base URL                                                                                |
+| `PULSE_NOTIFY_STATE`              | `./notify-state.json`   | Delivery ledger file, see [operation.md](operation.md)                                            |
+| `PULSE_NOTIFY_POLL_MS`            | `5000`                  | Poll interval in milliseconds, at least 1                                                         |
+| `PULSE_NOTIFY_RETRY_DELAY_MS`     | `1000`                  | Initial delay before the first retry in milliseconds; it doubles per retry                        |
+| `PULSE_NOTIFY_RETRY_MAX_DELAY_MS` | `60000`                 | Cap of the delay between attempts, at least the initial delay                                     |
+| `PULSE_NOTIFY_RETRY_ATTEMPTS`     | `12`                    | Total attempts per event; `0` retries without end                                                 |
+| `PULSE_NOTIFY_TIMEOUT_MS`         | `5000`                  | Timeout per webhook attempt and per api request, at least 1. It covers reading the response body. |
+
+The schedule is in [channels.md](channels.md#delivery-and-retries).
+
 - The numeric variables must be non-negative integers. Anything else stops startup with `<NAME> must be a non-negative integer`.
+- `PULSE_NOTIFY_RETRY_MAX_DELAY_MS` below `PULSE_NOTIFY_RETRY_DELAY_MS` stops startup with `PULSE_NOTIFY_RETRY_MAX_DELAY_MS must be at least PULSE_NOTIFY_RETRY_DELAY_MS`.
 - An empty value counts as unset, so the default applies.
 - Example: `PULSE_NOTIFY_POLL_MS=30000` polls every 30 seconds.
 

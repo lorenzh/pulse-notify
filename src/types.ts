@@ -35,9 +35,10 @@ export interface Config {
 }
 
 /** Sends one notification; rejects on failure. */
-export type Sender = (notification: Notification) => Promise<void>;
+export type Sender = (notification: Notification, signal?: AbortSignal) => Promise<void>;
 
-export type Sleep = (ms: number) => Promise<void>;
+/** Resolves after `ms`, or early when `signal` aborts. */
+export type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
 
 /** Starts a timer and returns a function that cancels it. */
 export type Schedule = (fn: () => void, ms: number) => () => void;

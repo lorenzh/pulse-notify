@@ -9,14 +9,28 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 
+import type { Notification } from "./types.ts";
+
 export type LedgerStatus = "seeded" | "pending" | "delivered" | "failed";
 
 interface LedgerData {
   version: 1;
   channels: Record<string, Record<string, LedgerStatus>>;
+  /** Notifications of `pending` keys, so they can be resent after a restart. */
+  payloads?: Record<string, Record<string, Notification>>;
 }
 
-/** Durable delivery ledger: one JSON file, rewritten atomically (temp file + rename). */
+export interface PendingEntry {
+  channelId: string;
+  key: string;
+  /** Absent for entries written by an older version. */
+  notification?: Notification;
+}
+
+/**
+ * Durable delivery ledger: one JSON file, rewritten atomically (temp file + rename).
+ * A write that fails throws and leaves the in-memory state as it was.
+ */
 export class Ledger {
   readonly #path: string;
   #data: LedgerData;
@@ -38,20 +52,23 @@ export class Ledger {
     if (parsed?.version !== 1 || typeof parsed.channels !== "object" || !parsed.channels) {
       throw new Error(`ledger ${this.#path} has an unsupported format`);
     }
+    if (typeof parsed.payloads !== "object" || parsed.payloads === null) delete parsed.payloads;
     return parsed;
   }
 
-  #save(): void {
+  /** Writes `next` to disk, then makes it the current state. */
+  #commit(next: LedgerData): void {
     mkdirSync(dirname(this.#path), { recursive: true });
     const tmp = `${this.#path}.tmp`;
     const fd = openSync(tmp, "w");
     try {
-      writeSync(fd, JSON.stringify(this.#data));
+      writeSync(fd, JSON.stringify(next));
       fsyncSync(fd);
     } finally {
       closeSync(fd);
     }
     renameSync(tmp, this.#path);
+    this.#data = next;
   }
 
   hasChannel(channelId: string): boolean {
@@ -69,38 +86,54 @@ export class Ledger {
 
   /** Records the keys as handled without sending; creates the channel record. */
   seed(channelId: string, keys: string[]): void {
-    const entries = this.#data.channels[channelId] ?? {};
+    const next = structuredClone(this.#data);
+    const entries = next.channels[channelId] ?? {};
     for (const key of keys) {
       if (!Object.hasOwn(entries, key)) entries[key] = "seeded";
     }
-    this.#data.channels[channelId] = entries;
-    this.#save();
+    next.channels[channelId] = entries;
+    this.#commit(next);
   }
 
-  /** Claims the key as pending before the first send. False if it is already recorded. */
-  claim(channelId: string, key: string): boolean {
+  /**
+   * Claims the key as pending before the first send and stores the notification for a resend.
+   * False if the key is already recorded.
+   */
+  claim(channelId: string, key: string, notification: Notification): boolean {
     if (this.has(channelId, key)) return false;
-    const entries = this.#data.channels[channelId] ?? {};
+    const next = structuredClone(this.#data);
+    const entries = next.channels[channelId] ?? {};
     entries[key] = "pending";
-    this.#data.channels[channelId] = entries;
-    this.#save();
+    next.channels[channelId] = entries;
+    next.payloads ??= {};
+    const payloads = next.payloads[channelId] ?? {};
+    payloads[key] = notification;
+    next.payloads[channelId] = payloads;
+    this.#commit(next);
     return true;
   }
 
   settle(channelId: string, key: string, status: "delivered" | "failed"): void {
-    const entries = this.#data.channels[channelId];
-    if (!entries || entries[key] !== "pending") {
+    if (this.status(channelId, key) !== "pending") {
       throw new Error(`cannot settle ${channelId}/${key}: not pending`);
     }
-    entries[key] = status;
-    this.#save();
+    const next = structuredClone(this.#data);
+    const entries = next.channels[channelId];
+    if (entries) entries[key] = status;
+    const payloads = next.payloads?.[channelId];
+    if (payloads) delete payloads[key];
+    this.#commit(next);
   }
 
-  pending(): { channelId: string; key: string }[] {
-    const out: { channelId: string; key: string }[] = [];
+  /** Pending keys in the order they were claimed. */
+  pending(): PendingEntry[] {
+    const out: PendingEntry[] = [];
     for (const [channelId, entries] of Object.entries(this.#data.channels)) {
       for (const [key, status] of Object.entries(entries)) {
-        if (status === "pending") out.push({ channelId, key });
+        if (status !== "pending") continue;
+        const payloads = this.#data.payloads?.[channelId];
+        const notification = payloads && Object.hasOwn(payloads, key) ? payloads[key] : undefined;
+        out.push(notification ? { channelId, key, notification } : { channelId, key });
       }
     }
     return out;

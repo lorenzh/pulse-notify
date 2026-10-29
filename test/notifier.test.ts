@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
@@ -47,13 +47,25 @@ function channels(extra: Partial<ChannelConfig>[] = []): ChannelConfig[] {
   ];
 }
 
-function make(opts: { channels?: ChannelConfig[]; sleep?: Sleep; schedule?: Schedule } = {}) {
+function make(
+  opts: {
+    channels?: ChannelConfig[];
+    sleep?: Sleep;
+    schedule?: Schedule;
+    retryAttempts?: number;
+    fetch?: typeof fetch;
+    timeoutMs?: number;
+  } = {},
+) {
   return new Notifier({
     config: { channels: opts.channels ?? channels() },
     apiUrl: api.url,
     ledger: new Ledger(statePath()),
     logger,
     retryDelayMs: 1000,
+    retryAttempts: opts.retryAttempts,
+    fetch: opts.fetch,
+    timeoutMs: opts.timeoutMs,
     sleep: opts.sleep ?? (async () => {}),
     schedule: opts.schedule ?? (() => () => {}),
   });
@@ -92,7 +104,7 @@ test("opened and resolved are delivered once each despite an outage; restart sen
   api.incidents = [incident({ id: 1, openedAt: Date.UTC(2026, 0, 1, 12, 0, 0) })];
   await n.tick();
   await n.idle();
-  assert.deepEqual(sleeps, [1000, 1000]);
+  assert.deepEqual(sleeps, [1000, 2000]);
   assert.equal(rx.requests.length, 3);
   assert.equal(rx.accepted().length, 1);
   const expectedOpened = {
@@ -135,7 +147,7 @@ test("opened and resolved are delivered once each despite an outage; restart sen
 
   // 3. restart: same ledger, config and api data
   const before = rx.requests.length;
-  const again = make();
+  const again = make({ retryAttempts: 4 });
   await again.tick();
   await again.idle();
   assert.equal(rx.requests.length, before);
@@ -149,6 +161,7 @@ test("a permanently down channel logs after 4 attempts and does not delay the he
   });
   let sleeping = 0;
   const n = await started({
+    retryAttempts: 4,
     sleep: async () => {
       sleeping++;
       await gate;
@@ -271,25 +284,6 @@ test("a channel seen for the first time is seeded without affecting existing one
   assert.throws(() => readFileSync(join(dir, "new.jsonl")), /ENOENT/);
 });
 
-test("a stale pending claim is logged at startup and not re-sent", async () => {
-  api.incidents = [incident({ id: 1 })];
-  const ledger = new Ledger(statePath());
-  ledger.seed("hook", []);
-  ledger.seed("log", []);
-  ledger.claim("hook", "1:opened");
-
-  const n = make();
-  n.start();
-  const lost = logger.entries.find((e) => e.level === "error" && /possibly lost/.test(e.msg));
-  assert.equal(lost?.fields.channel, "hook");
-  assert.equal(lost?.fields.key, "1:opened");
-
-  await n.tick();
-  await n.idle();
-  assert.equal(rx.requests.length, 0);
-  assert.equal(lines().length, 1); // the log channel had no claim and delivers
-});
-
 test("a failing api poll is logged and retried on the next tick", async () => {
   const n = await started();
   api.failing = true;
@@ -327,6 +321,201 @@ test("start schedules polls through the injected scheduler; stop cancels", async
   await new Promise((r) => setImmediate(r));
   const next = scheduled.filter((s) => s.ms === 5000 && !s.cancelled).at(-1);
   assert.ok(next, "next poll scheduled after pollMs");
-  n.stop();
+  await n.stop();
   assert.equal(next?.cancelled, true);
+});
+
+function unhandledRejections(): { seen: unknown[]; stop: () => void } {
+  const seen: unknown[] = [];
+  const listener = (reason: unknown): void => {
+    seen.push(reason);
+  };
+  process.on("unhandledRejection", listener);
+  return { seen, stop: () => process.off("unhandledRejection", listener) };
+}
+
+const tick = () => new Promise((r) => setImmediate(r));
+
+test("restart resends a pending notification from the ledger once", async () => {
+  const note = {
+    key: "1:opened",
+    event: "opened" as const,
+    incidentId: 1,
+    checkId: "example",
+    checkName: "Example site",
+    reason: "HTTP 503",
+    time: "2026-01-01T12:00:00.000Z",
+    timeMs: Date.UTC(2026, 0, 1, 12, 0, 0),
+  };
+  const ledger = new Ledger(statePath());
+  ledger.seed("hook", []);
+  ledger.seed("log", []);
+  ledger.claim("hook", "1:opened", note);
+  api.incidents = [incident({ id: 1 })];
+
+  const n = make();
+  n.start();
+  await n.tick();
+  await n.idle();
+  await n.stop();
+  assert.equal(rx.accepted().length, 1);
+  assert.deepEqual(rx.accepted()[0]?.body, note);
+  assert.equal(new Ledger(statePath()).status("hook", "1:opened"), "delivered");
+  assert.equal(
+    logger.entries.some((e) => e.msg === "resending pending notifications" && e.fields.count === 1),
+    true,
+  );
+});
+
+test("a legacy pending key without payload is rebuilt from the API", async () => {
+  const ledger = new Ledger(statePath());
+  ledger.seed("hook", []);
+  ledger.seed("log", []);
+  writeFileSync(
+    statePath(),
+    JSON.stringify({
+      version: 1,
+      channels: { hook: { "1:opened": "pending", "7:opened": "pending" }, log: {} },
+    }),
+  );
+  api.incidents = [incident({ id: 1 })];
+  const n = make();
+  n.start();
+  await n.tick();
+  await n.idle();
+  await n.tick();
+  await n.idle();
+  await n.stop();
+  assert.equal(rx.accepted().length, 1);
+  assert.equal(rx.accepted()[0]?.headers["idempotency-key"], "1:opened");
+  const missing = logger.entries.filter((e) => e.msg.includes("cannot be rebuilt"));
+  assert.equal(missing.length, 1);
+  assert.equal(missing[0]?.fields.key, "7:opened");
+  assert.equal(new Ledger(statePath()).status("hook", "7:opened"), "pending");
+});
+
+test("stop during an outage keeps the key pending; the next start delivers it", async () => {
+  const sleeping = Promise.withResolvers<void>();
+  const n = await started({
+    sleep: (_ms, signal) =>
+      new Promise((resolve) => {
+        sleeping.resolve();
+        signal?.addEventListener("abort", () => resolve());
+      }),
+  });
+  rx.up = false;
+  api.incidents = [incident({ id: 1 })];
+  await n.tick();
+  await sleeping.promise;
+  await n.stop();
+  const before = rx.requests.length;
+  assert.equal(new Ledger(statePath()).status("hook", "1:opened"), "pending");
+
+  rx.up = true;
+  const again = make();
+  again.start();
+  await again.tick();
+  await again.idle();
+  await again.stop();
+  assert.equal(rx.accepted().filter((r) => r.headers["idempotency-key"] === "1:opened").length, 1);
+  assert.ok(rx.requests.length > before);
+});
+
+test("a malformed incident is logged once; the others are delivered", async () => {
+  const rejections = unhandledRejections();
+  const n = await started();
+  api.incidents = [
+    incident({ id: 1, openedAt: Number.NaN }),
+    { ...incident({ id: 2 }), openedAt: "yesterday" } as never,
+    incident({ id: 3 }),
+  ];
+  await n.tick();
+  await n.idle();
+  await n.tick();
+  await n.idle();
+  await tick();
+  rejections.stop();
+  assert.deepEqual(rejections.seen, []);
+  const bad = logger.entries.filter((e) => e.msg === "incident skipped: malformed data");
+  assert.equal(bad.length, 2); // ids 1 and 2, once each over two polls
+  const accepted = rx.accepted().map((r) => r.headers["idempotency-key"]);
+  assert.deepEqual(accepted, ["3:opened"]);
+});
+
+test("a stalled api body times out, is logged, and the next poll runs", async () => {
+  let calls = 0;
+  let timer: (() => void) | undefined;
+  const stalled: typeof fetch = async () => {
+    calls++;
+    return new Response(new ReadableStream({ start() {} }), { status: 200 });
+  };
+  const n = make({
+    fetch: stalled,
+    timeoutMs: 50,
+    schedule: (fn) => {
+      timer = fn;
+      return () => {};
+    },
+  });
+  const polling = n.tick();
+  await tick();
+  timer?.();
+  await polling;
+  const failed = logger.entries.find((e) => e.msg === "api poll failed");
+  assert.equal(failed?.fields.error, "timeout after 50ms");
+  const first = calls;
+  const second = n.tick();
+  await tick();
+  timer?.();
+  await second;
+  assert.ok(calls > first);
+});
+
+test("throwing ledger claim, settle and seed are logged without rejection", async () => {
+  const rejections = unhandledRejections();
+  const ledger = new Ledger(statePath());
+  const n = new Notifier({
+    config: { channels: [{ id: "log", type: "file", path: filePath() }] },
+    apiUrl: api.url,
+    ledger,
+    logger,
+    sleep: async () => {},
+    schedule: () => () => {},
+  });
+  const realSeed = ledger.seed.bind(ledger);
+  ledger.seed = () => {
+    throw new Error("seed io");
+  };
+  await n.tick();
+  assert.equal(ledger.hasChannel("log"), false);
+  assert.ok(logger.entries.some((e) => e.msg.startsWith("ledger seed failed")));
+  ledger.seed = realSeed;
+  await n.tick();
+  assert.equal(ledger.hasChannel("log"), true);
+
+  const realClaim = ledger.claim.bind(ledger);
+  ledger.claim = () => {
+    throw new Error("claim io");
+  };
+  api.incidents = [incident({ id: 1 })];
+  await n.tick();
+  await n.idle();
+  assert.equal(lines().length, 0);
+  ledger.claim = realClaim;
+  await n.tick(); // the key was released, so the next poll retries it
+  await n.idle();
+  assert.equal(lines().length, 1);
+
+  const realSettle = ledger.settle.bind(ledger);
+  ledger.settle = () => {
+    throw new Error("settle io");
+  };
+  api.incidents = [incident({ id: 1 }), incident({ id: 2 })];
+  await n.tick();
+  await n.idle();
+  assert.equal(ledger.status("log", "2:opened"), "pending");
+  ledger.settle = realSettle;
+  await tick();
+  rejections.stop();
+  assert.deepEqual(rejections.seen, []);
 });

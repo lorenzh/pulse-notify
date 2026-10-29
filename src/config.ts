@@ -1,4 +1,9 @@
 import { readFileSync } from "node:fs";
+import {
+  DEFAULT_RETRY_ATTEMPTS,
+  DEFAULT_RETRY_DELAY_MS,
+  DEFAULT_RETRY_MAX_DELAY_MS,
+} from "./delivery.ts";
 import type { ChannelConfig, Config } from "./types.ts";
 
 export class ConfigError extends Error {
@@ -90,6 +95,8 @@ export interface Settings {
   statePath: string;
   pollMs: number;
   retryDelayMs: number;
+  retryMaxDelayMs: number;
+  retryAttempts: number;
   timeoutMs: number;
 }
 
@@ -110,12 +117,25 @@ export function loadSettings(env: Record<string, string | undefined>): Settings 
   const timeoutMs = intEnv(env, "PULSE_NOTIFY_TIMEOUT_MS", 5000);
   if (pollMs < 1) throw new ConfigError("PULSE_NOTIFY_POLL_MS must be at least 1");
   if (timeoutMs < 1) throw new ConfigError("PULSE_NOTIFY_TIMEOUT_MS must be at least 1");
+  const retryDelayMs = intEnv(env, "PULSE_NOTIFY_RETRY_DELAY_MS", DEFAULT_RETRY_DELAY_MS);
+  const retryMaxDelayMs = intEnv(
+    env,
+    "PULSE_NOTIFY_RETRY_MAX_DELAY_MS",
+    DEFAULT_RETRY_MAX_DELAY_MS,
+  );
+  if (retryMaxDelayMs < retryDelayMs) {
+    throw new ConfigError(
+      "PULSE_NOTIFY_RETRY_MAX_DELAY_MS must be at least PULSE_NOTIFY_RETRY_DELAY_MS",
+    );
+  }
   return {
     configPath,
     apiUrl: env.PULSE_API_URL || "http://localhost:3000",
     statePath: env.PULSE_NOTIFY_STATE || "./notify-state.json",
     pollMs,
-    retryDelayMs: intEnv(env, "PULSE_NOTIFY_RETRY_DELAY_MS", 1000),
+    retryDelayMs,
+    retryMaxDelayMs,
+    retryAttempts: intEnv(env, "PULSE_NOTIFY_RETRY_ATTEMPTS", DEFAULT_RETRY_ATTEMPTS),
     timeoutMs,
   };
 }

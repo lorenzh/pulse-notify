@@ -51,7 +51,7 @@ The types `Incident` and `Check` come from [pulse-contract](https://github.com/l
 - Sends a `POST` to `url` with the payload as body.
 - Headers: `content-type: application/json` and `idempotency-key: <key>`, in the form `<incident id>:<event>`. Delivery is at least once, so use the key to drop duplicates on your side.
 - A 2xx status is success. Any other status is a failure. Redirects are not followed, so a 3xx is a failure.
-- Each attempt times out after `PULSE_NOTIFY_TIMEOUT_MS` (default 5000 ms). The error is `timeout after <ms>ms`. A failed status gives `webhook responded with status <code>`.
+- Each attempt times out after `PULSE_NOTIFY_TIMEOUT_MS` (default 5000 ms), reading the response body included. The error is `timeout after <ms>ms`. A failed status gives `webhook responded with status <code>`.
 
 ## `file`
 
@@ -72,10 +72,17 @@ In Docker, only `/data` is writable. Use this config there:
 
 ## Delivery and retries
 
-- At least once. Before the first send, `(channel, key)` is recorded as `pending` in the ledger, then `delivered` or `failed`. A retry can deliver an event twice, so receivers must deduplicate by the key. The key is `<incident id>:<event>` (for example `12:opened`), sent as the `idempotency-key` header.
-- Each event gets 4 attempts: the first and 3 retries. The wait between attempts is `PULSE_NOTIFY_RETRY_DELAY_MS` (default 1000 ms).
-- After the fourth failure the event is logged at error level (channel, key, attempts, last error), marked `failed` and never retried, not even after a restart.
-- Each channel has its own FIFO queue and worker. A slow or failing channel delays neither other channels nor polling.
+- At least once per event and channel. This holds while the process runs, within the retry schedule below, and across restarts for unfinished (`pending`) events. Before the first send, `(channel, key)` is recorded as `pending` in the ledger together with the notification, then `delivered` or `failed`.
+- Duplicates are possible: a retry, a crash after a send, or a failed ledger write can deliver an event twice. Receivers must deduplicate by the key `<incident id>:<event>` (for example `12:opened`), sent as the `idempotency-key` header.
+- Retry schedule: the delay before retry n is `min(initial * 2^(n-1), max)`, without jitter. The initial delay is `PULSE_NOTIFY_RETRY_DELAY_MS` (default 1000 ms), the cap is `PULSE_NOTIFY_RETRY_MAX_DELAY_MS` (default 60000 ms), and `PULSE_NOTIFY_RETRY_ATTEMPTS` (default 12) is the total number of attempts per event. With the defaults:
+
+  | Retry | 1   | 2   | 3   | 4   | 5    | 6    | 7-11 |
+  | ----- | --- | --- | --- | --- | ---- | ---- | ---- |
+  | Delay | 1 s | 2 s | 4 s | 8 s | 16 s | 32 s | 60 s |
+
+  That is about 6 minutes in total. `PULSE_NOTIFY_RETRY_ATTEMPTS=0` retries without end.
+- After the last attempt the event is logged at error level (channel, key, attempts, error, code, cause) and marked `failed`. `failed` is final: it is not retried, not even after a restart (unless `PULSE_NOTIFY_RETRY_ATTEMPTS=0`, where an event never fails).
+- Each channel has its own FIFO queue and worker. A slow or failing channel delays neither other channels nor polling. Within one channel the order is kept, so a long retry blocks the later events of that channel (head-of-line blocking, up to the whole schedule).
 - `resolved` is sent after `opened`. It is still sent if `opened` failed.
 - On the first start of a channel (new ledger or new channel id) all incidents that the API shows are recorded as `seeded`. No notifications are sent for this history. The seed covers all incidents, whatever the `checks` filter says.
-- A failing api poll is logged and retried on the next tick. See [operation.md](operation.md) for restarts and logs.
+- A failing or malformed api poll is logged and retried on the next tick. See [operation.md](operation.md) for restarts and logs.
