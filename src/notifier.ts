@@ -63,7 +63,11 @@ interface ChannelState {
   delivery: ChannelDelivery;
   /** Keys enqueued but not yet recorded in the ledger. */
   queued: Set<string>;
+  /** Pending reminders from the ledger, held until the first successful poll. */
+  held: Notification[];
 }
+
+const REMINDER_KEY = /^(\d+):reminder:(\d+)$/;
 
 function buildNotification(
   key: string,
@@ -118,9 +122,10 @@ export class Notifier {
         sendMail: opts.sendMail,
       });
       const queued = new Set<string>();
-      return {
+      const state: ChannelState = {
         config,
         queued,
+        held: [],
         delivery: new ChannelDelivery({
           channelId: config.id,
           send,
@@ -131,12 +136,32 @@ export class Notifier {
           retryAttempts: opts.retryAttempts,
           logger: opts.logger,
           release: (key) => queued.delete(key),
-          isStale: (n) => n.event === "reminder" && this.#resolved.has(n.incidentId),
+          isStale: (n) =>
+            n.event === "reminder" &&
+            (this.#resolved.has(n.incidentId) || this.#isSuperseded(state, n)),
           onOutcome: (outcome) =>
             opts.metrics?.deliveryDone(config.id, outcome === "delivered" ? "success" : "failure"),
         }),
       };
+      return state;
     });
+  }
+
+  /** True when a reminder of the same incident with a higher n is pending, queued or delivered. */
+  #isSuperseded(channel: ChannelState, notification: Notification): boolean {
+    const own = REMINDER_KEY.exec(notification.key);
+    if (!own) return false;
+    const isNewer = (key: string, status: string): boolean => {
+      const match = REMINDER_KEY.exec(key);
+      return (
+        match !== null &&
+        match[1] === own[1] &&
+        Number(match[2]) > Number(own[2]) &&
+        (status === "pending" || status === "delivered")
+      );
+    };
+    for (const key of channel.queued) if (isNewer(key, "pending")) return true;
+    return this.#opts.ledger.entries(channel.config.id).some(([k, s]) => isNewer(k, s));
   }
 
   /** Resends pending notifications from the ledger, then starts polling (first poll at delay 0). */
@@ -169,6 +194,11 @@ export class Notifier {
     for (const { channelId, key, notification } of this.#opts.ledger.pending()) {
       const channel = this.#channels.find((c) => c.config.id === channelId);
       if (!channel || !notification) continue;
+      if (notification.event === "reminder") {
+        // Held until a poll shows which incidents are resolved.
+        channel.held.push(notification);
+        continue;
+      }
       channel.queued.add(key);
       channel.delivery.enqueue(notification);
       counts.set(channelId, (counts.get(channelId) ?? 0) + 1);
@@ -230,6 +260,18 @@ export class Notifier {
     const nowMs = this.#now();
     for (const channel of this.#channels) {
       this.#pollChannel(channel, incidents, names, nowMs);
+    }
+    // After the new events are queued, so a newer reminder supersedes a held one.
+    this.#releaseHeld();
+  }
+
+  #releaseHeld(): void {
+    for (const channel of this.#channels) {
+      const held = channel.held.splice(0);
+      for (const notification of held) {
+        channel.queued.add(notification.key);
+        channel.delivery.enqueue(notification);
+      }
     }
   }
 
