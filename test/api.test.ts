@@ -79,3 +79,18 @@ test("a wire version mismatch fails the call", async () => {
   await assert.rejects(fetchIncidents({ baseUrl: base, fetch: fetchFn }), /wire version mismatch/);
   await assert.rejects(fetchChecks({ baseUrl: base, fetch: fetchFn }), /wire version mismatch/);
 });
+
+test("a check with an out-of-range value is skipped and reported", async () => {
+  const errors: string[] = [];
+  const out = await fetchChecks({
+    baseUrl: base,
+    fetch: respond([httpCheck("a", "A"), { ...httpCheck("b", "B"), retries: 11 }]),
+    onInvalidCheck: (e) => errors.push(e),
+  });
+  assert.deepEqual(
+    out.map((c) => c.id),
+    ["a"],
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0] ?? "", /^checks\[1\]\./);
+});
