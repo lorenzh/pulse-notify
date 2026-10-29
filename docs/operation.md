@@ -37,6 +37,7 @@ Logs are JSON lines on stderr. Each line has `time` (ISO 8601 UTC), `level` (`in
 | `info`  | `notification delivered`                                     | `channel`, `key`, `attempts`                           |
 | `warn`  | `delivery attempt failed`                                    | `channel`, `key`, `attempt`, `error`, `code`, `cause`  |
 | `error` | `notification delivery failed`                               | `channel`, `key`, `attempts`, `error`, `code`, `cause` |
+| `error` | `notification cannot be built, the next poll retries`        | `channel`, `key`, `error`, `code`, `cause`             |
 | `error` | `api poll failed`                                            | `error`, `code`, `cause`                               |
 | `error` | `incident skipped: malformed data`                           | `incidentId`, `reason`                                 |
 | `error` | `pending notification cannot be rebuilt: incident not found` | `channel`, `key`                                       |

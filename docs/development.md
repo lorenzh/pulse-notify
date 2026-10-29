@@ -29,6 +29,6 @@ node --test test/<name>.test.ts          # one test file
 ## Lint and hooks
 
 - `npm run lint` runs Biome and SonarJS through ESLint (cognitive complexity of 15 or less per function). `npm run format` applies Biome fixes.
-- Lefthook runs `biome check` on staged files before each commit.
+- Lefthook runs two pre-commit commands on staged files: `biome check`, and `pulse-eslint` (the same ESLint config as `npm run lint`: SonarJS plus the type-aware `no-floating-promises`, `no-misused-promises` and `switch-exhaustiveness-check` rules).
 - The shared Biome, TypeScript, Lefthook, ESLint and CI configuration lives in [pulse-config](https://github.com/lorenzh/pulse-config). Change a rule there, then update the pin here. CI runs the shared `check.yml`.
 - The pulse-contract dependency is pinned to a commit SHA. Types are imported with `import type` only.
