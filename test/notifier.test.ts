@@ -9,6 +9,7 @@ import type { ChannelConfig, Schedule, Sleep } from "../src/types.ts";
 import {
   asRecord,
   type FakeApi,
+  heartbeatCheck,
   httpCheck,
   incident,
   type Receiver,
@@ -653,4 +654,26 @@ test("a build error while rebuilding a legacy pending key is logged and retried"
     rx.accepted().map((r) => r.headers["idempotency-key"]),
     ["2:opened", "1:opened"],
   );
+});
+
+test("an incident of a heartbeat check is delivered to webhook and file channels", async () => {
+  api.checks = [heartbeatCheck("nightly", "Nightly backup")];
+  const n = await started();
+  api.incidents = [
+    incident({
+      id: 7,
+      checkId: "nightly",
+      reason: "no ping for 65000 ms",
+      openedAt: Date.UTC(2026, 0, 1, 12, 0, 0),
+    }),
+  ];
+  await n.tick();
+  await n.idle();
+  assert.equal(rx.accepted().length, 1);
+  const body = asRecord(rx.accepted()[0]?.body);
+  assert.equal(body.key, "7:opened");
+  assert.equal(body.checkId, "nightly");
+  assert.equal(body.checkName, "Nightly backup");
+  assert.equal(body.reason, "no ping for 65000 ms");
+  assert.deepEqual(lines(), [body]);
 });

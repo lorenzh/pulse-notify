@@ -11,6 +11,8 @@ pulse-notify polls `GET /incidents` and `GET /checks` of pulse-api in parallel o
 - A resolved incident whose `opened` was never recorded gives `opened` first, then `resolved`.
 - With `remindEverySeconds`, an open incident also gives `reminder` events, see [Reminders](#reminders).
 
+Incidents of heartbeat checks (cron jobs and workers that ping pulse-api) are delivered like all others.
+
 The event key is `<incidentId>:<event>`, for example `12:opened`. When an incident opens is decided by pulse-api, see [quorum and incidents](https://github.com/lorenzh/pulse-api/blob/main/docs/concepts.md#quorum-and-incidents).
 
 ## Payload
