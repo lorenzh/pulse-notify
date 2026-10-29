@@ -1,13 +1,15 @@
 import {
   type Check,
-  checkWireVersion,
+  DEFAULT_MAX_BODY_BYTES,
+  type FetchJsonError,
+  type FetchJsonOptions,
+  fetchJson,
   type Incident,
+  type Validation,
   validateCheck,
   validateIncident,
-  WIRE_VERSION_HEADER,
 } from "@lorenzh/pulse-contract";
 import { redactInText } from "./redact.ts";
-import { fetchWithTimeout } from "./timeout.ts";
 import type { Schedule } from "./types.ts";
 
 export interface ApiOptions {
@@ -33,36 +35,7 @@ export interface IncidentsResult {
   rejected: RejectedIncident[];
 }
 
-export const DEFAULT_API_MAX_BYTES = 5 * 1024 * 1024;
-
-/** Reads the JSON body and stops with an error once it passes `maxBytes`. */
-async function readJson(res: Response, maxBytes: number, path: string): Promise<unknown> {
-  const tooLarge = (): Error => new Error(`GET ${path} response is larger than ${maxBytes} bytes`);
-  const declared = Number(res.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > maxBytes) {
-    await res.body?.cancel();
-    throw tooLarge();
-  }
-  // A response without a stream has no bytes to count: let it parse itself.
-  if (!res.body) return res.json();
-  const decoder = new TextDecoder();
-  let text = "";
-  let total = 0;
-  const reader = res.body.getReader();
-  try {
-    for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
-      total += chunk.value.byteLength;
-      if (total > maxBytes) throw tooLarge();
-      text += decoder.decode(chunk.value, { stream: true });
-    }
-  } catch (err) {
-    await reader.cancel().catch(() => {
-      // The stream is already broken; the original error is what matters.
-    });
-    throw err;
-  }
-  return JSON.parse(text + decoder.decode());
-}
+export const DEFAULT_API_MAX_BYTES = DEFAULT_MAX_BODY_BYTES;
 
 /** An error without the original cause and with the API url redacted in its text. */
 function redactedError(err: unknown, baseUrl: string): Error {
@@ -77,35 +50,53 @@ function redactedError(err: unknown, baseUrl: string): Error {
   return error;
 }
 
-async function getArray(opts: ApiOptions, path: string): Promise<unknown[]> {
-  const maxBytes = opts.maxBytes ?? DEFAULT_API_MAX_BYTES;
-  try {
-    const url = new URL(path, opts.baseUrl.endsWith("/") ? opts.baseUrl : `${opts.baseUrl}/`);
-    return await fetchWithTimeout(
-      opts.fetch ?? fetch,
-      url.toString().replace(/\/$/, ""),
-      { headers: { accept: "application/json" } },
-      opts.timeoutMs ?? 5000,
-      async (res) => {
-        const version = checkWireVersion(res.headers.get(WIRE_VERSION_HEADER));
-        if (version.status === "mismatch") {
-          await res.body?.cancel();
-          throw new Error(`GET ${path} wire version mismatch: ${version.error}`);
-        }
-        if (version.status === "absent") opts.onVersionAbsent?.();
-        if (!res.ok) {
-          await res.body?.cancel();
-          throw new Error(`GET ${path} returned ${res.status}`);
-        }
-        const body = await readJson(res, maxBytes, path);
-        if (!Array.isArray(body)) throw new Error(`GET ${path} did not return an array`);
-        return body;
-      },
-      opts.schedule,
-    );
-  } catch (err) {
-    throw redactedError(err, opts.baseUrl);
+/** The error for each failure of the shared client, with the text callers know. */
+function apiError(error: FetchJsonError, path: string): unknown {
+  switch (error.kind) {
+    case "timeout":
+      return new Error(`timeout after ${error.timeoutMs}ms`);
+    case "aborted":
+      return new Error(`GET ${path} was aborted`);
+    case "network":
+      return error.cause;
+    case "http":
+      return new Error(`GET ${path} returned ${error.status}`);
+    case "too-large":
+      return new Error(`GET ${path} response is larger than ${error.maxBytes} bytes`);
+    case "invalid-json":
+    case "validation":
+      return new Error(error.message);
+    case "wire-mismatch":
+      return new Error(`GET ${path} wire version mismatch: ${error.message}`);
+    default: {
+      const unreachable: never = error;
+      return unreachable;
+    }
   }
+}
+
+/** Accepts any array; the caller checks each item so one bad item can be skipped. */
+function validateArray(path: string): (raw: unknown) => Validation<unknown[]> {
+  return (raw) =>
+    Array.isArray(raw)
+      ? { ok: true, value: raw }
+      : { ok: false, error: `GET ${path} did not return an array` };
+}
+
+async function getArray(opts: ApiOptions, path: string): Promise<unknown[]> {
+  const url = new URL(path, opts.baseUrl.endsWith("/") ? opts.baseUrl : `${opts.baseUrl}/`);
+  const options: FetchJsonOptions<unknown[]> = {
+    fetch: opts.fetch ?? fetch,
+    validate: validateArray(path),
+    timeoutMs: opts.timeoutMs ?? 5000,
+    maxBytes: opts.maxBytes ?? DEFAULT_API_MAX_BYTES,
+    headers: { accept: "application/json" },
+  };
+  if (opts.onVersionAbsent) options.onWireAbsent = opts.onVersionAbsent;
+  if (opts.schedule) options.schedule = opts.schedule;
+  const result = await fetchJson(url.toString().replace(/\/$/, ""), options);
+  if (result.ok) return result.value;
+  throw redactedError(apiError(result.error, path), opts.baseUrl);
 }
 
 /** The range of `Date` in milliseconds; outside it `toISOString()` throws. */

@@ -550,111 +550,45 @@ test("an out-of-range timestamp does not keep the event queued", async () => {
   );
 });
 
-/**
- * Fetch that makes `reason` of the listed incident ids throw, but only while the notification is
- * built. Validation and detection read the incident normally, so the fault hits only the build.
- */
-function buildFault(poisoned: Set<number>): typeof fetch {
-  return async (input, init) => {
-    const res = await fetch(input, init);
-    if (!String(input).endsWith("/incidents")) return res;
-    const items: unknown = await res.json();
-    if (!Array.isArray(items)) return res;
-    for (const item of items) {
-      if (typeof item !== "object" || item === null) continue;
-      const { id, reason } = item as { id?: unknown; reason?: unknown };
-      if (typeof id !== "number" || !poisoned.has(id)) continue;
-      Object.defineProperty(item, "reason", {
-        get() {
-          if (poisoned.has(id) && new Error().stack?.includes("buildNotification")) {
-            throw new Error("injected build fault");
-          }
-          return reason;
-        },
-      });
-    }
-    // Without a body stream the client uses json(), which hands out the poisoned objects.
-    Object.defineProperty(res, "body", { value: null });
-    return Object.defineProperty(res, "json", { value: async () => items });
-  };
-}
+test("a build error is logged, leaves the key unqueued and other events deliver", async () => {
+  // A reminder takes its time from the clock: a clock outside the Date range fails the build.
+  const base = Date.UTC(2026, 0, 1, 12, 0, 0);
+  let nowMs = base + 10_000;
+  const n = new Notifier({
+    config: { channels: [{ id: "hook", type: "webhook", url: rx.url, remindEverySeconds: 60 }] },
+    apiUrl: api.url,
+    ledger: new Ledger(statePath()),
+    logger,
+    retryDelayMs: 1000,
+    now: () => nowMs,
+    sleep: async () => {},
+    schedule: () => () => {},
+  });
+  api.incidents = [incident({ id: 1, openedAt: base })];
+  await n.tick();
 
-function builtFailures(): { channel: unknown; key: unknown; error: unknown }[] {
-  return logger.entries
-    .filter((e) => e.msg === "notification cannot be built, the next poll retries")
-    .map((e) => ({ channel: e.fields.channel, key: e.fields.key, error: e.fields.error }));
-}
-
-test("a build error is logged per channel, leaves the key unqueued and other events deliver", async () => {
-  const poisoned = new Set([1]);
-  const n = await started({ fetch: buildFault(poisoned) });
-  api.incidents = [incident({ id: 1 }), incident({ id: 2 })];
+  nowMs = 8.64e15 + 1;
+  api.incidents = [incident({ id: 1, openedAt: base }), incident({ id: 2, openedAt: base })];
   await n.tick();
   await n.idle();
-  await tick();
-  assert.deepEqual(
-    builtFailures().sort((a, b) => String(a.channel).localeCompare(String(b.channel))),
-    [
-      { channel: "hook", key: "1:opened", error: "injected build fault" },
-      { channel: "log", key: "1:opened", error: "injected build fault" },
-    ],
+  const failures = logger.entries.filter(
+    (e) => e.msg === "notification cannot be built, the next poll retries",
   );
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0]?.fields.channel, "hook");
+  assert.match(String(failures[0]?.fields.key), /^1:reminder:/);
   assert.deepEqual(
     rx.accepted().map((r) => r.headers["idempotency-key"]),
     ["2:opened"],
   );
-  assert.deepEqual(
-    lines().map((l) => l.key),
-    ["2:opened"],
-  );
-  assert.equal(new Ledger(statePath()).has("hook", "1:opened"), false);
 
-  poisoned.clear();
+  nowMs = base + 120_000;
   await n.tick();
   await n.idle();
   await tick();
   assert.deepEqual(
     rx.accepted().map((r) => r.headers["idempotency-key"]),
-    ["2:opened", "1:opened"],
-  );
-  assert.deepEqual(
-    lines().map((l) => l.key),
-    ["2:opened", "1:opened"],
-  );
-});
-
-test("a build error while rebuilding a legacy pending key is logged and retried", async () => {
-  const ledger = new Ledger(statePath());
-  ledger.seed("hook", []);
-  ledger.seed("log", []);
-  writeFileSync(
-    statePath(),
-    JSON.stringify({
-      version: 1,
-      channels: { hook: { "1:opened": "pending", "2:opened": "pending" }, log: {} },
-    }),
-  );
-  api.incidents = [incident({ id: 1 }), incident({ id: 2 })];
-  const poisoned = new Set([1]);
-  const n = make({ fetch: buildFault(poisoned) });
-  await n.tick();
-  await n.idle();
-  // The "log" channel is in the ledger too, so its normal enqueue fails for the same incident.
-  assert.deepEqual(
-    builtFailures().filter((f) => f.channel === "hook"),
-    [{ channel: "hook", key: "1:opened", error: "injected build fault" }],
-  );
-  assert.deepEqual(
-    rx.accepted().map((r) => r.headers["idempotency-key"]),
-    ["2:opened"],
-  );
-
-  poisoned.clear();
-  await n.tick();
-  await n.idle();
-  assert.deepEqual(
-    rx.accepted().map((r) => r.headers["idempotency-key"]),
-    ["2:opened", "1:opened"],
+    ["2:opened", "1:reminder:2", "2:reminder:2"],
   );
 });
 

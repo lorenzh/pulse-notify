@@ -26,7 +26,7 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "@lorenzh/pulse-contract": "github:lorenzh/pulse-contract#c98a2d452778fd3dbb245509f8c0e413f0eee8ab",
+    "@lorenzh/pulse-contract": "github:lorenzh/pulse-contract#cc8c1faa412ab2523b4573313937330c42349043",
     "nodemailer": "10.3.1"
   }
 }
