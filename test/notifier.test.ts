@@ -519,3 +519,30 @@ test("throwing ledger claim, settle and seed are logged without rejection", asyn
   rejections.stop();
   assert.deepEqual(rejections.seen, []);
 });
+
+test("an out-of-range timestamp does not keep the event queued", async () => {
+  const rejections = unhandledRejections();
+  const n = await started();
+  api.incidents = [incident({ id: 1, openedAt: 1.8e18 }), incident({ id: 2 })];
+  await n.tick();
+  await n.idle();
+  await tick();
+  const bad = logger.entries.filter((e) => e.msg === "incident skipped: malformed data");
+  assert.equal(bad.length, 1);
+  assert.equal(bad[0]?.fields?.incidentId, 1);
+  assert.deepEqual(
+    rx.accepted().map((r) => r.headers["idempotency-key"]),
+    ["2:opened"],
+  );
+
+  api.incidents = [incident({ id: 1 }), incident({ id: 2 })];
+  await n.tick();
+  await n.idle();
+  await tick();
+  rejections.stop();
+  assert.deepEqual(rejections.seen, []);
+  assert.deepEqual(
+    rx.accepted().map((r) => r.headers["idempotency-key"]),
+    ["2:opened", "1:opened"],
+  );
+});
