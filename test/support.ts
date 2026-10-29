@@ -152,6 +152,10 @@ export function httpCheck(id: string, name: string): Check {
   return { id, name, url: "http://example.invalid", intervalMs: 1000 };
 }
 
+export function heartbeatCheck(id: string, name: string): Check {
+  return { id, name, type: "heartbeat", period: 60_000, grace: 5000 };
+}
+
 /** Narrows a received body to a JSON object, failing the test otherwise. */
 export function asRecord(body: unknown): Record<string, unknown> {
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
