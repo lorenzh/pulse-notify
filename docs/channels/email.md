@@ -1,6 +1,6 @@
 # Email channel
 
-Sends a plain text email over SMTP. pulse-notify has its own small SMTP client (`EHLO`, `STARTTLS`, `AUTH PLAIN` and `LOGIN`, `MAIL FROM`, `RCPT TO`, `DATA`, `QUIT`), so there is no extra dependency.
+Sends a plain text email over SMTP. pulse-notify sends it with [nodemailer](https://nodemailer.com), its only SMTP and MIME library. It makes one connection per attempt and closes it after the attempt.
 
 ```json
 {
@@ -33,12 +33,13 @@ Sends a plain text email over SMTP. pulse-notify has its own small SMTP client (
 - Certificate verification is always on.
 - `none` must be set explicitly. Login over `none` to a host other than `127.0.0.1`/`localhost` is refused at startup.
 - A line break in `from`, `to` or `subjectPrefix` stops startup. A line break in the check name or reason is replaced by a space.
-- `PULSE_NOTIFY_TIMEOUT_MS` covers one whole attempt, from the connection to `QUIT`, as one shared deadline. A slow server that answers each command in time can still hit it.
-- Any reply that is not 2xx (or 354 for `DATA`) fails the attempt. A 5xx reply, at any stage (greeting, `EHLO`, `STARTTLS`, `AUTH`, `MAIL FROM`, `RCPT TO`, `DATA`, end of data), is a [permanent error](../channels.md#delivery-and-retries): the event is `failed` at once. A 4xx reply is retried like a webhook failure. The final reply code decides.
-- A reply of more than 100 lines, or more than 64 KiB of unread reply lines, fails the attempt as a retryable error.
-- Bytes that arrive before the TLS handshake of `STARTTLS` are dropped, so a server or a man in the middle cannot plant replies for the commands after it.
+- `PULSE_NOTIFY_TIMEOUT_MS` covers one whole attempt, from the connection to the end of the send, as one shared deadline. A slow server that answers each command in time can still hit it. The timeout message does not name a stage (`SMTP send timed out after <ms>ms`). A timeout and an abort close the connection at once and are retried.
+- Any failed reply fails the attempt. A 5xx reply, at any stage (greeting, `EHLO`, `STARTTLS`, `AUTH`, `MAIL FROM`, `RCPT TO`, `DATA`, end of data), is a [permanent error](../channels.md#delivery-and-retries): the event is `failed` at once. A 4xx reply is retried like a webhook failure. The reply code decides. A failed `EHLO` is not followed by `HELO`. Error text and log fields hold only fixed words and codes, never text from the server.
+- Login uses `AUTH PLAIN` or `AUTH LOGIN`. `CRAM-MD5` and `XOAUTH2` are never used; a server that offers neither `PLAIN` nor `LOGIN` fails the attempt.
+- If some recipients are refused and others accepted, the message is still sent to the accepted ones and the attempt fails, so a retry can deliver a second copy to them.
+- Limits on the size of server replies are those of nodemailer.
 - `Message-ID` is `<hash-of-key@domain-of-from>`, so a resend after a crash carries the same ID and a receiver can drop the duplicate.
-- The body is UTF-8 plain text in base64.
+- The body is UTF-8 plain text. A subject with non-ASCII text is encoded as RFC 2047 by nodemailer.
 
 Sample message:
 

@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import type { SendMail, SmtpMessage, SmtpOptions } from "../src/channels/smtp.ts";
+import type { MailMessage, SendMail, SmtpOptions } from "../src/channels/mailer.ts";
 import { Ledger } from "../src/ledger.ts";
 import { Metrics } from "../src/metrics.ts";
 import { Notifier } from "../src/notifier.ts";
@@ -34,7 +34,7 @@ let api: FakeApi;
 let rx: Receiver;
 let dir: string;
 let logger: SpyLogger;
-let mails: { smtp: SmtpOptions; message: SmtpMessage }[];
+let mails: { smtp: SmtpOptions; message: MailMessage }[];
 let failMail: Error | undefined;
 
 beforeEach(async () => {
@@ -210,12 +210,11 @@ test("email goes through the SMTP client with a stable Message-ID and a safe sub
   assert.equal(mails.length, 1);
   const mail = mails[0];
   assert.deepEqual(mail?.message.to, ["ops@example.com"]);
-  assert.equal(mail?.message.from, "pulse@example.com");
-  const [head = "", body = ""] = (mail?.message.data ?? "").split("\r\n\r\n");
-  assert.ok(head.includes("Subject: [pulse] DOWN: Example site"));
-  assert.match(head, /Message-ID: <[0-9a-f]{32}@example\.com>/);
-  assert.ok(!head.includes("Bcc"));
-  const text = Buffer.from(body.replace(/\r\n/g, ""), "base64").toString("utf8");
+  assert.equal(mail?.message.from, "Pulse <pulse@example.com>");
+  assert.equal(mail?.message.subject, "[pulse] DOWN: Example site");
+  assert.match(mail?.message.messageId ?? "", /^<[0-9a-f]{32}@example\.com>$/);
+  assert.equal(mail?.message.date.getTime(), Date.UTC(2026, 0, 1, 12, 0, 30));
+  const text = mail?.message.text ?? "";
   assert.ok(text.includes("Reason: bad  Bcc: evil@example.com"));
   assert.ok(text.includes("State: DOWN"));
 });

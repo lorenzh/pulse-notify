@@ -1,8 +1,8 @@
 import type { Check, Incident } from "@lorenzh/pulse-contract";
 import { fetchChecks, fetchIncidents } from "./api.ts";
 import { createSender } from "./channels/factory.ts";
+import type { SendMail } from "./channels/mailer.ts";
 import { isRouted } from "./channels/routing.ts";
-import type { SendMail } from "./channels/smtp.ts";
 import { ChannelDelivery } from "./delivery.ts";
 import { detectEvents, eventTimeMs, type ReminderPlan, seedKeys } from "./detector.ts";
 import { errorFields } from "./errors.ts";

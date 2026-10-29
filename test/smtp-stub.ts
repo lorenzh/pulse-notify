@@ -50,7 +50,7 @@ export interface SmtpStubOptions {
   /** Offer and accept STARTTLS with this certificate. */
   starttls?: TestCert;
   /** AUTH mechanisms to offer; default none. */
-  auth?: ("PLAIN" | "LOGIN")[];
+  auth?: ("PLAIN" | "LOGIN" | "CRAM-MD5")[];
   /** Reply to the first command that starts with the key, instead of the normal one. */
   replies?: Record<string, string>;
   /** Greeting line; default "220 stub ready". */
@@ -71,6 +71,8 @@ export interface SmtpStub {
   commands: string[];
   /** Raw DATA content of each accepted message, without the final dot line. */
   messages: string[];
+  /** Resolves when the first connection to the stub is closed. */
+  firstClosed: Promise<void>;
   close(): Promise<void>;
 }
 
@@ -188,10 +190,14 @@ class Connection {
 
 export async function startSmtpStub(options: SmtpStubOptions = {}): Promise<SmtpStub> {
   const sockets = new Set<Socket>();
+  let onFirstClose: () => void = () => {};
   const stub: SmtpStub = {
     port: 0,
     commands: [],
     messages: [],
+    firstClosed: new Promise((resolve) => {
+      onFirstClose = resolve;
+    }),
     close: () =>
       new Promise((resolve) => {
         for (const s of sockets) s.destroy();
@@ -200,7 +206,10 @@ export async function startSmtpStub(options: SmtpStubOptions = {}): Promise<Smtp
   };
   const server: Server = createServer((socket) => {
     sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
+    socket.on("close", () => {
+      sockets.delete(socket);
+      onFirstClose();
+    });
     new Connection(stub, options, false).attach(socket);
     if (!options.isSilent) socket.write(`${options.greeting ?? "220 stub ready"}\r\n`);
   });
@@ -211,12 +220,17 @@ export async function startSmtpStub(options: SmtpStubOptions = {}): Promise<Smtp
 }
 
 /** An implicit-TLS SMTP stub (`tls: "tls"`). */
-export async function startTlsSmtpStub(cert: TestCert): Promise<SmtpStub> {
+export async function startTlsSmtpStub(
+  cert: TestCert,
+  options: SmtpStubOptions = {},
+): Promise<SmtpStub> {
   const { createServer: createTlsServer } = await import("node:tls");
   const stub: SmtpStub = {
     port: 0,
     commands: [],
     messages: [],
+    // Not tracked for the TLS stub.
+    firstClosed: Promise.resolve(),
     close: () =>
       new Promise((resolve) => {
         for (const s of sockets) s.destroy();
@@ -227,7 +241,7 @@ export async function startTlsSmtpStub(cert: TestCert): Promise<SmtpStub> {
   const server = createTlsServer({ key: cert.key, cert: cert.cert }, (socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
-    new Connection(stub, {}, true).attach(socket);
+    new Connection(stub, options, true).attach(socket);
     socket.write("220 stub ready\r\n");
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
