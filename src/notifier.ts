@@ -78,6 +78,12 @@ function buildNotification(
   };
 }
 
+type BuildArgs = Parameters<typeof buildNotification>;
+
+function buildArgs(...args: BuildArgs): BuildArgs {
+  return args;
+}
+
 export class Notifier {
   readonly #opts: NotifierOptions;
   readonly #channels: ChannelState[];
@@ -242,8 +248,7 @@ export class Notifier {
       filter && filter.length > 0 ? incidents.filter((i) => filter.includes(i.checkId)) : incidents;
     const events = detectEvents(relevant, (key) => ledger.has(id, key) || channel.queued.has(key));
     for (const { key, event, incident } of events) {
-      channel.queued.add(key);
-      channel.delivery.enqueue(buildNotification(key, event, incident, names));
+      this.#enqueue(channel, buildArgs(key, event, incident, names));
     }
   }
 
@@ -271,9 +276,28 @@ export class Notifier {
         );
         continue;
       }
-      channel.queued.add(key);
-      channel.delivery.enqueue(buildNotification(key, found.event, found.incident, names));
+      this.#enqueue(channel, buildArgs(key, found.event, found.incident, names));
     }
+  }
+
+  /**
+   * Builds first, so a build error leaves the key unqueued and the next poll tries again.
+   * Only the build is caught: errors from `enqueue` must surface.
+   */
+  #enqueue(channel: ChannelState, args: BuildArgs): void {
+    let notification: Notification;
+    try {
+      notification = buildNotification(...args);
+    } catch (err) {
+      this.#opts.logger.log("error", "notification cannot be built, the next poll retries", {
+        channel: channel.config.id,
+        key: args[0],
+        ...errorFields(err),
+      });
+      return;
+    }
+    channel.queued.add(args[0]);
+    channel.delivery.enqueue(notification);
   }
 
   #findEvent(

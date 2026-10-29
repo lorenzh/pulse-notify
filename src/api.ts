@@ -43,6 +43,13 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+/** The range of `Date` in milliseconds; outside it `toISOString()` throws. */
+const MAX_DATE_MS = 8.64e15;
+
+function isDateMs(value: number): boolean {
+  return Math.abs(value) <= MAX_DATE_MS;
+}
+
 /** Returns the incident, or the reason why the raw value is not one. */
 function checkIncident(raw: unknown): Incident | string {
   if (typeof raw !== "object" || raw === null) return "not an object";
@@ -50,9 +57,11 @@ function checkIncident(raw: unknown): Incident | string {
   if (!isFiniteNumber(r.id)) return "id is not a number";
   if (typeof r.checkId !== "string") return "checkId is not a string";
   if (!isFiniteNumber(r.openedAt)) return "openedAt is not a finite number";
+  if (!isDateMs(r.openedAt)) return "openedAt is not a valid date";
   if (r.resolvedAt != null && !isFiniteNumber(r.resolvedAt)) {
     return "resolvedAt is not a finite number";
   }
+  if (r.resolvedAt != null && !isDateMs(r.resolvedAt)) return "resolvedAt is not a valid date";
   // The checks above are the trust boundary for the contract type.
   return raw as Incident;
 }
