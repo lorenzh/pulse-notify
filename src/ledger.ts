@@ -121,6 +121,8 @@ export interface LedgerOptions {
   schedule?: Schedule;
   /** Receives the error of a batched write that failed; the changes stay queued for the next write. */
   onError?: (err: Error) => void;
+  /** Test only: lets a test pause a batched write between its temp file and the rename. */
+  hooks?: { beforeRename?: () => Promise<void> };
 }
 
 /**
@@ -136,6 +138,7 @@ export class Ledger {
   readonly #now: () => number;
   readonly #schedule: Schedule;
   readonly #onError: (err: Error) => void;
+  readonly #beforeRename: (() => Promise<void>) | undefined;
   #data: LedgerData;
   #isDirty = false;
   #isClosed = false;
@@ -150,6 +153,7 @@ export class Ledger {
     this.#now = opts.now ?? Date.now;
     this.#schedule = opts.schedule ?? unrefSchedule;
     this.#onError = opts.onError ?? (() => {});
+    this.#beforeRename = opts.hooks?.beforeRename;
     this.#data = this.#load();
   }
 
@@ -216,7 +220,6 @@ export class Ledger {
   async #writeSnapshot(): Promise<void> {
     if (!this.#isDirty || this.#isClosed) return;
     const syncWrites = this.#syncWrites;
-    this.#isDirty = false;
     const text = JSON.stringify(this.#data);
     const tmp = `${this.#path}.batch.tmp`;
     try {
@@ -229,14 +232,29 @@ export class Ledger {
       }
       if (syncWrites !== this.#syncWrites || this.#isClosed) {
         // A sync write saved a newer state meanwhile; renaming this snapshot would undo it.
-        await unlink(tmp);
+        await discard(tmp);
         return;
       }
+      await this.#beforeRename?.();
       await rename(tmp, this.#path);
+      // The rename above is the only point where a sync write can slip in unseen: re-check.
+      if (syncWrites !== this.#syncWrites) {
+        if (!this.#isClosed) this.#writeSync();
+      } else {
+        this.#isDirty = this.#hasChangedSince(text);
+      }
     } catch (err) {
       this.#isDirty = true;
+      await discard(tmp).catch(() => {
+        // Best effort: the original error is the one to report.
+      });
       throw err;
     }
+  }
+
+  /** True when memory changed after the snapshot `text` was taken. */
+  #hasChangedSince(text: string): boolean {
+    return JSON.stringify(this.#data) !== text;
   }
 
   /** Writes the batched changes now. Rejects if that fails. Call it before the process exits. */
@@ -472,3 +490,12 @@ const unrefSchedule: Schedule = (fn, ms) => {
   timer.unref();
   return () => clearTimeout(timer);
 };
+
+/** Removes a temp file; a missing file is fine. */
+async function discard(tmp: string): Promise<void> {
+  try {
+    await unlink(tmp);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+}

@@ -185,3 +185,21 @@ test("the startup log shows the API url without user info, query or fragment", a
   }
   await s.running.stop();
 });
+
+test("start creates a missing state directory and the lock", async () => {
+  const nested = join(dir, "missing", "deep", "state.json");
+  const t = setup({ env: { PULSE_NOTIFY_STATE: nested } });
+  await t.running.listening;
+  assert.equal(existsSync(`${nested}.lock`), true);
+  assert.deepEqual(t.exits, []);
+  await t.running.stop();
+});
+
+test("a state parent that is a file throws ConfigError", () => {
+  const blocker = join(dir, "blocker");
+  writeFileSync(blocker, "x");
+  assert.throws(
+    () => setup({ env: { PULSE_NOTIFY_STATE: join(blocker, "state.json") } }),
+    (err: unknown) => err instanceof ConfigError && /^cannot use state file /.test(err.message),
+  );
+});
