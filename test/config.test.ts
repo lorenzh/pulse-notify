@@ -40,6 +40,37 @@ const invalid: [string, unknown, RegExp][] = [
   ["checks with non-string", { channels: [{ ...file, checks: [1] }] }, /array of strings/],
 ];
 
+test("parseConfig rejects unknown keys and names the path and key", () => {
+  const cases: [unknown, string][] = [
+    [{ channels: [file], chanels: [] }, 'cfg.json: unknown key "chanels" in config'],
+    [{ channels: [{ ...file, check: ["a"] }] }, 'cfg.json: unknown key "check" in channels[0]'],
+    [{ channels: [file, { ...hook, path: "x" }] }, 'cfg.json: unknown key "path" in channels[1]'],
+    [{ channels: [{ ...file, url: "x" }] }, 'cfg.json: unknown key "url" in channels[0]'],
+  ];
+  for (const [raw, message] of cases) {
+    assert.throws(
+      () => parseConfig(raw, "cfg.json"),
+      (err) => err instanceof ConfigError && err.message === message,
+    );
+  }
+});
+
+test("loadSettings reads log level and health listener settings", () => {
+  const base = { PULSE_NOTIFY_CONFIG: "c" };
+  const s = loadSettings({
+    ...base,
+    PULSE_LOG_LEVEL: "debug",
+    PULSE_HEALTH_PORT: "9100",
+    PULSE_HEALTH_HOST: "0.0.0.0",
+  });
+  assert.equal(s.logLevel, "debug");
+  assert.equal(s.healthPort, 9100);
+  assert.equal(s.healthHost, "0.0.0.0");
+  assert.throws(() => loadSettings({ ...base, PULSE_LOG_LEVEL: "loud" }), /PULSE_LOG_LEVEL/);
+  assert.throws(() => loadSettings({ ...base, PULSE_HEALTH_PORT: "70000" }), /PULSE_HEALTH_PORT/);
+  assert.throws(() => loadSettings({ ...base, PULSE_HEALTH_PORT: "x" }), ConfigError);
+});
+
 for (const [label, raw, pattern] of invalid) {
   test(`parseConfig rejects: ${label}`, () => {
     assert.throws(
@@ -73,6 +104,9 @@ test("loadSettings applies defaults and validates", () => {
     retryMaxDelayMs: 60000,
     retryAttempts: 12,
     timeoutMs: 5000,
+    logLevel: "info",
+    healthPort: undefined,
+    healthHost: "127.0.0.1",
   });
   assert.equal(loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_NOTIFY_POLL_MS: "10" }).pollMs, 10);
   assert.throws(

@@ -13,7 +13,7 @@ PULSE_NOTIFY_CONFIG=./notify.json PULSE_API_URL=http://localhost:3000 npm start
 
 `npm start` runs `node src/index.ts`. The source runs unbuilt with Node type stripping. Stop it with `SIGINT` or `SIGTERM`; it exits with code 0.
 
-If `PULSE_NOTIFY_CONFIG` is missing or the config is invalid, it prints `configuration error: <message>` to stderr and exits with code 2.
+If `PULSE_NOTIFY_CONFIG` is missing or the config is invalid, it prints `pulse-notify: <message>` to stderr and exits with code 2.
 
 ## Docker
 

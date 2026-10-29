@@ -7,6 +7,7 @@ import { detectEvents, seedKeys } from "./detector.ts";
 import { errorFields } from "./errors.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Logger } from "./log.ts";
+import type { Metrics } from "./metrics.ts";
 import { defaultSchedule } from "./timeout.ts";
 import type {
   ChannelConfig,
@@ -35,6 +36,7 @@ export interface NotifierOptions {
   sleep?: Sleep;
   /** Schedules the next poll and request timeouts. */
   schedule?: Schedule;
+  metrics?: Metrics;
 }
 
 const realSleep: Sleep = (ms, signal) =>
@@ -119,6 +121,8 @@ export class Notifier {
           retryAttempts: opts.retryAttempts,
           logger: opts.logger,
           release: (key) => queued.delete(key),
+          onOutcome: (outcome) =>
+            opts.metrics?.deliveryDone(config.id, outcome === "delivered" ? "success" : "failure"),
         }),
       };
     });
@@ -205,8 +209,10 @@ export class Notifier {
       this.#reportRejected(result.rejected);
     } catch (err) {
       this.#opts.logger.log("error", "api poll failed", errorFields(err));
+      this.#opts.metrics?.pollDone("error");
       return;
     }
+    this.#opts.metrics?.pollDone("ok");
     const names = new Map(checks.map((c) => [c.id, c.name]));
     for (const channel of this.#channels) {
       this.#pollChannel(channel, incidents, names);
