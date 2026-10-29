@@ -7,7 +7,7 @@ Instructions for coding agents in this repository. They bind every change.
 pulse is an uptime monitor with a status page, split over several repositories. Work arrives as an
 issue with an approved spec from the meta repository; implement only the section for this
 repository. Node 24+ with native type stripping, ESM, npm, strict TypeScript (`tsc --noEmit`),
-`node:test`, Biome, Lefthook.
+`node:test`, Biome, ESLint, Lefthook.
 
 ## Commands
 
@@ -19,7 +19,7 @@ repository. Node 24+ with native type stripping, ESM, npm, strict TypeScript (`t
 | Tests whose name matches                                      | `node --test --test-name-pattern "<text>"` |
 | Typecheck                                                     | `npm run typecheck`                        |
 | Lint and format check / apply fixes                           | `npm run lint` / `npm run format`          |
-- A change is done when `npm run check` passes; the pre-commit hook runs only Biome. Never run `git commit --no-verify`, and never weaken the shared config (`biome.json`, `tsconfig.json`, CI) to pass.
+- A change is done when `npm run check` passes; the pre-commit hook runs Biome and ESLint. Never run `git commit --no-verify`, and never weaken the shared config (`biome.json`, `tsconfig.json`, CI) to pass.
 
 ## Repository boundaries
 

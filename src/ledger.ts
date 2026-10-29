@@ -20,6 +20,13 @@ interface LedgerData {
   payloads?: Record<string, Record<string, Notification>>;
 }
 
+/** Trust boundary: the file content is checked only as far as the ledger relies on it. */
+function isLedgerData(value: unknown): value is LedgerData {
+  if (typeof value !== "object" || value === null) return false;
+  const { version, channels } = value as { version?: unknown; channels?: unknown };
+  return version === 1 && typeof channels === "object" && channels !== null;
+}
+
 export interface PendingEntry {
   channelId: string;
   key: string;
@@ -48,11 +55,12 @@ export class Ledger {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, channels: {} };
       throw err;
     }
-    const parsed = JSON.parse(text) as LedgerData;
-    if (parsed?.version !== 1 || typeof parsed.channels !== "object" || !parsed.channels) {
+    const raw: unknown = JSON.parse(text);
+    if (!isLedgerData(raw)) {
       throw new Error(`ledger ${this.#path} has an unsupported format`);
     }
-    if (typeof parsed.payloads !== "object" || parsed.payloads === null) delete parsed.payloads;
+    const parsed = raw;
+    if (typeof parsed.payloads !== "object" || !parsed.payloads) delete parsed.payloads;
     return parsed;
   }
 

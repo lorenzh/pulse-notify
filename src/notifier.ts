@@ -26,11 +26,11 @@ export interface NotifierOptions {
   pollMs?: number;
   /** Delay before the first retry; it doubles up to `retryMaxDelayMs`. */
   retryDelayMs?: number;
-  retryMaxDelayMs?: number;
+  retryMaxDelayMs?: number | undefined;
   /** Total attempts per event; 0 retries without end. */
-  retryAttempts?: number;
-  timeoutMs?: number;
-  fetch?: typeof fetch;
+  retryAttempts?: number | undefined;
+  timeoutMs?: number | undefined;
+  fetch?: typeof fetch | undefined;
   /** Waits between delivery attempts. */
   sleep?: Sleep;
   /** Schedules the next poll and request timeouts. */

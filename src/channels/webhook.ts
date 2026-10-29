@@ -2,8 +2,8 @@ import { fetchWithTimeout } from "../timeout.ts";
 import type { Schedule, Sender, WebhookChannelConfig } from "../types.ts";
 
 export interface WebhookOptions {
-  fetch?: typeof fetch;
-  timeoutMs?: number;
+  fetch?: typeof fetch | undefined;
+  timeoutMs?: number | undefined;
   schedule?: Schedule;
 }
 

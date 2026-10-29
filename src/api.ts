@@ -11,9 +11,9 @@ import type { Schedule } from "./types.ts";
 
 export interface ApiOptions {
   baseUrl: string;
-  fetch?: typeof fetch;
-  timeoutMs?: number;
-  schedule?: Schedule;
+  fetch?: typeof fetch | undefined;
+  timeoutMs?: number | undefined;
+  schedule?: Schedule | undefined;
   /** Called when a response has no wire version header. */
   onVersionAbsent?: () => void;
   /** Called with the contract error for each check that is skipped. */
@@ -64,13 +64,15 @@ function isDateMs(value: number): boolean {
 }
 
 /** Returns the incident, or the reason why the raw value is not one. */
-function checkIncident(raw: unknown, path: string): Incident | string {
+function checkIncident(raw: unknown, path: string): { incident: Incident } | { reason: string } {
   const validated = validateIncident(raw, path);
-  if (!validated.ok) return validated.error;
+  if (!validated.ok) return { reason: validated.error };
   const { openedAt, resolvedAt } = validated.value;
-  if (!isDateMs(openedAt)) return "openedAt is not a valid date";
-  if (resolvedAt != null && !isDateMs(resolvedAt)) return "resolvedAt is not a valid date";
-  return validated.value;
+  if (!isDateMs(openedAt)) return { reason: "openedAt is not a valid date" };
+  if (resolvedAt != null && !isDateMs(resolvedAt)) {
+    return { reason: "resolvedAt is not a valid date" };
+  }
+  return { incident: validated.value };
 }
 
 export async function fetchIncidents(opts: ApiOptions): Promise<IncidentsResult> {
@@ -78,11 +80,11 @@ export async function fetchIncidents(opts: ApiOptions): Promise<IncidentsResult>
   const items = await getArray(opts, "incidents");
   for (const [i, raw] of items.entries()) {
     const checked = checkIncident(raw, `incidents[${i}]`);
-    if (typeof checked === "string") {
+    if ("reason" in checked) {
       const id = typeof raw === "object" && raw !== null ? (raw as { id?: unknown }).id : undefined;
-      result.rejected.push({ id, reason: checked });
+      result.rejected.push({ id, reason: checked.reason });
     } else {
-      result.incidents.push(checked);
+      result.incidents.push(checked.incident);
     }
   }
   return result;
