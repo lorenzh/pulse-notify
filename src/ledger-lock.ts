@@ -1,4 +1,5 @@
-import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { ConfigError } from "./config.ts";
 import type { Logger } from "./log.ts";
 
@@ -24,7 +25,15 @@ export interface LockDeps {
   logger?: Logger | undefined;
   /** A new random token per lock holder. */
   token: () => string;
+  /** Age in ms after which a takeover marker counts as left by a crashed takeover. Default 10 s. */
+  markerStaleMs?: number;
+  /** Test only: called after the first holder read, before the takeover decision. */
+  afterHolderRead?: () => void;
+  /** Test only: called after the takeover marker is taken, before the lock file is removed. */
+  afterMarker?: () => void;
 }
+
+const MARKER_STALE_MS = 10_000;
 
 interface LockContent {
   pid: number;
@@ -158,24 +167,109 @@ function create(path: string, deps: LockDeps): LedgerLock | undefined {
   return new LedgerLock(path, deps, content);
 }
 
+interface MarkerContent {
+  pid: number;
+  hostname: string;
+  token: string;
+  at: number;
+}
+
+/** Trust boundary: the marker is written by another process. */
+function parseMarker(text: string): MarkerContent | undefined {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    // Not JSON: the caller treats the marker as live.
+    return undefined;
+  }
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const { pid, hostname, token, at } = raw as Record<string, unknown>;
+  if (
+    typeof pid !== "number" ||
+    typeof hostname !== "string" ||
+    typeof token !== "string" ||
+    typeof at !== "number"
+  ) {
+    return undefined;
+  }
+  return { pid, hostname, token, at };
+}
+
+function markerError(marker: string, lockPath: string): ConfigError {
+  return new ConfigError(
+    `another pulse-notify is taking over the state lock ${lockPath} (remove ${marker} if no pulse-notify runs)`,
+  );
+}
+
+function readMarkerText(marker: string): string | undefined {
+  try {
+    return readFileSync(marker, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+}
+
+/** Writes the marker with `wx`; false when it exists. */
+function createMarker(marker: string, deps: LockDeps): string | undefined {
+  const token = deps.token();
+  const content: MarkerContent = {
+    pid: deps.pid,
+    hostname: deps.hostname(),
+    token,
+    at: deps.now(),
+  };
+  try {
+    writeFileSync(marker, JSON.stringify(content), { flag: "wx" });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return undefined;
+    throw err;
+  }
+  return token;
+}
+
+function isMarkerStale(content: MarkerContent | undefined, deps: LockDeps): boolean {
+  if (!content) return false;
+  if (deps.now() - content.at >= (deps.markerStaleMs ?? MARKER_STALE_MS)) return true;
+  return content.hostname === deps.hostname() && !deps.isPidAlive(content.pid);
+}
+
 /**
- * Takes the lock `<statePath>.lock` or throws a `ConfigError` (exit 2) when a live process holds it.
- * A stale lock is replaced with a warning; the winner of two racing takeovers is the one whose
- * token is in the file afterwards.
+ * Takes the takeover marker. A stale marker (crashed takeover) is removed once and `wx` retried.
+ * Returns the marker token, or throws `ConfigError` when another takeover is live or unreadable.
  */
-export function acquireLock(statePath: string, deps: LockDeps): LedgerLock {
-  const path = `${statePath}.lock`;
-  const first = create(path, deps);
-  if (first) return first;
-  const read = readContent(path);
-  if (read.state === "missing") {
-    // Removed between our two calls: one more try.
-    const retry = create(path, deps);
-    if (retry) return retry;
+function takeMarker(marker: string, lockPath: string, deps: LockDeps): string {
+  const token = createMarker(marker, deps);
+  if (token) return token;
+  const text = readMarkerText(marker);
+  if (text !== undefined) {
+    if (!isMarkerStale(parseMarker(text), deps)) throw markerError(marker, lockPath);
+    // Remove only the content we judged stale; a fresh marker of another contender stays.
+    if (readMarkerText(marker) === text) removeFile(marker);
+  }
+  const retry = createMarker(marker, deps);
+  if (!retry) throw markerError(marker, lockPath);
+  return retry;
+}
+
+function releaseMarker(marker: string, token: string): void {
+  const text = readMarkerText(marker);
+  const content = text === undefined ? undefined : parseMarker(text);
+  if (content?.token === token) removeFile(marker);
+}
+
+/** Takes over the stale lock under the marker; the caller holds the marker. */
+function takeOver(path: string, deps: LockDeps): LedgerLock {
+  const fresh = readContent(path);
+  if (fresh.state === "missing") {
+    const created = create(path, deps);
+    if (created) return created;
     throw inUse(path, holderOf(readContent(path)), deps.now());
   }
-  const holder = holderOf(read);
+  const holder = holderOf(fresh);
   if (!isStale(holder, deps)) throw inUse(path, holder, deps.now());
+  deps.afterMarker?.();
   deps.logger?.log("warn", "taking over a stale state lock", {
     path,
     ...(holder ? { holderHostname: holder.hostname, holderPid: holder.pid } : {}),
@@ -187,6 +281,50 @@ export function acquireLock(statePath: string, deps: LockDeps): LedgerLock {
     throw inUse(path, confirmed, deps.now());
   }
   return taken;
+}
+
+function isErrno(err: unknown): err is NodeJS.ErrnoException {
+  return err instanceof Error && typeof (err as NodeJS.ErrnoException).code === "string";
+}
+
+/**
+ * Takes the lock `<statePath>.lock` or throws a `ConfigError` (exit 2) when a live process holds it
+ * or the path cannot be used. The parent directory is created first. A stale lock is replaced
+ * under the marker `<statePath>.lock.takeover`, so only one contender takes over.
+ */
+export function acquireLock(statePath: string, deps: LockDeps): LedgerLock {
+  try {
+    mkdirSync(dirname(statePath), { recursive: true });
+    return acquire(statePath, deps);
+  } catch (err) {
+    if (err instanceof ConfigError || !isErrno(err)) throw err;
+    throw new ConfigError(`cannot use state file ${statePath}: ${err.message.split("\n")[0]}`, {
+      cause: err,
+    });
+  }
+}
+
+function acquire(statePath: string, deps: LockDeps): LedgerLock {
+  const path = `${statePath}.lock`;
+  const first = create(path, deps);
+  if (first) return first;
+  const read = readContent(path);
+  if (read.state === "missing") {
+    // Removed between our two calls: one more try.
+    const retry = create(path, deps);
+    if (retry) return retry;
+    throw inUse(path, holderOf(readContent(path)), deps.now());
+  }
+  const holder = holderOf(read);
+  deps.afterHolderRead?.();
+  if (!isStale(holder, deps)) throw inUse(path, holder, deps.now());
+  const marker = `${path}.takeover`;
+  const markerToken = takeMarker(marker, path, deps);
+  try {
+    return takeOver(path, deps);
+  } finally {
+    releaseMarker(marker, markerToken);
+  }
 }
 
 function removeFile(path: string): void {

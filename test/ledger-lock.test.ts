@@ -160,3 +160,109 @@ test("the heartbeat interval is a sixth of the lease", () => {
   assert.equal(heartbeatIntervalSeconds(60), 10);
   assert.equal(heartbeatIntervalSeconds(30), 5);
 });
+
+test("two contenders on one stale lock: exactly one wins, the winner's lock stays", () => {
+  const state = statePath();
+  writeLock(state, { pid: 55, hostname: "host-a", token: "old", heartbeat: 1 });
+  const isAlive = (pid: number): boolean => pid !== 55;
+  let loser: unknown;
+  let inner: ReturnType<typeof acquireLock> | undefined;
+  const outerDeps = deps({
+    isPidAlive: isAlive,
+    token: () => "token-a",
+    afterHolderRead: () => {
+      // B runs completely inside A's window and wins.
+      inner = acquireLock(state, deps({ isPidAlive: isAlive, token: () => "token-b", pid: 200 }));
+    },
+  });
+  try {
+    acquireLock(state, outerDeps);
+  } catch (err) {
+    loser = err;
+  }
+  assert.ok(inner);
+  assert.ok(loser instanceof ConfigError);
+  assert.equal(read(state).token, "token-b");
+  assert.equal(existsSync(`${state}.lock.takeover`), false);
+});
+
+test("a contender that meets a live marker loses and leaves the marker", () => {
+  const state = statePath();
+  writeLock(state, { pid: 55, hostname: "host-a", token: "old", heartbeat: 1 });
+  writeFileSync(
+    `${state}.lock.takeover`,
+    JSON.stringify({ pid: 300, hostname: "host-a", token: "m", at: 999_999 }),
+  );
+  assert.throws(
+    () => acquireLock(state, deps({ isPidAlive: (pid) => pid !== 55 })),
+    (err: unknown) => err instanceof ConfigError && /\.lock\.takeover/.test(err.message),
+  );
+  assert.equal(read(state).token, "old");
+  assert.equal(existsSync(`${state}.lock.takeover`), true);
+});
+
+test("a stale marker (old time, or dead pid) is cleared and the takeover succeeds", () => {
+  for (const marker of [
+    { pid: 300, hostname: "host-a", token: "m", at: 1 },
+    { pid: 301, hostname: "host-a", token: "m", at: 999_999 },
+  ]) {
+    const state = statePath();
+    writeLock(state, { pid: 55, hostname: "host-a", token: "old", heartbeat: 1 });
+    writeFileSync(`${state}.lock.takeover`, JSON.stringify(marker));
+    const lock = acquireLock(state, deps({ isPidAlive: (pid) => pid === 300 }));
+    assert.ok(lock);
+    assert.equal(read(state).token, "token-own");
+    assert.equal(existsSync(`${state}.lock.takeover`), false);
+  }
+});
+
+test("a corrupt marker fails closed with the marker path", () => {
+  const state = statePath();
+  writeLock(state, { pid: 55, hostname: "host-a", token: "old", heartbeat: 1 });
+  writeFileSync(`${state}.lock.takeover`, "{nope");
+  assert.throws(
+    () => acquireLock(state, deps({ isPidAlive: () => false })),
+    (err: unknown) => err instanceof ConfigError && err.message.includes(`${state}.lock.takeover`),
+  );
+  assert.equal(existsSync(`${state}.lock.takeover`), true);
+});
+
+test("the marker is removed when the takeover fails", () => {
+  const state = statePath();
+  writeLock(state, { pid: 55, hostname: "host-a", token: "old", heartbeat: 1 });
+  let alive = false;
+  assert.throws(
+    () =>
+      acquireLock(
+        state,
+        deps({
+          isPidAlive: () => alive,
+          afterHolderRead: () => {
+            alive = true; // the holder revives between the read and the re-check
+          },
+        }),
+      ),
+    ConfigError,
+  );
+  assert.equal(existsSync(`${state}.lock.takeover`), false);
+  assert.equal(read(state).token, "old");
+});
+
+test("the parent directory is created before the lock", () => {
+  const state = join(dir, "a", "b", "state.json");
+  const lock = acquireLock(state, deps());
+  assert.equal(existsSync(`${state}.lock`), true);
+  lock.release();
+});
+
+test("a parent that is a file gives one ConfigError line", () => {
+  const file = statePath();
+  writeFileSync(file, "x");
+  assert.throws(
+    () => acquireLock(join(file, "state.json"), deps()),
+    (err: unknown) =>
+      err instanceof ConfigError &&
+      err.message.startsWith("cannot use state file ") &&
+      !err.message.includes("\n"),
+  );
+});
