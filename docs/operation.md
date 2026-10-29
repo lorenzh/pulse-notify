@@ -47,3 +47,9 @@ Logs are JSON lines on stderr. Each line has `time` (ISO 8601 UTC), `level` (`in
 `error` is the message of the error. `code` (for example `ECONNREFUSED`, `ENOTFOUND`, `CERT_HAS_EXPIRED`) and `cause` (the message of the innermost cause) appear when the error has them. `fetch failed` alone says little; `code` and `cause` say why.
 
 Startup configuration errors are not JSON. They are one line on stderr: `configuration error: <message>`, exit code 2.
+
+## API validation and version check
+
+Every item from `GET /incidents` and `GET /checks` is validated with the validators of `@lorenzh/pulse-contract` (`validateIncident`, `validateCheck`). An invalid incident or check is skipped and logged once with a path such as `incidents[0].checkId: ...`. Incidents also need `openedAt` and `resolvedAt` inside the range of `Date`.
+
+Each API response is checked with `checkWireVersion` against the `x-pulse-contract` header. A mismatch fails the poll like a network error (logged as `api poll failed`). A missing header is logged once as a warning and the poll continues.

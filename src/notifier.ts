@@ -193,6 +193,8 @@ export class Notifier {
       fetch: this.#opts.fetch,
       timeoutMs: this.#opts.timeoutMs,
       schedule: this.#opts.schedule,
+      onVersionAbsent: () => this.#reportVersionAbsent(),
+      onInvalidCheck: (error: string) => this.#reportInvalidCheck(error),
     };
     let incidents: Incident[];
     let checks: Check[];
@@ -209,6 +211,19 @@ export class Notifier {
     for (const channel of this.#channels) {
       this.#pollChannel(channel, incidents, names);
     }
+  }
+
+  #reportVersionAbsent(): void {
+    if (this.#reported.has("wire-version-absent")) return;
+    this.#reported.add("wire-version-absent");
+    this.#opts.logger.log("warn", "api sent no wire version header; continuing");
+  }
+
+  #reportInvalidCheck(error: string): void {
+    const key = `check:${error}`;
+    if (this.#reported.has(key)) return;
+    this.#reported.add(key);
+    this.#opts.logger.log("warn", "check skipped: malformed data", { reason: error });
   }
 
   #reportRejected(rejected: { id: unknown; reason: string }[]): void {
