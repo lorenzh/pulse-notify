@@ -11,7 +11,10 @@ import { dirname } from "node:path";
 
 import type { Notification } from "./types.ts";
 
-/** `dropped`: a reminder that was not sent because its incident resolved first. */
+/**
+ * `dropped`: a reminder that was not sent because its incident resolved first.
+ * A newer reminder with any status except `dropped` supersedes an older one.
+ */
 export type LedgerStatus = "seeded" | "pending" | "delivered" | "failed" | "dropped";
 
 interface LedgerData {

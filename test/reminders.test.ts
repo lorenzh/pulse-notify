@@ -263,3 +263,19 @@ test("after failed intervals only the latest reminder is delivered", async () =>
   await n.stop();
   assert.deepEqual(keys(), ["1:opened", "1:reminder:4"]);
 });
+
+test("a failed newer reminder still supersedes an older pending one", async () => {
+  const ledger = new Ledger(join(dir, "state.json"));
+  ledger.seed("hook", ["1:opened"]);
+  ledger.claim("hook", "1:reminder:1", reminder(1));
+  ledger.claim("hook", "1:reminder:2", reminder(2));
+  ledger.settle("hook", "1:reminder:2", "failed");
+  api.incidents = [incident({ id: 1, openedAt: OPENED })];
+  clock = OPENED + 10 * MINUTE;
+  const n = make();
+  n.start();
+  await n.tick();
+  await n.idle();
+  await n.stop();
+  assert.deepEqual(keys(), []);
+});
