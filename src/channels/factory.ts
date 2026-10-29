@@ -3,8 +3,9 @@ import type { ChannelConfig, Schedule, Sender } from "../types.ts";
 import { createEmailSender } from "./email.ts";
 import { createFileSender } from "./file.ts";
 import { isLoopbackHost } from "./loopback.ts";
+import type { SendMail } from "./mailer.ts";
 import { createSlackSender } from "./slack.ts";
-import { type SendMail, sendMail } from "./smtp.ts";
+import { sendMail } from "./smtp-send.ts";
 import { createTeamsSender } from "./teams.ts";
 import { createWebhookSender } from "./webhook.ts";
 

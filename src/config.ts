@@ -1,8 +1,7 @@
 import { readFileSync } from "node:fs";
 import { DEFAULT_API_MAX_BYTES } from "./api.ts";
-import { envelopeAddress } from "./channels/email.ts";
 import { isLoopbackHost } from "./channels/loopback.ts";
-import { isEhloName } from "./channels/smtp.ts";
+import { envelopeAddress, isEhloName } from "./channels/mailer.ts";
 import {
   DEFAULT_RETRY_ATTEMPTS,
   DEFAULT_RETRY_DELAY_MS,

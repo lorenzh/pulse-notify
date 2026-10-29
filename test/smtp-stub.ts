@@ -50,7 +50,7 @@ export interface SmtpStubOptions {
   /** Offer and accept STARTTLS with this certificate. */
   starttls?: TestCert;
   /** AUTH mechanisms to offer; default none. */
-  auth?: ("PLAIN" | "LOGIN")[];
+  auth?: ("PLAIN" | "LOGIN" | "CRAM-MD5")[];
   /** Reply to the first command that starts with the key, instead of the normal one. */
   replies?: Record<string, string>;
   /** Greeting line; default "220 stub ready". */
