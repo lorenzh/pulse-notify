@@ -71,6 +71,10 @@ export interface SmtpStub {
   commands: string[];
   /** Raw DATA content of each accepted message, without the final dot line. */
   messages: string[];
+  /** Connections accepted so far. */
+  accepted: number;
+  /** Connections that are open now. */
+  open: number;
   /** Resolves when the first connection to the stub is closed. */
   firstClosed: Promise<void>;
   close(): Promise<void>;
@@ -195,6 +199,8 @@ export async function startSmtpStub(options: SmtpStubOptions = {}): Promise<Smtp
     port: 0,
     commands: [],
     messages: [],
+    accepted: 0,
+    open: 0,
     firstClosed: new Promise((resolve) => {
       onFirstClose = resolve;
     }),
@@ -206,8 +212,11 @@ export async function startSmtpStub(options: SmtpStubOptions = {}): Promise<Smtp
   };
   const server: Server = createServer((socket) => {
     sockets.add(socket);
+    stub.accepted += 1;
+    stub.open += 1;
     socket.on("close", () => {
       sockets.delete(socket);
+      stub.open -= 1;
       onFirstClose();
     });
     new Connection(stub, options, false).attach(socket);
@@ -229,6 +238,8 @@ export async function startTlsSmtpStub(
     port: 0,
     commands: [],
     messages: [],
+    accepted: 0,
+    open: 0,
     // Not tracked for the TLS stub.
     firstClosed: Promise.resolve(),
     close: () =>
@@ -240,7 +251,12 @@ export async function startTlsSmtpStub(
   const sockets = new Set<Socket>();
   const server = createTlsServer({ key: cert.key, cert: cert.cert }, (socket) => {
     sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
+    stub.accepted += 1;
+    stub.open += 1;
+    socket.on("close", () => {
+      sockets.delete(socket);
+      stub.open -= 1;
+    });
     new Connection(stub, options, true).attach(socket);
     socket.write("220 stub ready\r\n");
   });
