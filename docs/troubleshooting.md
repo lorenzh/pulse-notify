@@ -24,7 +24,7 @@ Messages are quoted from the code. `<x>` marks a value that varies.
 | `pulse-notify: cannot use state file <path>: <reason>` (exit code 2)     | The state file is JSON but not a version 1 ledger.                                   | Check `PULSE_NOTIFY_STATE` points to the right file. Move it away to start with a new ledger (all channels are seeded again). |
 | `pulse-notify: cannot use state file <path>: <JSON error>` (exit code 2) | The state file is not valid JSON, for example after a manual edit or a disk problem. | Restore a copy, or move the file away.                                                                                        |
 
-Other startup lines: `pulse-notify: <file>: unknown key "<key>" in <place>` (a misspelled or unsupported key in the config file; fix or remove it), `pulse-notify: PULSE_LOG_LEVEL must be one of debug, info, warn, error`, `pulse-notify: PULSE_HEALTH_PORT must be an integer from 0 to 65535`.
+Other startup lines: `pulse-notify: <file>: unknown key "<key>" in <place>` (a misspelled or unsupported key in the config file; fix or remove it), `pulse-notify: PULSE_LOG_LEVEL must be one of debug, info, warn, error`, `pulse-notify: PULSE_HEALTH_PORT must be an integer from 0 to 65535`, `pulse-notify: cannot listen on <host>:<port> (PULSE_HEALTH_HOST/PULSE_HEALTH_PORT): <reason>` (the health port is taken or not allowed; the exit code is 2 and no polling starts).
 
 ## While running
 
