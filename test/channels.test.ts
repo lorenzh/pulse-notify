@@ -21,6 +21,13 @@ import {
   startReceiver,
 } from "./support.ts";
 
+let current: Ledger | undefined;
+
+function newLedger(): Ledger {
+  current = new Ledger(join(dir, "state.json"));
+  return current;
+}
+
 const SIGNING_KEY = "k".repeat(12);
 
 let api: FakeApi;
@@ -62,7 +69,7 @@ function make(channels: ChannelConfig[], retryAttempts = 3, metrics?: Metrics): 
   return new Notifier({
     config: { channels },
     apiUrl: api.url,
-    ledger: new Ledger(join(dir, "state.json")),
+    ledger: newLedger(),
     logger,
     retryDelayMs: 1,
     retryAttempts,
@@ -126,7 +133,7 @@ test("HTTP 500 and 429 are retried until delivered; redirects fail", async () =>
       channels: [{ id: "s", type: "slack", url: "https://hooks.example.test/T/secret-path" }],
     },
     apiUrl: api.url,
-    ledger: new Ledger(join(dir, "state.json")),
+    ledger: newLedger(),
     logger,
     retryDelayMs: 1,
     retryAttempts: 5,
@@ -255,8 +262,9 @@ test("an SMTP error that never clears ends as failed", async () => {
   await openIncident(n);
   assert.ok(mailCalls > 0);
   assert.ok(logger.entries.some((e) => e.msg === "notification delivery failed"));
+  await current?.flush();
   const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
-  assert.equal(state.channels.m["1:opened"], "failed");
+  assert.equal(state.channels.m["1:opened"].status, "failed");
 });
 
 test("routing: checks pattern and excludeChecks apply to every channel type", async () => {
@@ -302,7 +310,8 @@ test("no secret, URL or password appears in logs or metrics", async () => {
   const dump = JSON.stringify(logger.entries) + metrics.render();
   assert.ok(mailCalls > 0);
   assert.ok(logger.entries.some((e) => e.msg === "notification delivery failed"));
+  await current?.flush();
   const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
-  assert.equal(state.channels.m["1:opened"], "failed");
+  assert.equal(state.channels.m["1:opened"].status, "failed");
   for (const secret of secrets) assert.equal(dump.includes(secret), false, secret);
 });

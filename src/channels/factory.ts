@@ -15,6 +15,9 @@ export interface SenderDeps {
   now?: (() => number) | undefined;
   logger: Logger;
   sendMail?: SendMail | undefined;
+  /** Global EHLO name for email channels. */
+  smtpClientName?: string | undefined;
+  hostname?: (() => string) | undefined;
 }
 
 function warnIfPlainHttp(url: string, id: string, logger: Logger): void {
@@ -36,7 +39,11 @@ export function createSender(config: ChannelConfig, deps: SenderDeps): Sender {
     case "teams":
       return createTeamsSender(config, deps);
     case "email":
-      return createEmailSender(config, { ...deps, sendMail: deps.sendMail ?? sendMail });
+      return createEmailSender(config, {
+        ...deps,
+        clientName: deps.smtpClientName,
+        sendMail: deps.sendMail ?? sendMail,
+      });
     default: {
       const unreachable: never = config;
       throw new Error(`unknown channel type ${JSON.stringify(unreachable)}`);

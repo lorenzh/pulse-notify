@@ -24,7 +24,7 @@ function tmpPath(): string {
   return join(mkdtempSync(join(tmpdir(), "notify-ledger-")), "sub", "state.json");
 }
 
-test("state persists across instances", () => {
+test("state persists across instances", async () => {
   const path = tmpPath();
   const a = new Ledger(path);
   assert.equal(a.hasChannel("c"), false);
@@ -34,6 +34,7 @@ test("state persists across instances", () => {
   a.settle("c", "3:opened", "delivered");
   assert.equal(a.claim("c", "4:opened", note("4:opened")), true);
   a.settle("c", "4:opened", "failed");
+  await a.flush();
 
   const b = new Ledger(path);
   assert.equal(b.hasChannel("c"), true);
@@ -67,15 +68,16 @@ test("a corrupt ledger is an error, not an empty state", () => {
   new Ledger(path).seed("c", []);
   writeFileSync(path, "{bad");
   assert.throws(() => new Ledger(path));
-  writeFileSync(path, JSON.stringify({ version: 2 }));
+  writeFileSync(path, JSON.stringify({ version: 3, channels: {} }));
   assert.throws(() => new Ledger(path), /unsupported format/);
 });
 
-test("settle removes the payload; a ledger without payloads loads", () => {
+test("settle removes the payload; a ledger without payloads loads", async () => {
   const path = tmpPath();
   const a = new Ledger(path);
   a.claim("c", "1:opened", note("1:opened"));
   a.settle("c", "1:opened", "delivered");
+  await a.flush();
   assert.deepEqual(new Ledger(path).pending(), []);
   assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).payloads, { c: {} });
 
@@ -83,7 +85,7 @@ test("settle removes the payload; a ledger without payloads loads", () => {
   assert.deepEqual(new Ledger(path).pending(), [{ channelId: "c", key: "9:opened" }]);
 });
 
-test("a failed write leaves the state unchanged", () => {
+test("a failed sync write leaves the state unchanged", () => {
   const path = tmpPath();
   const ledger = new Ledger(path);
   ledger.seed("c", []);
@@ -95,7 +97,4 @@ test("a failed write leaves the state unchanged", () => {
   assert.equal(ledger.hasChannel("d"), false);
   rmSync(`${path}.tmp`, { recursive: true });
   assert.equal(ledger.claim("c", "1:opened", note("1:opened")), true);
-  mkdirSync(`${path}.tmp`);
-  assert.throws(() => ledger.settle("c", "1:opened", "delivered"));
-  assert.equal(ledger.status("c", "1:opened"), "pending");
 });

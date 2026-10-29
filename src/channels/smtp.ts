@@ -1,5 +1,6 @@
 import { isIP, connect as netConnect, type Socket } from "node:net";
 import { type ConnectionOptions, connect as tlsConnect } from "node:tls";
+import { PermanentDeliveryError } from "../errors.ts";
 import { defaultSchedule } from "../timeout.ts";
 import type { Schedule, SmtpConfig } from "../types.ts";
 import { isLoopbackHost } from "./loopback.ts";
@@ -11,9 +12,37 @@ export class SmtpError extends Error {
   }
 }
 
+export const DEFAULT_CLIENT_NAME = "localhost";
+
+const HOST_LABEL = /^[A-Za-z0-9-]{1,63}$/;
+const LITERAL_BODY = /^[0-9A-Fa-f:.]+$/;
+
+function isAddressLiteral(value: string): boolean {
+  if (!value.startsWith("[") || !value.endsWith("]")) return false;
+  return LITERAL_BODY.test(value.slice(1, -1).replace(/^IPv6:/, ""));
+}
+
+function isHostName(value: string): boolean {
+  return value
+    .split(".")
+    .every((label) => HOST_LABEL.test(label) && !label.startsWith("-") && !label.endsWith("-"));
+}
+
+/** True for a host name or an address literal (`[192.0.2.1]`) of at most 255 characters. */
+export function isEhloName(value: string): boolean {
+  return value.length <= 255 && (isHostName(value) || isAddressLiteral(value));
+}
+
+/** An EHLO token from a machine host name: invalid characters become `-`; `localhost` if nothing is left. */
+export function ehloNameFrom(hostname: string): string {
+  const chars = [...hostname.replaceAll(/[^A-Za-z0-9.-]/g, "-")];
+  while (chars[0] === "-" || chars[0] === ".") chars.shift();
+  while (chars.at(-1) === "-" || chars.at(-1) === ".") chars.pop();
+  const cleaned = chars.join("");
+  return isEhloName(cleaned) ? cleaned : DEFAULT_CLIENT_NAME;
+}
+
 export interface SmtpOptions extends SmtpConfig {
-  /** Name sent with EHLO. */
-  clientName?: string;
   timeoutMs: number;
   schedule?: Schedule | undefined;
   signal?: AbortSignal | undefined;
@@ -35,36 +64,57 @@ export type SendMail = (smtp: SmtpOptions, message: SmtpMessage) => Promise<void
 interface Reply {
   code: number;
   lines: string[];
+  /** Characters of all lines, for the size cap. */
+  size: number;
 }
 
+/** One limit for a whole attempt: the timer starts at connect and the abort signal joins it. */
 interface Guard {
-  ms: number;
-  schedule: Schedule;
-  signal: AbortSignal | undefined;
+  /** Rejects when the attempt timer fires or the signal aborts. Never resolves. */
+  limit: Promise<never>;
+  /** The stage that the timeout message names. */
+  stage: { name: string };
 }
 
 const MAX_BUFFER = 64 * 1024;
+/** Longest reply in lines, and most bytes held in unread reply lines. */
+const MAX_REPLY_LINES = 100;
+const MAX_REPLY_BYTES = 64 * 1024;
 
-/** Rejects when `promise` does, or when the guard's timer fires or its signal aborts. */
-function guarded<T>(promise: Promise<T>, guard: Guard, what: string): Promise<T> {
+function createGuard(
+  ms: number,
+  schedule: Schedule,
+  signal: AbortSignal | undefined,
+): { guard: Guard; dispose: () => void } {
+  const stage = { name: "connect" };
   let cancel: () => void = () => {};
   let detach: () => void = () => {};
   const limit = new Promise<never>((_, reject) => {
-    cancel = guard.schedule(
-      () => reject(new SmtpError(`SMTP ${what} timed out after ${guard.ms}ms`)),
-      guard.ms,
+    cancel = schedule(
+      () => reject(new SmtpError(`SMTP ${stage.name} timed out after ${ms}ms`)),
+      ms,
     );
-    const { signal } = guard;
     if (!signal) return;
     const onAbort = (): void => reject(new SmtpError("SMTP send aborted"));
     if (signal.aborted) onAbort();
     signal.addEventListener("abort", onAbort, { once: true });
     detach = () => signal.removeEventListener("abort", onAbort);
   });
-  return Promise.race([promise, limit]).finally(() => {
-    cancel();
-    detach();
-  });
+  // The race in `guarded` handles a rejection; this keeps an unraced one from being unhandled.
+  limit.catch(() => {});
+  return {
+    guard: { stage, limit },
+    dispose: () => {
+      cancel();
+      detach();
+    },
+  };
+}
+
+/** Rejects when `promise` does, or when the attempt limit is reached. */
+function guarded<T>(promise: Promise<T>, guard: Guard, what: string): Promise<T> {
+  guard.stage.name = what;
+  return Promise.race([promise, guard.limit]);
 }
 
 /** Line and reply reader on top of a socket that can be upgraded to TLS. */
@@ -72,7 +122,8 @@ class Session {
   #socket: Socket;
   #buffer = "";
   #partial: string[] = [];
-  readonly #replies: Reply[] = [];
+  #partialSize = 0;
+  #replies: Reply[] = [];
   #failure: Error | undefined;
   #waiter: { resolve: (r: Reply) => void; reject: (e: Error) => void } | undefined;
   readonly #onData = (chunk: string): void => {
@@ -127,10 +178,17 @@ class Session {
       this.#fail(new SmtpError("SMTP server sent a malformed reply"));
       return;
     }
-    this.#partial.push(match[3] ?? "");
+    const text = match[3] ?? "";
+    this.#partial.push(text);
+    this.#partialSize += text.length + 4;
+    if (this.#isOverCap()) {
+      this.#fail(new SmtpError("SMTP reply too long"));
+      return;
+    }
     if (match[2] === "-") return;
-    const reply = { code: Number(match[1]), lines: this.#partial };
+    const reply = { code: Number(match[1]), lines: this.#partial, size: this.#partialSize };
     this.#partial = [];
+    this.#partialSize = 0;
     const waiter = this.#waiter;
     if (waiter) {
       this.#waiter = undefined;
@@ -138,6 +196,13 @@ class Session {
     } else {
       this.#replies.push(reply);
     }
+  }
+
+  /** Too many lines in one reply, or too many bytes in the partial plus the queued replies. */
+  #isOverCap(): boolean {
+    if (this.#partial.length > MAX_REPLY_LINES) return true;
+    const queued = this.#replies.reduce((sum, r) => sum + r.size, 0);
+    return queued + this.#partialSize > MAX_REPLY_BYTES;
   }
 
   #read(): Promise<Reply> {
@@ -161,7 +226,12 @@ class Session {
     if (!accept(reply.code)) {
       // AUTH replies can echo credentials, so only the code is reported.
       const text = what === "AUTH" ? "" : (reply.lines[0] ?? "").slice(0, 200);
-      throw new SmtpError(`SMTP ${what} failed: ${reply.code} ${text}`.trim());
+      const message = `SMTP ${what} failed: ${reply.code} ${text}`.trim();
+      // The final reply code decides: 5xx will not change on a retry, 4xx and others may.
+      if (reply.code >= 500 && reply.code <= 599) {
+        throw new PermanentDeliveryError(message, { status: reply.code });
+      }
+      throw new SmtpError(message);
     }
     return reply;
   }
@@ -170,12 +240,17 @@ class Session {
     this.#socket.write(data);
   }
 
-  /** Wraps the open socket in TLS. Anything buffered before the handshake is dropped. */
+  /** Wraps the open socket in TLS. Anything buffered or queued before the handshake is dropped. */
   async upgrade(host: string, extra: ConnectionOptions | undefined, guard: Guard): Promise<void> {
     this.#unbind();
     // The TLS socket forwards errors of the plain one; this keeps a late one from crashing.
     this.#socket.on("error", () => {});
+    // Bytes that arrived before the handshake came from the plain connection: never trust them.
     this.#buffer = "";
+    this.#replies = [];
+    this.#partial = [];
+    this.#partialSize = 0;
+    this.#waiter = undefined;
     const secure = tlsConnect({
       socket: this.#socket,
       ...(isIP(host) === 0 ? { servername: host } : {}),
@@ -259,7 +334,7 @@ function assertSafe(smtp: SmtpOptions, message: SmtpMessage): void {
 }
 
 async function negotiate(session: Session, smtp: SmtpOptions, guard: Guard): Promise<void> {
-  const name = smtp.clientName ?? "localhost";
+  const name = smtp.clientName ?? DEFAULT_CLIENT_NAME;
   await session.command(guard, "greeting", undefined, isCode(220));
   let capabilities = await ehlo(session, guard, name);
   if (smtp.tls === "starttls") {
@@ -285,14 +360,18 @@ async function transmit(session: Session, message: SmtpMessage, guard: Guard): P
   await session.command(guard, "message", undefined, is2xx);
 }
 
-/** Sends one message. Rejects on a non-2xx reply, a socket failure, a timeout or an abort. */
+/**
+ * Sends one message. Rejects on a non-2xx reply, a socket failure, a timeout or an abort.
+ * `timeoutMs` covers the whole attempt, from connect to QUIT. A 5xx reply rejects with a
+ * `PermanentDeliveryError`.
+ */
 export async function sendMail(smtp: SmtpOptions, message: SmtpMessage): Promise<void> {
   assertSafe(smtp, message);
-  const guard: Guard = {
-    ms: smtp.timeoutMs,
-    schedule: smtp.schedule ?? defaultSchedule,
-    signal: smtp.signal,
-  };
+  const { guard, dispose } = createGuard(
+    smtp.timeoutMs,
+    smtp.schedule ?? defaultSchedule,
+    smtp.signal,
+  );
   const session = new Session(createSocket(smtp));
   try {
     await negotiate(session, smtp, guard);
@@ -300,6 +379,7 @@ export async function sendMail(smtp: SmtpOptions, message: SmtpMessage): Promise
     // QUIT is courtesy: the message is already accepted, so a failure here is ignored.
     await session.command(guard, "QUIT", "QUIT", is2xx).catch(() => {});
   } finally {
+    dispose();
     session.destroy();
   }
 }

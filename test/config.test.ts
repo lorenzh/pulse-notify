@@ -107,6 +107,11 @@ test("loadSettings applies defaults and validates", () => {
     logLevel: "info",
     healthPort: undefined,
     healthHost: "127.0.0.1",
+    healthMaxFailedPolls: 5,
+    lockLeaseSeconds: 60,
+    stateRetentionDays: 30,
+    apiMaxBytes: 5242880,
+    smtpClientName: undefined,
   });
   assert.equal(loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_NOTIFY_POLL_MS: "10" }).pollMs, 10);
   assert.throws(
@@ -116,6 +121,51 @@ test("loadSettings applies defaults and validates", () => {
   assert.throws(
     () => loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_NOTIFY_TIMEOUT_MS: "0" }),
     ConfigError,
+  );
+});
+
+test("loadSettings parses the new limits and rejects values below their minimum", () => {
+  const base = { PULSE_NOTIFY_CONFIG: "c" };
+  const s = loadSettings({
+    ...base,
+    PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS: "2",
+    PULSE_NOTIFY_LOCK_LEASE_SECONDS: "30",
+    PULSE_NOTIFY_STATE_RETENTION_DAYS: "7",
+    PULSE_NOTIFY_API_MAX_BYTES: "1000",
+    PULSE_NOTIFY_SMTP_CLIENT_NAME: "pulse.example.com",
+  });
+  assert.equal(s.healthMaxFailedPolls, 2);
+  assert.equal(s.lockLeaseSeconds, 30);
+  assert.equal(s.stateRetentionDays, 7);
+  assert.equal(s.apiMaxBytes, 1000);
+  assert.equal(s.smtpClientName, "pulse.example.com");
+  for (const name of [
+    "PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS",
+    "PULSE_NOTIFY_LOCK_LEASE_SECONDS",
+    "PULSE_NOTIFY_STATE_RETENTION_DAYS",
+    "PULSE_NOTIFY_API_MAX_BYTES",
+  ]) {
+    assert.throws(() => loadSettings({ ...base, [name]: "0" }), /at least/, name);
+  }
+  assert.throws(
+    () => loadSettings({ ...base, PULSE_NOTIFY_LOCK_LEASE_SECONDS: "29" }),
+    ConfigError,
+  );
+  assert.throws(
+    () => loadSettings({ ...base, PULSE_NOTIFY_SMTP_CLIENT_NAME: "bad name" }),
+    ConfigError,
+  );
+});
+
+test("PULSE_API_URL errors never echo the url", () => {
+  const url = "file://user:secret@host/p?token=x";
+  assert.throws(
+    () => loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_API_URL: url }),
+    (err: Error) => !/secret|token/.test(err.message) && err instanceof ConfigError,
+  );
+  assert.throws(
+    () => loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_API_URL: "user:secret@" }),
+    (err: Error) => !err.message.includes("secret"),
   );
 });
 

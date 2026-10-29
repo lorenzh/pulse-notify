@@ -6,6 +6,7 @@ import {
   validateIncident,
   WIRE_VERSION_HEADER,
 } from "@lorenzh/pulse-contract";
+import { redactInText } from "./redact.ts";
 import { fetchWithTimeout } from "./timeout.ts";
 import type { Schedule } from "./types.ts";
 
@@ -13,6 +14,8 @@ export interface ApiOptions {
   baseUrl: string;
   fetch?: typeof fetch | undefined;
   timeoutMs?: number | undefined;
+  /** Largest response body in bytes; defaults to `DEFAULT_API_MAX_BYTES`. */
+  maxBytes?: number | undefined;
   schedule?: Schedule | undefined;
   /** Called when a response has no wire version header. */
   onVersionAbsent?: () => void;
@@ -30,30 +33,79 @@ export interface IncidentsResult {
   rejected: RejectedIncident[];
 }
 
+export const DEFAULT_API_MAX_BYTES = 5 * 1024 * 1024;
+
+/** Reads the JSON body and stops with an error once it passes `maxBytes`. */
+async function readJson(res: Response, maxBytes: number, path: string): Promise<unknown> {
+  const tooLarge = (): Error => new Error(`GET ${path} response is larger than ${maxBytes} bytes`);
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await res.body?.cancel();
+    throw tooLarge();
+  }
+  // A response without a stream has no bytes to count: let it parse itself.
+  if (!res.body) return res.json();
+  const decoder = new TextDecoder();
+  let text = "";
+  let total = 0;
+  const reader = res.body.getReader();
+  try {
+    for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+      total += chunk.value.byteLength;
+      if (total > maxBytes) throw tooLarge();
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+  } catch (err) {
+    await reader.cancel().catch(() => {
+      // The stream is already broken; the original error is what matters.
+    });
+    throw err;
+  }
+  return JSON.parse(text + decoder.decode());
+}
+
+/** An error without the original cause and with the API url redacted in its text. */
+function redactedError(err: unknown, baseUrl: string): Error {
+  const message = err instanceof Error ? err.message : String(err);
+  const error = new Error(redactInText(message, baseUrl));
+  let current: unknown = err;
+  for (let depth = 0; current instanceof Error && depth < 5; depth++) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string") Object.assign(error, { code });
+    current = current.cause;
+  }
+  return error;
+}
+
 async function getArray(opts: ApiOptions, path: string): Promise<unknown[]> {
-  const url = new URL(path, opts.baseUrl.endsWith("/") ? opts.baseUrl : `${opts.baseUrl}/`);
-  return fetchWithTimeout(
-    opts.fetch ?? fetch,
-    url.toString().replace(/\/$/, ""),
-    { headers: { accept: "application/json" } },
-    opts.timeoutMs ?? 5000,
-    async (res) => {
-      const version = checkWireVersion(res.headers.get(WIRE_VERSION_HEADER));
-      if (version.status === "mismatch") {
-        await res.body?.cancel();
-        throw new Error(`GET ${path} wire version mismatch: ${version.error}`);
-      }
-      if (version.status === "absent") opts.onVersionAbsent?.();
-      if (!res.ok) {
-        await res.body?.cancel();
-        throw new Error(`GET ${path} returned ${res.status}`);
-      }
-      const body: unknown = await res.json();
-      if (!Array.isArray(body)) throw new Error(`GET ${path} did not return an array`);
-      return body;
-    },
-    opts.schedule,
-  );
+  const maxBytes = opts.maxBytes ?? DEFAULT_API_MAX_BYTES;
+  try {
+    const url = new URL(path, opts.baseUrl.endsWith("/") ? opts.baseUrl : `${opts.baseUrl}/`);
+    return await fetchWithTimeout(
+      opts.fetch ?? fetch,
+      url.toString().replace(/\/$/, ""),
+      { headers: { accept: "application/json" } },
+      opts.timeoutMs ?? 5000,
+      async (res) => {
+        const version = checkWireVersion(res.headers.get(WIRE_VERSION_HEADER));
+        if (version.status === "mismatch") {
+          await res.body?.cancel();
+          throw new Error(`GET ${path} wire version mismatch: ${version.error}`);
+        }
+        if (version.status === "absent") opts.onVersionAbsent?.();
+        if (!res.ok) {
+          await res.body?.cancel();
+          throw new Error(`GET ${path} returned ${res.status}`);
+        }
+        const body = await readJson(res, maxBytes, path);
+        if (!Array.isArray(body)) throw new Error(`GET ${path} did not return an array`);
+        return body;
+      },
+      opts.schedule,
+    );
+  } catch (err) {
+    throw redactedError(err, opts.baseUrl);
+  }
 }
 
 /** The range of `Date` in milliseconds; outside it `toISOString()` throws. */
