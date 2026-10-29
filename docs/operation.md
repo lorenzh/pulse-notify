@@ -65,6 +65,8 @@ The signal handlers are registered before the settings, the config and the ledge
 
 Set `PULSE_HEALTH_PORT` to start an HTTP listener (off by default) on `PULSE_HEALTH_HOST` (default `127.0.0.1`). It has no authentication: do not publish it. The Docker image enables it on `0.0.0.0:9100` and has a `HEALTHCHECK` on it; Compose should not publish the port.
 
+The listener binds before polling starts. If the bind fails, the service prints one line and exits 2. If a stop takes longer than 5 s on SIGINT/SIGTERM, it logs a `warn` line and exits 0.
+
 - `GET /healthz`: `200 ok` once the poll loop runs, `503` with a reason while starting and while shutting down.
 - `GET /metrics`: Prometheus text. Counters reset on restart.
 
