@@ -4,16 +4,19 @@ pulse-notify reads environment variables and one JSON config file. Both are read
 
 ## Environment variables
 
-| Variable                          | Default                 | Meaning                                                                                           |
-| --------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------- |
-| `PULSE_NOTIFY_CONFIG`             | required                | Path to the channel config file                                                                   |
-| `PULSE_API_URL`                   | `http://localhost:3000` | pulse-api base URL                                                                                |
-| `PULSE_NOTIFY_STATE`              | `./notify-state.json`   | Delivery ledger file, see [operation.md](operation.md)                                            |
-| `PULSE_NOTIFY_POLL_MS`            | `5000`                  | Poll interval in milliseconds, at least 1                                                         |
-| `PULSE_NOTIFY_RETRY_DELAY_MS`     | `1000`                  | Initial delay before the first retry in milliseconds; it doubles per retry                        |
-| `PULSE_NOTIFY_RETRY_MAX_DELAY_MS` | `60000`                 | Cap of the delay between attempts, at least the initial delay                                     |
-| `PULSE_NOTIFY_RETRY_ATTEMPTS`     | `12`                    | Total attempts per event; `0` retries without end                                                 |
-| `PULSE_NOTIFY_TIMEOUT_MS`         | `5000`                  | Timeout per webhook attempt and per api request, at least 1. It covers reading the response body. |
+| Variable                          | Default                 | Meaning                                                                                             |
+| --------------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------- |
+| `PULSE_NOTIFY_CONFIG`             | required                | Path to the channel config file                                                                     |
+| `PULSE_API_URL`                   | `http://localhost:3000` | pulse-api base URL                                                                                  |
+| `PULSE_NOTIFY_STATE`              | `./notify-state.json`   | Delivery ledger file, see [operation.md](operation.md)                                              |
+| `PULSE_NOTIFY_POLL_MS`            | `5000`                  | Poll interval in milliseconds, at least 1                                                           |
+| `PULSE_NOTIFY_RETRY_DELAY_MS`     | `1000`                  | Initial delay before the first retry in milliseconds; it doubles per retry                          |
+| `PULSE_NOTIFY_RETRY_MAX_DELAY_MS` | `60000`                 | Cap of the delay between attempts, at least the initial delay                                       |
+| `PULSE_NOTIFY_RETRY_ATTEMPTS`     | `12`                    | Total attempts per event; `0` retries without end                                                   |
+| `PULSE_NOTIFY_TIMEOUT_MS`         | `5000`                  | Timeout per webhook attempt and per api request, at least 1. It covers reading the response body.   |
+| `PULSE_LOG_LEVEL`                 | `info`                  | `debug`, `info`, `warn` or `error`. Another value stops startup.                                    |
+| `PULSE_HEALTH_PORT`               | unset                   | Port of the health and metrics listener, see [operation.md](operation.md). Unset means no listener. |
+| `PULSE_HEALTH_HOST`               | `127.0.0.1`             | Address of that listener. The Docker image sets `0.0.0.0` and port `9100`.                          |
 
 The schedule is in [channels.md](channels.md#delivery-and-retries).
 
@@ -61,8 +64,8 @@ Per type:
 | `webhook` | `url`  | yes      | A valid `http:` or `https:` URL                       |
 | `file`    | `path` | yes      | Non-empty file path. The parent directory is created. |
 
-Other keys are ignored. Details of each channel are in [channels.md](channels.md).
+Unknown keys are rejected at startup, for example `notify.json: unknown key "check" in channels[0]`. Check the spelling of `checks`. Details of each channel are in [channels.md](channels.md).
 
 Do not put secrets in a webhook URL if you share the config file or its logs. pulse-notify does not log the URL, but your config file holds it in clear text.
 
-An invalid config stops startup with `configuration error: <message>`. The messages are listed in [troubleshooting.md](troubleshooting.md).
+An invalid config stops startup with `pulse-notify: <message>` and exit code 2. The messages are listed in [troubleshooting.md](troubleshooting.md).

@@ -4,17 +4,31 @@ import {
   DEFAULT_RETRY_DELAY_MS,
   DEFAULT_RETRY_MAX_DELAY_MS,
 } from "./delivery.ts";
+import { LOG_LEVELS, type LogLevel } from "./log.ts";
 import type { ChannelConfig, Config } from "./types.ts";
 
 export class ConfigError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "ConfigError";
   }
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function rejectUnknownKeys(
+  raw: Record<string, unknown>,
+  allowed: readonly string[],
+  path: string,
+  where: string,
+): void {
+  for (const key of Object.keys(raw)) {
+    if (!allowed.includes(key)) {
+      throw new ConfigError(`${path}: unknown key ${JSON.stringify(key)} in ${where}`);
+    }
+  }
 }
 
 function parseChecks(value: unknown, id: string): string[] | undefined {
@@ -36,7 +50,7 @@ function isHttpUrl(url: unknown): url is string {
   }
 }
 
-function parseChannel(raw: unknown, index: number): ChannelConfig {
+function parseChannel(raw: unknown, index: number, path: string): ChannelConfig {
   const where = `channels[${index}]`;
   if (!isObject(raw)) throw new ConfigError(`${where} must be an object`);
   const { id, type } = raw;
@@ -46,11 +60,13 @@ function parseChannel(raw: unknown, index: number): ChannelConfig {
   const checks = parseChecks(raw.checks, id);
   const base = checks === undefined ? { id } : { id, checks };
   if (type === "webhook") {
+    rejectUnknownKeys(raw, ["id", "type", "checks", "url"], path, where);
     if (!isHttpUrl(raw.url))
       throw new ConfigError(`channel "${id}": webhook needs a valid http(s) url`);
     return { ...base, type: "webhook", url: raw.url };
   }
   if (type === "file") {
+    rejectUnknownKeys(raw, ["id", "type", "checks", "path"], path, where);
     if (typeof raw.path !== "string" || raw.path === "") {
       throw new ConfigError(`channel "${id}": file channel needs a path`);
     }
@@ -59,12 +75,14 @@ function parseChannel(raw: unknown, index: number): ChannelConfig {
   throw new ConfigError(`channel "${id}": unknown type ${JSON.stringify(type)}`);
 }
 
-export function parseConfig(raw: unknown): Config {
+/** `path` names the file in unknown-key errors. */
+export function parseConfig(raw: unknown, path = "config"): Config {
   if (!isObject(raw)) throw new ConfigError("config must be an object");
+  rejectUnknownKeys(raw, ["channels"], path, "config");
   if (!Array.isArray(raw.channels) || raw.channels.length === 0) {
     throw new ConfigError("config.channels must be a non-empty array");
   }
-  const channels = raw.channels.map(parseChannel);
+  const channels = raw.channels.map((c, i) => parseChannel(c, i, path));
   const seen = new Set<string>();
   for (const channel of channels) {
     if (seen.has(channel.id)) throw new ConfigError(`duplicate channel id "${channel.id}"`);
@@ -86,7 +104,7 @@ export function loadConfigFile(path: string): Config {
   } catch (err) {
     throw new ConfigError(`config file ${path} is not valid JSON: ${(err as Error).message}`);
   }
-  return parseConfig(json);
+  return parseConfig(json, path);
 }
 
 export interface Settings {
@@ -98,6 +116,28 @@ export interface Settings {
   retryMaxDelayMs: number;
   retryAttempts: number;
   timeoutMs: number;
+  logLevel: LogLevel;
+  /** `undefined` means no health listener. */
+  healthPort: number | undefined;
+  healthHost: string;
+}
+
+function parseLogLevel(value: string | undefined): LogLevel {
+  if (value === undefined || value === "") return "info";
+  const level = LOG_LEVELS.find((l) => l === value);
+  if (level === undefined) {
+    throw new ConfigError(`PULSE_LOG_LEVEL must be one of ${LOG_LEVELS.join(", ")}`);
+  }
+  return level;
+}
+
+function parseHealthPort(value: string | undefined): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0 || n > 65535) {
+    throw new ConfigError("PULSE_HEALTH_PORT must be an integer from 0 to 65535");
+  }
+  return n;
 }
 
 function intEnv(env: Record<string, string | undefined>, name: string, fallback: number): number {
@@ -137,5 +177,8 @@ export function loadSettings(env: Record<string, string | undefined>): Settings 
     retryMaxDelayMs,
     retryAttempts: intEnv(env, "PULSE_NOTIFY_RETRY_ATTEMPTS", DEFAULT_RETRY_ATTEMPTS),
     timeoutMs,
+    logLevel: parseLogLevel(env.PULSE_LOG_LEVEL),
+    healthPort: parseHealthPort(env.PULSE_HEALTH_PORT),
+    healthHost: env.PULSE_HEALTH_HOST || "127.0.0.1",
   };
 }

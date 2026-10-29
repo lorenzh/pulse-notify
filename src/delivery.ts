@@ -21,6 +21,8 @@ export interface ChannelDeliveryOptions {
   logger: Logger;
   /** Called when a notification leaves the worker, whatever the outcome. */
   release?: (key: string) => void;
+  /** Called once per event that ended as delivered or failed. */
+  onOutcome?: (outcome: "delivered" | "failed") => void;
 }
 
 type Outcome =
@@ -151,6 +153,7 @@ export class ChannelDelivery {
       });
       return;
     }
+    this.#opts.onOutcome?.(outcome.kind);
     if (outcome.kind === "delivered") {
       logger.log("info", "notification delivered", {
         channel: channelId,

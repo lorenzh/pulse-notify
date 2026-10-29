@@ -27,7 +27,7 @@ If you delete the ledger, every channel counts as new on the next start. It reco
 
 ## Logs
 
-Logs are JSON lines on stderr. Each line has `time` (ISO 8601 UTC), `level` (`info`, `warn` or `error`), `msg` and extra fields.
+Logs are JSON lines on stderr. Each line has `time` (ISO 8601 UTC), `level` (`debug`, `info`, `warn` or `error`), `msg` and extra fields.
 
 | Level   | `msg`                                                        | Fields                                                 |
 | ------- | ------------------------------------------------------------ | ------------------------------------------------------ |
@@ -47,7 +47,35 @@ Logs are JSON lines on stderr. Each line has `time` (ISO 8601 UTC), `level` (`in
 
 `error` is the message of the error. `code` (for example `ECONNREFUSED`, `ENOTFOUND`, `CERT_HAS_EXPIRED`) and `cause` (the message of the innermost cause) appear when the error has them. `fetch failed` alone says little; `code` and `cause` say why.
 
-Startup configuration errors are not JSON. They are one line on stderr: `configuration error: <message>`, exit code 2.
+`PULSE_LOG_LEVEL` sets the lowest level written (default `info`; `debug` is the most verbose).
+
+Startup errors are not JSON. They are one line on stderr: `pulse-notify: <message>`, exit code 2, no stack. This covers environment variables, the config file (including unknown keys) and an unusable state file.
+
+## Exit codes
+
+| Code | Meaning                                                                   |
+| ---- | ------------------------------------------------------------------------- |
+| `0`  | Clean stop after `SIGINT` or `SIGTERM` (also when the 5 s bound was hit). |
+| `2`  | Configuration or startup error.                                           |
+| `1`  | Unexpected failure while running.                                         |
+
+The signal handlers are registered before the settings, the config and the ledger are read. A second signal does nothing more.
+
+## Health and metrics
+
+Set `PULSE_HEALTH_PORT` to start an HTTP listener (off by default) on `PULSE_HEALTH_HOST` (default `127.0.0.1`). It has no authentication: do not publish it. The Docker image enables it on `0.0.0.0:9100` and has a `HEALTHCHECK` on it; Compose should not publish the port.
+
+- `GET /healthz`: `200 ok` once the poll loop runs, `503` with a reason while starting and while shutting down.
+- `GET /metrics`: Prometheus text. Counters reset on restart.
+
+| Series                                                              | Type            |
+| ------------------------------------------------------------------- | --------------- |
+| `pulse_up`                                                          | gauge, always 1 |
+| `pulse_notify_polls_total{outcome="ok\|error"}`                     | counter         |
+| `pulse_notify_deliveries_total{channel,outcome="success\|failure"}` | counter         |
+| `pulse_notify_pending_deliveries`                                   | gauge           |
+
+`channel` is the channel id. Webhook URLs, paths and secrets never appear.
 
 ## API validation and version check
 
