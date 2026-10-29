@@ -1,4 +1,14 @@
 import { readFileSync } from "node:fs";
+import {
+  type Env,
+  type LogLevel,
+  readLogLevel,
+  readMs,
+  readPort,
+  readString,
+  readUrl,
+  StartupError,
+} from "@lorenzh/pulse-kit";
 import { DEFAULT_API_MAX_BYTES } from "./api.ts";
 import { isLoopbackHost } from "./channels/loopback.ts";
 import { envelopeAddress, isEhloName } from "./channels/mailer.ts";
@@ -7,7 +17,6 @@ import {
   DEFAULT_RETRY_DELAY_MS,
   DEFAULT_RETRY_MAX_DELAY_MS,
 } from "./delivery.ts";
-import { LOG_LEVELS, type LogLevel } from "./log.ts";
 import type { ChannelConfig, Config, SmtpConfig } from "./types.ts";
 
 export const DEFAULT_LEASE_SECONDS = 60;
@@ -431,105 +440,75 @@ export interface Settings {
   smtpClientName: string | undefined;
 }
 
-function parseLogLevel(value: string | undefined): LogLevel {
-  if (value === undefined || value === "") return "info";
-  const level = LOG_LEVELS.find((l) => l === value);
-  if (level === undefined) {
-    throw new ConfigError(`PULSE_LOG_LEVEL must be one of ${LOG_LEVELS.join(", ")}`);
-  }
-  return level;
-}
-
-function parseHealthPort(value: string | undefined): number | undefined {
-  if (value === undefined || value === "") return undefined;
-  const n = Number(value);
-  if (!Number.isInteger(n) || n < 0 || n > 65535) {
-    throw new ConfigError("PULSE_HEALTH_PORT must be an integer from 0 to 65535");
-  }
-  return n;
-}
-
-function intEnv(env: Record<string, string | undefined>, name: string, fallback: number): number {
-  const value = env[name];
-  if (value === undefined || value === "") return fallback;
-  const n = Number(value);
-  if (!Number.isInteger(n) || n < 0) {
-    throw new ConfigError(`${name} must be a non-negative integer`);
-  }
-  return n;
-}
-
-function minIntEnv(
-  env: Record<string, string | undefined>,
-  name: string,
-  fallback: number,
-  min: number,
-): number {
-  const n = intEnv(env, name, fallback);
-  if (n < min) throw new ConfigError(`${name} must be at least ${min}`);
-  return n;
+/** An integer setting with a lower bound; the message keeps the "at least" wording. */
+function readMin(env: Env, name: string, fallback: number, min: number): number {
+  return readMs(env, name, { fallback, min, describe: `must be an integer of at least ${min}` });
 }
 
 /** The API url must be http(s); the error never repeats it, it can hold credentials. */
-function parseApiUrl(value: string | undefined): string {
-  const url = value || "http://localhost:3000";
-  if (!isHttpUrl(url)) throw new ConfigError("PULSE_API_URL must be a valid http(s) url");
-  return url;
+function parseApiUrl(env: Env): string {
+  const url = readUrl(env, "PULSE_API_URL", {
+    allowCredentials: true,
+    allowQueryOrFragment: true,
+    describe: "must be a valid http(s) url",
+  });
+  return url ?? "http://localhost:3000";
 }
 
-function parseSmtpClientName(value: string | undefined): string | undefined {
-  if (value === undefined || value === "") return undefined;
+function parseSmtpClientName(env: Env): string | undefined {
+  const name = "PULSE_NOTIFY_SMTP_CLIENT_NAME";
+  const value = readString(env, name);
+  if (value === undefined) return undefined;
   if (!isEhloName(value)) {
-    throw new ConfigError(
-      "PULSE_NOTIFY_SMTP_CLIENT_NAME must be a host name or an address literal",
-    );
+    throw new StartupError(`${name}: must be a host name or an address literal`, { setting: name });
   }
   return value;
 }
 
-export function loadLockLeaseSeconds(env: Record<string, string | undefined>): number {
-  return minIntEnv(
-    env,
-    "PULSE_NOTIFY_LOCK_LEASE_SECONDS",
-    DEFAULT_LEASE_SECONDS,
-    MIN_LEASE_SECONDS,
-  );
+export function loadLockLeaseSeconds(env: Env): number {
+  return readMin(env, "PULSE_NOTIFY_LOCK_LEASE_SECONDS", DEFAULT_LEASE_SECONDS, MIN_LEASE_SECONDS);
 }
 
-export function loadSettings(env: Record<string, string | undefined>): Settings {
-  const configPath = env.PULSE_NOTIFY_CONFIG;
-  if (!configPath) throw new ConfigError("PULSE_NOTIFY_CONFIG is required");
-  const pollMs = intEnv(env, "PULSE_NOTIFY_POLL_MS", 5000);
-  const timeoutMs = intEnv(env, "PULSE_NOTIFY_TIMEOUT_MS", 5000);
-  if (pollMs < 1) throw new ConfigError("PULSE_NOTIFY_POLL_MS must be at least 1");
-  if (timeoutMs < 1) throw new ConfigError("PULSE_NOTIFY_TIMEOUT_MS must be at least 1");
-  const retryDelayMs = intEnv(env, "PULSE_NOTIFY_RETRY_DELAY_MS", DEFAULT_RETRY_DELAY_MS);
-  const retryMaxDelayMs = intEnv(
-    env,
-    "PULSE_NOTIFY_RETRY_MAX_DELAY_MS",
-    DEFAULT_RETRY_MAX_DELAY_MS,
-  );
+export function loadSettings(env: Env): Settings {
+  const configPath = readString(env, "PULSE_NOTIFY_CONFIG");
+  if (configPath === undefined) {
+    throw new StartupError("PULSE_NOTIFY_CONFIG is required", { setting: "PULSE_NOTIFY_CONFIG" });
+  }
+  const pollMs = readMin(env, "PULSE_NOTIFY_POLL_MS", 5000, 1);
+  const timeoutMs = readMin(env, "PULSE_NOTIFY_TIMEOUT_MS", 5000, 1);
+  const retryDelayMs = readMs(env, "PULSE_NOTIFY_RETRY_DELAY_MS", {
+    fallback: DEFAULT_RETRY_DELAY_MS,
+    min: 0,
+  });
+  const retryMaxDelayMs = readMs(env, "PULSE_NOTIFY_RETRY_MAX_DELAY_MS", {
+    fallback: DEFAULT_RETRY_MAX_DELAY_MS,
+    min: 0,
+  });
   if (retryMaxDelayMs < retryDelayMs) {
-    throw new ConfigError(
-      "PULSE_NOTIFY_RETRY_MAX_DELAY_MS must be at least PULSE_NOTIFY_RETRY_DELAY_MS",
+    throw new StartupError(
+      "PULSE_NOTIFY_RETRY_MAX_DELAY_MS: must be at least PULSE_NOTIFY_RETRY_DELAY_MS",
+      { setting: "PULSE_NOTIFY_RETRY_MAX_DELAY_MS" },
     );
   }
   return {
     configPath,
-    apiUrl: parseApiUrl(env.PULSE_API_URL),
-    statePath: env.PULSE_NOTIFY_STATE || "./notify-state.json",
+    apiUrl: parseApiUrl(env),
+    statePath: readString(env, "PULSE_NOTIFY_STATE") ?? "./notify-state.json",
     pollMs,
     retryDelayMs,
     retryMaxDelayMs,
-    retryAttempts: intEnv(env, "PULSE_NOTIFY_RETRY_ATTEMPTS", DEFAULT_RETRY_ATTEMPTS),
+    retryAttempts: readMs(env, "PULSE_NOTIFY_RETRY_ATTEMPTS", {
+      fallback: DEFAULT_RETRY_ATTEMPTS,
+      min: 0,
+    }),
     timeoutMs,
-    logLevel: parseLogLevel(env.PULSE_LOG_LEVEL),
-    healthPort: parseHealthPort(env.PULSE_HEALTH_PORT),
-    healthHost: env.PULSE_HEALTH_HOST || "127.0.0.1",
-    healthMaxFailedPolls: minIntEnv(env, "PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS", 5, 1),
+    logLevel: readLogLevel(env),
+    healthPort: readPort(env, "PULSE_HEALTH_PORT"),
+    healthHost: readString(env, "PULSE_HEALTH_HOST") ?? "127.0.0.1",
+    healthMaxFailedPolls: readMin(env, "PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS", 5, 1),
     lockLeaseSeconds: loadLockLeaseSeconds(env),
-    stateRetentionDays: minIntEnv(env, "PULSE_NOTIFY_STATE_RETENTION_DAYS", 30, 1),
-    apiMaxBytes: minIntEnv(env, "PULSE_NOTIFY_API_MAX_BYTES", DEFAULT_API_MAX_BYTES, 1),
-    smtpClientName: parseSmtpClientName(env.PULSE_NOTIFY_SMTP_CLIENT_NAME),
+    stateRetentionDays: readMin(env, "PULSE_NOTIFY_STATE_RETENTION_DAYS", 30, 1),
+    apiMaxBytes: readMin(env, "PULSE_NOTIFY_API_MAX_BYTES", DEFAULT_API_MAX_BYTES, 1),
+    smtpClientName: parseSmtpClientName(env),
   };
 }

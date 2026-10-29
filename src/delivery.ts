@@ -1,6 +1,6 @@
+import type { Logger } from "@lorenzh/pulse-kit";
 import { errorFields, PermanentDeliveryError } from "./errors.ts";
 import type { Ledger } from "./ledger.ts";
-import type { Logger } from "./log.ts";
 import type { Notification, Sender, Sleep } from "./types.ts";
 
 export const DEFAULT_RETRY_DELAY_MS = 1000;
@@ -91,7 +91,7 @@ export class ChannelDelivery {
       try {
         await this.#deliver(next);
       } catch (err) {
-        this.#opts.logger.log("error", "delivery failed unexpectedly", {
+        this.#opts.logger.error("delivery failed unexpectedly", {
           channel: this.#opts.channelId,
           key: next.key,
           ...errorFields(err),
@@ -117,7 +117,7 @@ export class ChannelDelivery {
     try {
       return ledger.claim(channelId, notification.key, notification);
     } catch (err) {
-      logger.log("error", "ledger claim failed, the next poll retries", {
+      logger.error("ledger claim failed, the next poll retries", {
         channel: channelId,
         key: notification.key,
         ...errorFields(err),
@@ -141,7 +141,7 @@ export class ChannelDelivery {
         if (this.#stopped) return { kind: "stopped" };
         const failed = failureOf(err, attempt, limit);
         if (failed) return failed;
-        logger.log("warn", "delivery attempt failed", {
+        logger.warn("delivery attempt failed", {
           channel: channelId,
           key: notification.key,
           attempt,
@@ -161,7 +161,7 @@ export class ChannelDelivery {
       ledger.settle(channelId, notification.key, outcome.kind);
     } catch (err) {
       // The key stays pending and is resent at the next start.
-      logger.log("error", "ledger settle failed, the key stays pending", {
+      logger.error("ledger settle failed, the key stays pending", {
         channel: channelId,
         key: notification.key,
         ...errorFields(err),
@@ -169,18 +169,18 @@ export class ChannelDelivery {
       return;
     }
     if (outcome.kind === "dropped") {
-      logger.log("info", "stale reminder dropped", { channel: channelId, key: notification.key });
+      logger.info("stale reminder dropped", { channel: channelId, key: notification.key });
       return;
     }
     this.#opts.onOutcome?.(outcome.kind);
     if (outcome.kind === "delivered") {
-      logger.log("info", "notification delivered", {
+      logger.info("notification delivered", {
         channel: channelId,
         key: notification.key,
         attempts: outcome.attempts,
       });
     } else {
-      logger.log("error", "notification delivery failed", {
+      logger.error("notification delivery failed", {
         channel: channelId,
         key: notification.key,
         attempts: outcome.attempts,

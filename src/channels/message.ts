@@ -1,3 +1,4 @@
+import { formatDuration } from "@lorenzh/pulse-kit";
 import type { Notification } from "../types.ts";
 
 export const MAX_REASON_LENGTH = 300;
@@ -24,17 +25,6 @@ export interface MessageParts {
 export function cleanText(value: string, max: number = MAX_REASON_LENGTH): string {
   const text = value.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, " ").trim();
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
-}
-
-/** "1d 2h", "3h 5m", "12m" or "<1m". */
-export function formatDuration(ms: number): string {
-  const minutes = Math.floor(Math.max(ms, 0) / 60000);
-  const days = Math.floor(minutes / 1440);
-  const hours = Math.floor((minutes % 1440) / 60);
-  const rest = minutes % 60;
-  if (days > 0) return `${days}d ${hours}h`;
-  if (hours > 0) return `${hours}h ${rest}m`;
-  return minutes > 0 ? `${minutes}m` : "<1m";
 }
 
 function stateOf(event: Notification["event"]): MessageState {

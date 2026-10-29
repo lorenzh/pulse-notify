@@ -1,4 +1,4 @@
-import type { Logger } from "../log.ts";
+import type { Logger } from "@lorenzh/pulse-kit";
 import type { ChannelConfig, Schedule, Sender } from "../types.ts";
 import { createEmailSender } from "./email.ts";
 import { createFileSender } from "./file.ts";
@@ -24,7 +24,7 @@ export interface SenderDeps {
 function warnIfPlainHttp(url: string, id: string, logger: Logger): void {
   const { protocol, hostname } = new URL(url);
   if (protocol === "http:" && !isLoopbackHost(hostname)) {
-    logger.log("warn", "webhook sends over http to a non-local host", { channel: id });
+    logger.warn("webhook sends over http to a non-local host", { channel: id });
   }
 }
 

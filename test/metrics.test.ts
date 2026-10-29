@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createLogger } from "../src/log.ts";
 import { Metrics } from "../src/metrics.ts";
 
 test("metrics render counters per channel and escape labels", () => {
@@ -20,20 +19,29 @@ test("metrics render counters per channel and escape labels", () => {
   assert.match(text, /pulse_notify_pending_deliveries 1\n/);
 });
 
-test("logger drops lines below the level and writes ISO time", () => {
-  const lines: string[] = [];
-  const log = createLogger(
-    (l) => lines.push(l),
-    () => 0,
-    "warn",
+test("metrics keep the names, help texts and order", () => {
+  const text = new Metrics(["log"], () => 0).render();
+  assert.equal(
+    text,
+    [
+      "# HELP pulse_up Whether the process runs.",
+      "# TYPE pulse_up gauge",
+      "pulse_up 1",
+      "# HELP pulse_notify_polls_total API polls by outcome.",
+      "# TYPE pulse_notify_polls_total counter",
+      'pulse_notify_polls_total{outcome="ok"} 0',
+      'pulse_notify_polls_total{outcome="error"} 0',
+      "# HELP pulse_notify_deliveries_total Finished deliveries by channel and outcome.",
+      "# TYPE pulse_notify_deliveries_total counter",
+      'pulse_notify_deliveries_total{channel="log",outcome="success"} 0',
+      'pulse_notify_deliveries_total{channel="log",outcome="failure"} 0',
+      "# HELP pulse_notify_pending_deliveries Notifications not yet delivered or failed.",
+      "# TYPE pulse_notify_pending_deliveries gauge",
+      "pulse_notify_pending_deliveries 0",
+      "# HELP pulse_notify_consecutive_failed_polls Polls in a row that failed; 0 after a good poll.",
+      "# TYPE pulse_notify_consecutive_failed_polls gauge",
+      "pulse_notify_consecutive_failed_polls 0",
+      "",
+    ].join("\n"),
   );
-  log.log("info", "quiet");
-  log.log("error", "loud", { a: 1 });
-  assert.equal(lines.length, 1);
-  assert.deepEqual(JSON.parse(lines[0] ?? ""), {
-    time: "1970-01-01T00:00:00.000Z",
-    level: "error",
-    msg: "loud",
-    a: 1,
-  });
 });

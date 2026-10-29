@@ -96,7 +96,7 @@ test("/healthz is 200, then 503 after N failed polls, then 200 after one good po
       PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS: "3",
       PULSE_HEALTH_PORT: "0",
     },
-    { process: { on() {} }, write: () => {} },
+    { write: () => {} },
   );
   const port = await running.listening;
   const url = `http://127.0.0.1:${port}`;
@@ -131,7 +131,6 @@ test("the health check stays ok when the notifier has no pollHealth (test fakes)
       PULSE_HEALTH_PORT: "0",
     },
     {
-      process: { on() {} },
       write: () => {},
       createNotifier: (): Stoppable => ({ start() {}, async stop() {} }),
     },

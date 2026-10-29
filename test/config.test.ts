@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { StartupError } from "@lorenzh/pulse-kit";
 import { ConfigError, loadConfigFile, loadSettings, parseConfig } from "../src/config.ts";
 
 const hook = { id: "h", type: "webhook", url: "https://example.com/x" };
@@ -68,7 +69,7 @@ test("loadSettings reads log level and health listener settings", () => {
   assert.equal(s.healthHost, "0.0.0.0");
   assert.throws(() => loadSettings({ ...base, PULSE_LOG_LEVEL: "loud" }), /PULSE_LOG_LEVEL/);
   assert.throws(() => loadSettings({ ...base, PULSE_HEALTH_PORT: "70000" }), /PULSE_HEALTH_PORT/);
-  assert.throws(() => loadSettings({ ...base, PULSE_HEALTH_PORT: "x" }), ConfigError);
+  assert.throws(() => loadSettings({ ...base, PULSE_HEALTH_PORT: "x" }), StartupError);
 });
 
 for (const [label, raw, pattern] of invalid) {
@@ -116,11 +117,11 @@ test("loadSettings applies defaults and validates", () => {
   assert.equal(loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_NOTIFY_POLL_MS: "10" }).pollMs, 10);
   assert.throws(
     () => loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_NOTIFY_POLL_MS: "abc" }),
-    ConfigError,
+    StartupError,
   );
   assert.throws(
     () => loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_NOTIFY_TIMEOUT_MS: "0" }),
-    ConfigError,
+    StartupError,
   );
 });
 
@@ -149,11 +150,11 @@ test("loadSettings parses the new limits and rejects values below their minimum"
   }
   assert.throws(
     () => loadSettings({ ...base, PULSE_NOTIFY_LOCK_LEASE_SECONDS: "29" }),
-    ConfigError,
+    StartupError,
   );
   assert.throws(
     () => loadSettings({ ...base, PULSE_NOTIFY_SMTP_CLIENT_NAME: "bad name" }),
-    ConfigError,
+    StartupError,
   );
 });
 
@@ -161,7 +162,7 @@ test("PULSE_API_URL errors never echo the url", () => {
   const url = "file://user:secret@host/p?token=x";
   assert.throws(
     () => loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_API_URL: url }),
-    (err: Error) => !/secret|token/.test(err.message) && err instanceof ConfigError,
+    (err: Error) => !/secret|token/.test(err.message) && err instanceof StartupError,
   );
   assert.throws(
     () => loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_API_URL: "user:secret@" }),
@@ -180,8 +181,11 @@ test("loadSettings parses the retry schedule and validates it", () => {
   assert.equal(s.retryDelayMs, 10);
   assert.equal(s.retryMaxDelayMs, 100);
   assert.equal(s.retryAttempts, 0);
-  assert.throws(() => loadSettings({ ...base, PULSE_NOTIFY_RETRY_ATTEMPTS: "-1" }), ConfigError);
-  assert.throws(() => loadSettings({ ...base, PULSE_NOTIFY_RETRY_MAX_DELAY_MS: "x" }), ConfigError);
+  assert.throws(() => loadSettings({ ...base, PULSE_NOTIFY_RETRY_ATTEMPTS: "-1" }), StartupError);
+  assert.throws(
+    () => loadSettings({ ...base, PULSE_NOTIFY_RETRY_MAX_DELAY_MS: "x" }),
+    StartupError,
+  );
   assert.throws(
     () =>
       loadSettings({

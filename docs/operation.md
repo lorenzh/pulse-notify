@@ -111,6 +111,7 @@ Set `PULSE_HEALTH_PORT` to start an HTTP listener (off by default) on `PULSE_HEA
 The listener binds before polling starts. If the bind fails, the service prints one line and exits 2. If a stop takes longer than 5 s on SIGINT/SIGTERM, it logs a `warn` line and exits 0.
 
 - `GET /healthz`: `200 ok` once the poll loop runs, `503` with a reason while starting, while shutting down, and while polls fail: after `PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS` (default 5) failed polls in a row it answers `503 polls failing (<n> in a row)`. A poll fails when the API fetch or the detection threw (including a body over `PULSE_NOTIFY_API_MAX_BYTES`); a poll that fetched fine but had rejected items is good. One good poll resets the count and `/healthz` is `200` again. A Docker `HEALTHCHECK` on `/healthz` therefore marks a notifier unhealthy when pulse-api has been unreachable for 5 polls (25 s with the defaults).
+- `GET /readyz`: the same check, status and body as `/healthz` (added with the shared pulse-kit ops server). `/healthz` and `/readyz` both answer `HEAD`; a method other than `GET` and `HEAD` answers `405`.
 - `GET /metrics`: Prometheus text. Counters reset on restart.
 
 | Series                                                              | Type            |
