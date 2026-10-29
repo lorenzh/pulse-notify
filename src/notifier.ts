@@ -147,7 +147,7 @@ export class Notifier {
     });
   }
 
-  /** True when a reminder of the same incident with a higher n is pending, queued or delivered. */
+  /** True when a reminder of the same incident with a higher n is queued or in the ledger with any status except dropped. */
   #isSuperseded(channel: ChannelState, notification: Notification): boolean {
     const own = REMINDER_KEY.exec(notification.key);
     if (!own) return false;
@@ -157,7 +157,7 @@ export class Notifier {
         match !== null &&
         match[1] === own[1] &&
         Number(match[2]) > Number(own[2]) &&
-        (status === "pending" || status === "delivered")
+        status !== "dropped"
       );
     };
     for (const key of channel.queued) if (isNewer(key, "pending")) return true;
