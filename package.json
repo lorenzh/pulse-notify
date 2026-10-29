@@ -11,7 +11,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test --experimental-test-coverage --test-coverage-lines=80 --test-coverage-exclude=\"**/*.test.ts\" --test-coverage-exclude=\"test/**\" --test-coverage-exclude=\"**/test/**\" --test-coverage-exclude=\"dist/**\"",
-    "lint": "biome check . && node node_modules/@lorenzh/pulse-config/node_modules/eslint/bin/eslint.js .",
+    "lint": "biome check . && pulse-eslint .",
     "format": "biome check --write .",
     "prepare": "lefthook install || true",
     "check": "npm run lint && npm run typecheck && npm run test",
@@ -22,7 +22,7 @@
     "@types/node": "^26.6.5",
     "lefthook": "2.2.2",
     "typescript": "^7.0.2",
-    "@lorenzh/pulse-config": "github:lorenzh/pulse-config#a3432e0451bb24397e77e48a5ee2e9d46913bd05"
+    "@lorenzh/pulse-config": "github:lorenzh/pulse-config#dc7c69698f96e7babebc1e3cddc081d71e5a4201"
   },
   "dependencies": {
     "@lorenzh/pulse-contract": "github:lorenzh/pulse-contract#d7eaa1b955a0c84a5f8d67580cfe7882c9a47d83"

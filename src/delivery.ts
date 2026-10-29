@@ -15,9 +15,9 @@ export interface ChannelDeliveryOptions {
   /** Delay before the first retry; it doubles for each further retry. */
   retryDelayMs: number;
   /** Upper bound of the delay between attempts. */
-  retryMaxDelayMs?: number;
+  retryMaxDelayMs?: number | undefined;
   /** Total attempts per event; 0 retries without end. */
-  retryAttempts?: number;
+  retryAttempts?: number | undefined;
   logger: Logger;
   /** Called when a notification leaves the worker, whatever the outcome. */
   release?: (key: string) => void;
