@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { before, test } from "node:test";
-import { dotStuff, type SmtpOptions, sendMail } from "../src/channels/smtp.ts";
+import {
+  dotStuff,
+  ehloNameFrom,
+  isEhloName,
+  type SmtpOptions,
+  sendMail,
+} from "../src/channels/smtp.ts";
+import { PermanentDeliveryError } from "../src/errors.ts";
 import { makeCert, startSmtpStub, startTlsSmtpStub, type TestCert } from "./smtp-stub.ts";
 
 let cert: TestCert;
@@ -212,5 +219,155 @@ test("an AUTH failure reports the code only, not the reply text", async () => {
     );
   } finally {
     await stub.close();
+  }
+});
+
+test("a reply injected before the STARTTLS handshake is not read after it", async () => {
+  const stub = await startSmtpStub({
+    starttls: cert,
+    auth: ["PLAIN"],
+    injectAfterStartTls: "250 injected\r\n",
+  });
+  try {
+    await sendMail(
+      options(stub.port, {
+        tls: "starttls",
+        tlsOptions: { ca: cert.cert },
+        username: "u",
+        password: "p",
+      }),
+      message,
+    );
+    // The real EHLO reply (with AUTH PLAIN) was used, not the injected one.
+    assert.ok(stub.commands.some((c) => c.startsWith("AUTH PLAIN")));
+    assert.equal(stub.messages.length, 1);
+  } finally {
+    await stub.close();
+  }
+});
+
+test("a reply with too many lines or too many bytes fails the attempt, retryable", async () => {
+  const manyLines = `${"250-line\r\n".repeat(150)}250 end`;
+  const bigLine = `250-${"x".repeat(1000)}
+`;
+  const bigLines = `${bigLine.repeat(70)}250 end`;
+  for (const reply of [manyLines, bigLines]) {
+    const stub = await startSmtpStub({ replies: { EHLO: reply } });
+    try {
+      await assert.rejects(sendMail(options(stub.port), message), (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.match(err.message, /reply too long/);
+        assert.equal(err instanceof PermanentDeliveryError, false);
+        return true;
+      });
+    } finally {
+      await stub.close();
+    }
+  }
+});
+
+test("a 5xx reply is a permanent error at every stage, a 4xx is not", async () => {
+  const stages: [string, boolean][] = [
+    ["EHLO", false],
+    ["MAIL FROM", false],
+    ["RCPT TO", false],
+    ["DATA", false],
+  ];
+  for (const [verb] of stages) {
+    for (const code of [550, 451]) {
+      const stub = await startSmtpStub({ replies: { [verb]: `${code} nope` } });
+      try {
+        await assert.rejects(sendMail(options(stub.port), message), (err: unknown) => {
+          assert.equal(err instanceof PermanentDeliveryError, code === 550, `${verb} ${code}`);
+          return true;
+        });
+      } finally {
+        await stub.close();
+      }
+    }
+  }
+});
+
+test("a 5xx greeting and a 5xx end-of-data reply are permanent", async () => {
+  const stub = await startSmtpStub({ greeting: "554 no service" });
+  try {
+    await assert.rejects(sendMail(options(stub.port), message), PermanentDeliveryError);
+  } finally {
+    await stub.close();
+  }
+
+  const end = await startSmtpStub({ endOfDataReply: "552 too big" });
+  try {
+    await assert.rejects(sendMail(options(end.port), message), PermanentDeliveryError);
+  } finally {
+    await end.close();
+  }
+});
+
+test("the EHLO name is sent as given", async () => {
+  const stub = await startSmtpStub();
+  try {
+    await sendMail(options(stub.port, { clientName: "pulse.example.com" }), message);
+    assert.equal(stub.commands[0], "EHLO pulse.example.com");
+  } finally {
+    await stub.close();
+  }
+});
+
+test("one timer covers the whole attempt, not each command", async () => {
+  const stub = await startSmtpStub();
+  const scheduled: number[] = [];
+  try {
+    await sendMail(
+      options(stub.port, {
+        timeoutMs: 777,
+        schedule: (_fn, ms) => {
+          scheduled.push(ms);
+          return () => {};
+        },
+      }),
+      message,
+    );
+    assert.deepEqual(scheduled, [777]);
+  } finally {
+    await stub.close();
+  }
+});
+
+test("the attempt timer firing mid-conversation names the stage", async () => {
+  const stub = await startSmtpStub({ silentOn: ["MAIL FROM"] });
+  const timers: (() => void)[] = [];
+  try {
+    const sending = sendMail(
+      options(stub.port, {
+        schedule: (fn) => {
+          timers.push(fn);
+          return () => {};
+        },
+      }),
+      message,
+    );
+    // Wait until the stub saw MAIL FROM: EHLO was answered, so the timer is still the same one.
+    while (!stub.commands.includes("MAIL FROM:<pulse@example.com>")) {
+      await new Promise((r) => setImmediate(r));
+    }
+    timers[0]?.();
+    await assert.rejects(sending, /SMTP MAIL FROM timed out/);
+    assert.equal(timers.length, 1);
+  } finally {
+    await stub.close();
+  }
+});
+
+test("ehloNameFrom cleans a host name and isEhloName validates names", () => {
+  assert.equal(ehloNameFrom("web-1.example.com"), "web-1.example.com");
+  assert.equal(ehloNameFrom("my host_1"), "my-host-1");
+  assert.equal(ehloNameFrom(""), "localhost");
+  assert.equal(ehloNameFrom("..."), "localhost");
+  assert.equal(isEhloName("[192.0.2.1]"), true);
+  assert.equal(isEhloName("[IPv6:::1]"), true);
+  assert.equal(isEhloName("a.b-c.d"), true);
+  for (const bad of ["", "-a", "a-", "a b", "a\r\nb", "a..b", "x".repeat(256), "[nope!]"]) {
+    assert.equal(isEhloName(bad), false, JSON.stringify(bad));
   }
 });

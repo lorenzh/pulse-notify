@@ -1,3 +1,4 @@
+import { PermanentDeliveryError } from "../errors.ts";
 import { fetchWithTimeout } from "../timeout.ts";
 import type { Schedule } from "../types.ts";
 
@@ -23,7 +24,8 @@ function safeFetchError(label: string, err: unknown): Error {
   return error;
 }
 
-/** POSTs a JSON body without following redirects. Any non-2xx status rejects with the status only. */
+/** POSTs a JSON body without following redirects. Any non-2xx status rejects with the status only;
+ * a 4xx except 408 and 429 rejects with a `PermanentDeliveryError`. */
 export async function postJson(
   label: string,
   url: string,
@@ -54,7 +56,10 @@ export async function postJson(
   } catch (err) {
     throw safeFetchError(label, err);
   }
-  if (status < 200 || status > 299) {
-    throw new Error(`${label} responded with status ${status}`);
+  if (status >= 200 && status <= 299) return;
+  // 408 and 429 ask for a later retry; every other 4xx will not change by itself.
+  if (status >= 400 && status <= 499 && status !== 408 && status !== 429) {
+    throw new PermanentDeliveryError(`${label} responded with status ${status}`, { status });
   }
+  throw new Error(`${label} responded with status ${status}`);
 }

@@ -10,11 +10,13 @@ export class Metrics {
   readonly #deliveries = new Map<string, number>();
   readonly #channelIds: string[];
   readonly #pending: () => number;
+  readonly #failedPolls: () => number;
 
   /** Only channel ids are used as labels: never a URL or a path. */
-  constructor(channelIds: string[], pending: () => number) {
+  constructor(channelIds: string[], pending: () => number, failedPolls: () => number = () => 0) {
     this.#channelIds = channelIds;
     this.#pending = pending;
+    this.#failedPolls = failedPolls;
   }
 
   pollDone(outcome: PollOutcome): void {
@@ -54,6 +56,9 @@ export class Metrics {
       "# HELP pulse_notify_pending_deliveries Notifications not yet delivered or failed.",
       "# TYPE pulse_notify_pending_deliveries gauge",
       `pulse_notify_pending_deliveries ${this.#pending()}`,
+      "# HELP pulse_notify_consecutive_failed_polls Polls in a row that failed; 0 after a good poll.",
+      "# TYPE pulse_notify_consecutive_failed_polls gauge",
+      `pulse_notify_consecutive_failed_polls ${this.#failedPolls()}`,
     );
     return `${lines.join("\n")}\n`;
   }

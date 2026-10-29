@@ -42,13 +42,25 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+let current: Ledger | undefined;
+
+/** Writes the batched changes of the last ledger and returns the state file. */
+async function savedState(): Promise<{
+  channels: Record<string, Record<string, { status: string }>>;
+  version: number;
+}> {
+  await current?.flush();
+  return JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+}
+
 function make(sleep: Sleep = async () => {}): Notifier {
+  current = new Ledger(join(dir, "state.json"));
   return new Notifier({
     config: {
       channels: [{ id: "hook", type: "webhook", url: rx.url, remindEverySeconds: 600 }],
     },
     apiUrl: api.url,
-    ledger: new Ledger(join(dir, "state.json")),
+    ledger: current,
     logger,
     retryDelayMs: 1,
     retryAttempts: 5,
@@ -121,12 +133,12 @@ test("older reminder keys are pruned from the ledger", async () => {
   await poll(n);
   clock = OPENED + 20 * MINUTE;
   await poll(n);
-  const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+  const state = await savedState();
   assert.deepEqual(
-    Object.keys(state.channels.hook).sort((a, b) => a.localeCompare(b)),
+    Object.keys(state.channels.hook ?? {}).sort((a, b) => a.localeCompare(b)),
     ["1:opened", "1:reminder:2"],
   );
-  assert.equal(state.version, 1);
+  assert.equal(state.version, 2);
 });
 
 test("a resolved incident gets no reminder", async () => {
@@ -159,8 +171,8 @@ test("a reminder still retrying when the incident resolves is dropped before sen
   release();
   await n.idle();
   assert.deepEqual(keys(), ["1:opened", "1:resolved"]);
-  const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
-  assert.equal(state.channels.hook["1:reminder:1"], "dropped");
+  const state = await savedState();
+  assert.equal(state.channels.hook?.["1:reminder:1"]?.status, "dropped");
   assert.ok(logger.entries.some((e) => e.msg === "stale reminder dropped"));
 });
 
@@ -222,8 +234,8 @@ test("a reminder pending at restart of a resolved incident is dropped, not sent"
   await n.idle();
   await n.stop();
   assert.deepEqual(keys(), ["1:resolved"]);
-  const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
-  assert.equal(state.channels.hook["1:reminder:1"], "dropped");
+  const state = await savedState();
+  assert.equal(state.channels.hook?.["1:reminder:1"]?.status, "dropped");
 });
 
 test("a held reminder of an open incident is sent after the first poll", async () => {
@@ -270,6 +282,7 @@ test("a failed newer reminder still supersedes an older pending one", async () =
   ledger.claim("hook", "1:reminder:1", reminder(1));
   ledger.claim("hook", "1:reminder:2", reminder(2));
   ledger.settle("hook", "1:reminder:2", "failed");
+  await ledger.flush();
   api.incidents = [incident({ id: 1, openedAt: OPENED })];
   clock = OPENED + 10 * MINUTE;
   const n = make();

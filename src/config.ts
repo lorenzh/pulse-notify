@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
+import { DEFAULT_API_MAX_BYTES } from "./api.ts";
 import { envelopeAddress } from "./channels/email.ts";
 import { isLoopbackHost } from "./channels/loopback.ts";
+import { isEhloName } from "./channels/smtp.ts";
 import {
   DEFAULT_RETRY_ATTEMPTS,
   DEFAULT_RETRY_DELAY_MS,
@@ -8,6 +10,9 @@ import {
 } from "./delivery.ts";
 import { LOG_LEVELS, type LogLevel } from "./log.ts";
 import type { ChannelConfig, Config, SmtpConfig } from "./types.ts";
+
+export const DEFAULT_LEASE_SECONDS = 60;
+export const MIN_LEASE_SECONDS = 30;
 
 export class ConfigError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -271,7 +276,7 @@ function parseSmtp(value: unknown, id: string, path: string, source: SecretSourc
   const where = "smtp";
   rejectUnknownKeys(
     value,
-    ["host", "port", "tls", "username", "passwordEnv", "passwordFile"],
+    ["host", "port", "tls", "username", "passwordEnv", "passwordFile", "clientName"],
     path,
     `channels ${JSON.stringify(id)} ${where}`,
   );
@@ -284,6 +289,14 @@ function parseSmtp(value: unknown, id: string, path: string, source: SecretSourc
   }
   const tls = parseSmtpTls(value.tls, id);
   const smtp: SmtpConfig = { host: value.host, port, tls };
+  if (value.clientName !== undefined) {
+    if (typeof value.clientName !== "string" || !isEhloName(value.clientName)) {
+      throw new ConfigError(
+        `channel "${id}": smtp.clientName must be a host name or an address literal`,
+      );
+    }
+    smtp.clientName = value.clientName;
+  }
   if (value.username === undefined) {
     if (value.passwordEnv !== undefined || value.passwordFile !== undefined) {
       throw new ConfigError(`channel "${id}": smtp password needs a username`);
@@ -410,6 +423,13 @@ export interface Settings {
   /** `undefined` means no health listener. */
   healthPort: number | undefined;
   healthHost: string;
+  /** `/healthz` fails after this many failed polls in a row. */
+  healthMaxFailedPolls: number;
+  lockLeaseSeconds: number;
+  stateRetentionDays: number;
+  apiMaxBytes: number;
+  /** Global EHLO name; `undefined` means the machine host name. */
+  smtpClientName: string | undefined;
 }
 
 function parseLogLevel(value: string | undefined): LogLevel {
@@ -440,6 +460,43 @@ function intEnv(env: Record<string, string | undefined>, name: string, fallback:
   return n;
 }
 
+function minIntEnv(
+  env: Record<string, string | undefined>,
+  name: string,
+  fallback: number,
+  min: number,
+): number {
+  const n = intEnv(env, name, fallback);
+  if (n < min) throw new ConfigError(`${name} must be at least ${min}`);
+  return n;
+}
+
+/** The API url must be http(s); the error never repeats it, it can hold credentials. */
+function parseApiUrl(value: string | undefined): string {
+  const url = value || "http://localhost:3000";
+  if (!isHttpUrl(url)) throw new ConfigError("PULSE_API_URL must be a valid http(s) url");
+  return url;
+}
+
+function parseSmtpClientName(value: string | undefined): string | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (!isEhloName(value)) {
+    throw new ConfigError(
+      "PULSE_NOTIFY_SMTP_CLIENT_NAME must be a host name or an address literal",
+    );
+  }
+  return value;
+}
+
+export function loadLockLeaseSeconds(env: Record<string, string | undefined>): number {
+  return minIntEnv(
+    env,
+    "PULSE_NOTIFY_LOCK_LEASE_SECONDS",
+    DEFAULT_LEASE_SECONDS,
+    MIN_LEASE_SECONDS,
+  );
+}
+
 export function loadSettings(env: Record<string, string | undefined>): Settings {
   const configPath = env.PULSE_NOTIFY_CONFIG;
   if (!configPath) throw new ConfigError("PULSE_NOTIFY_CONFIG is required");
@@ -460,7 +517,7 @@ export function loadSettings(env: Record<string, string | undefined>): Settings 
   }
   return {
     configPath,
-    apiUrl: env.PULSE_API_URL || "http://localhost:3000",
+    apiUrl: parseApiUrl(env.PULSE_API_URL),
     statePath: env.PULSE_NOTIFY_STATE || "./notify-state.json",
     pollMs,
     retryDelayMs,
@@ -470,5 +527,10 @@ export function loadSettings(env: Record<string, string | undefined>): Settings 
     logLevel: parseLogLevel(env.PULSE_LOG_LEVEL),
     healthPort: parseHealthPort(env.PULSE_HEALTH_PORT),
     healthHost: env.PULSE_HEALTH_HOST || "127.0.0.1",
+    healthMaxFailedPolls: minIntEnv(env, "PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS", 5, 1),
+    lockLeaseSeconds: loadLockLeaseSeconds(env),
+    stateRetentionDays: minIntEnv(env, "PULSE_NOTIFY_STATE_RETENTION_DAYS", 30, 1),
+    apiMaxBytes: minIntEnv(env, "PULSE_NOTIFY_API_MAX_BYTES", DEFAULT_API_MAX_BYTES, 1),
+    smtpClientName: parseSmtpClientName(env.PULSE_NOTIFY_SMTP_CLIENT_NAME),
   };
 }

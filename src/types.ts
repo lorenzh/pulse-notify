@@ -59,6 +59,8 @@ export interface SmtpConfig {
   username?: string;
   /** Read at startup from the environment or a file. */
   password?: string;
+  /** Name sent with EHLO: a host name or an address literal. Absent means the global default. */
+  clientName?: string;
 }
 
 export interface EmailChannelConfig extends ChannelBase {

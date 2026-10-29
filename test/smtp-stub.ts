@@ -53,8 +53,16 @@ export interface SmtpStubOptions {
   auth?: ("PLAIN" | "LOGIN")[];
   /** Reply to the first command that starts with the key, instead of the normal one. */
   replies?: Record<string, string>;
+  /** Greeting line; default "220 stub ready". */
+  greeting?: string;
   /** Do not send the greeting. */
   isSilent?: boolean;
+  /** Bytes sent in the same write as the STARTTLS "220", so they arrive before the handshake. */
+  injectAfterStartTls?: string;
+  /** Reply to the end of the message data (the "." line) with this instead of "250 queued". */
+  endOfDataReply?: string;
+  /** Never answer a command that starts with one of these. */
+  silentOn?: string[];
 }
 
 export interface SmtpStub {
@@ -108,7 +116,7 @@ class Connection {
       if (line === ".") {
         this.#stub.messages.push(this.#data.join("\r\n"));
         this.#data = undefined;
-        socket.write("250 queued\r\n");
+        socket.write(`${this.#options.endOfDataReply ?? "250 queued"}\r\n`);
       } else {
         this.#data.push(line);
       }
@@ -122,6 +130,7 @@ class Connection {
       return;
     }
     this.#stub.commands.push(line);
+    if (this.#options.silentOn?.some((prefix) => line.startsWith(prefix))) return;
     const override = Object.keys(this.#options.replies ?? {}).find((k) => line.startsWith(k));
     if (override !== undefined) {
       const reply = this.#options.replies?.[override] ?? "";
@@ -167,7 +176,7 @@ class Connection {
       socket.write("502 no\r\n");
       return;
     }
-    socket.write("220 go ahead\r\n");
+    socket.write(`220 go ahead\r\n${this.#options.injectAfterStartTls ?? ""}`);
     // Stop reading plain text before the handshake starts.
     socket.removeAllListeners("data");
     const secure = new TLSSocket(socket, { isServer: true, key: tls.key, cert: tls.cert });
@@ -193,7 +202,7 @@ export async function startSmtpStub(options: SmtpStubOptions = {}): Promise<Smtp
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
     new Connection(stub, options, false).attach(socket);
-    if (!options.isSilent) socket.write("220 stub ready\r\n");
+    if (!options.isSilent) socket.write(`${options.greeting ?? "220 stub ready"}\r\n`);
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
   const address = server.address();

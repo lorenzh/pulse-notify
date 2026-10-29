@@ -573,6 +573,8 @@ function buildFault(poisoned: Set<number>): typeof fetch {
         },
       });
     }
+    // Without a body stream the client uses json(), which hands out the poisoned objects.
+    Object.defineProperty(res, "body", { value: null });
     return Object.defineProperty(res, "json", { value: async () => items });
   };
 }

@@ -76,6 +76,7 @@ Set `remindEverySeconds` (an integer of at least 60) on a channel to get a "stil
 - After a restart, a pending reminder is held until the first successful poll, then dropped if its incident resolved or a newer reminder exists. Nothing is repeated, because `n` is derived from the clock and the ledger holds the key.
 - After an outage of pulse-notify or the channel only the latest due reminder is sent, not one for every missed interval.
 - A new channel starts with the current `n`: reminders for incidents that are already open begin at the next interval.
+- Switching `remindEverySeconds` on for an existing channel does the same: at the first poll the due reminder of every open incident is recorded as `seeded` and nothing is sent, so there is no burst. The ledger stores the time as `remindersFrom` for the channel. Later incidents and later intervals remind normally. Removing `remindEverySeconds` drops `remindersFrom`, so switching it on again seeds again. Known limit: after an upgrade from a version 1 ledger, one due reminder per open incident is skipped once.
 - A resolved incident gets no reminder. A reminder that is still queued or retrying when its incident resolves is dropped (the ledger marks it `dropped`), so `resolved` never follows a late reminder.
 - Webhook and file receivers see `"event": "reminder"` only if you set `remindEverySeconds` on that channel. Make sure they accept the value.
 - Older reminder keys of an incident are removed from the ledger when a newer one is recorded.
@@ -112,7 +113,13 @@ The reason is untrusted text: it is cut to 300 characters, control characters ar
   | Delay | 1 s | 2 s | 4 s | 8 s | 16 s | 32 s | 60 s |
 
   That is about 6 minutes in total. `PULSE_NOTIFY_RETRY_ATTEMPTS=0` retries without end.
-- After the last attempt the event is logged at error level (channel, key, attempts, error, code, cause) and marked `failed`. `failed` is final: it is not retried, not even after a restart (unless `PULSE_NOTIFY_RETRY_ATTEMPTS=0`, where an event never fails).
+- Permanent errors are not retried: the event is `failed` after the first attempt, with no delay and also with `PULSE_NOTIFY_RETRY_ATTEMPTS=0`, and the log line `notification delivery failed` has `permanent: true`. They are:
+  - HTTP channels (webhook, Slack, Teams): a 4xx status except 408 and 429, for example 400, 401, 403, 404 or 410. A 3xx status, 408, 429, a 5xx status, a timeout or a network error is retried.
+  - Email: an SMTP reply with a 5xx code, at any stage. A 4xx reply is retried.
+
+  The next queued event of the channel is sent at once. Resend a failed event with `failed resend`, see [operation.md](operation.md#failed-events-and-resend).
+- `PULSE_NOTIFY_RETRY_ATTEMPTS=0` caveat: a retryable error (for example a 503 or a dead host) then blocks the channel until the receiver recovers, because there is no deadline per event. Later events of that channel wait behind it. Use a finite number unless blocking is what you want.
+- After the last attempt the event is logged at error level (channel, key, attempts, error, code, cause) and marked `failed`. `failed` is not retried by the service, not even after a restart (unless `PULSE_NOTIFY_RETRY_ATTEMPTS=0`, where a retryable error never ends the event). Its notification is kept in the ledger, so `failed resend` can send it again.
 - Each channel has its own FIFO queue and worker. A slow or failing channel delays neither other channels nor polling. Within one channel the order is kept, so a long retry blocks the later events of that channel (head-of-line blocking, up to the whole schedule).
 - `resolved` is sent after `opened`. It is still sent if `opened` failed.
 - On the first start of a channel (new ledger or new channel id) all incidents that the API shows are recorded as `seeded`. No notifications are sent for this history. The seed covers all incidents, whatever the `checks` filter says.

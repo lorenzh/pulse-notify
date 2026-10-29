@@ -41,7 +41,24 @@ export interface NotifierOptions {
   now?: () => number;
   /** Replaces the SMTP client, for tests. */
   sendMail?: SendMail;
+  /** Largest API response body in bytes. */
+  apiMaxBytes?: number | undefined;
+  /** Settled ledger entries older than this many days are pruned. Default 30. */
+  stateRetentionDays?: number | undefined;
+  /** Global EHLO name for email channels. */
+  smtpClientName?: string | undefined;
+  /** Machine host name, the EHLO name when nothing is set. */
+  hostname?: (() => string) | undefined;
 }
+
+/** How a notifier polls: used for the health check. */
+export interface PollHealth {
+  /** Polls in a row that failed (fetch or detection threw); 0 after a good poll. */
+  consecutiveFailedPolls: number;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const PRUNE_EVERY_MS = 60 * 60 * 1000;
 
 const realSleep: Sleep = (ms, signal) =>
   new Promise((resolve) => {
@@ -104,6 +121,10 @@ export class Notifier {
   /** Ids of the incidents that the last poll showed as resolved. */
   #resolved = new Set<number>();
   readonly #now: () => number;
+  #failedPolls = 0;
+  /** Ids of the incidents in the last successful poll; `undefined` before the first one. */
+  #visible: Set<number> | undefined;
+  #lastPruneMs: number | undefined;
   #cancelPoll: (() => void) | undefined;
   #running = false;
   #ticking: Promise<void> | undefined;
@@ -120,6 +141,8 @@ export class Notifier {
         now: this.#now,
         logger: opts.logger,
         sendMail: opts.sendMail,
+        smtpClientName: opts.smtpClientName,
+        hostname: opts.hostname,
       });
       const queued = new Set<string>();
       const state: ChannelState = {
@@ -184,6 +207,10 @@ export class Notifier {
     await this.idle();
   }
 
+  pollHealth(): PollHealth {
+    return { consecutiveFailedPolls: this.#failedPolls };
+  }
+
   /** Resolves when every channel queue is empty. */
   async idle(): Promise<void> {
     await Promise.all(this.#channels.map((c) => c.delivery.idle()));
@@ -223,7 +250,11 @@ export class Notifier {
   /** One poll: fetch, detect, enqueue. Never rejects; does not wait for deliveries. */
   tick(): Promise<void> {
     this.#ticking ??= this.#poll()
+      .then((isOk) => {
+        this.#failedPolls = isOk ? 0 : this.#failedPolls + 1;
+      })
       .catch((err: unknown) => {
+        this.#failedPolls++;
         this.#opts.logger.log("error", "poll failed unexpectedly", errorFields(err));
       })
       .finally(() => {
@@ -232,11 +263,13 @@ export class Notifier {
     return this.#ticking;
   }
 
-  async #poll(): Promise<void> {
+  /** Resolves true when the API answered, false when the fetch failed. */
+  async #poll(): Promise<boolean> {
     const api = {
       baseUrl: this.#opts.apiUrl,
       fetch: this.#opts.fetch,
       timeoutMs: this.#opts.timeoutMs,
+      maxBytes: this.#opts.apiMaxBytes,
       schedule: this.#opts.schedule,
       onVersionAbsent: () => this.#reportVersionAbsent(),
       onInvalidCheck: (error: string) => this.#reportInvalidCheck(error),
@@ -251,7 +284,7 @@ export class Notifier {
     } catch (err) {
       this.#opts.logger.log("error", "api poll failed", errorFields(err));
       this.#opts.metrics?.pollDone("error");
-      return;
+      return false;
     }
     this.#opts.metrics?.pollDone("ok");
     const names = new Map(checks.map((c) => [c.id, c.name]));
@@ -263,6 +296,18 @@ export class Notifier {
     }
     // After the new events are queued, so a newer reminder supersedes a held one.
     this.#releaseHeld();
+    this.#visible = new Set(incidents.map((i) => i.id));
+    this.#pruneLedger(nowMs);
+    return true;
+  }
+
+  /** Removes old settled entries at the first poll and then once per hour. */
+  #pruneLedger(nowMs: number): void {
+    if (this.#lastPruneMs !== undefined && nowMs - this.#lastPruneMs < PRUNE_EVERY_MS) return;
+    this.#lastPruneMs = nowMs;
+    const days = this.#opts.stateRetentionDays ?? 30;
+    const count = this.#opts.ledger.prune(days * DAY_MS, this.#visible);
+    if (count > 0) this.#opts.logger.log("info", "old ledger entries pruned", { count });
   }
 
   #releaseHeld(): void {
@@ -313,7 +358,7 @@ export class Notifier {
       remindSeconds === undefined ? undefined : { everyMs: remindSeconds * 1000, nowMs };
     if (!ledger.hasChannel(id)) {
       try {
-        ledger.seed(id, seedKeys(incidents, reminders));
+        ledger.seed(id, seedKeys(incidents, reminders), reminders ? nowMs : undefined);
       } catch (err) {
         logger.log("error", "ledger seed failed, the next poll retries", {
           channel: id,
@@ -327,6 +372,7 @@ export class Notifier {
       });
       return;
     }
+    if (!this.#syncReminderMark(id, incidents, reminders, nowMs)) return;
     this.#rebuildLegacyPending(channel, incidents, names, nowMs);
     const relevant = incidents.filter((i) => isRouted(channel.config, i.checkId));
     const events = detectEvents(
@@ -337,6 +383,42 @@ export class Notifier {
     for (const { key, event, incident } of events) {
       this.#enqueue(channel, buildArgs(key, event, incident, names, nowMs));
     }
+  }
+
+  /**
+   * Reminders switched on for a channel that has none yet: the due reminder of every open
+   * incident counts as handled, so enabling them does not send a burst. Switched off: the mark
+   * goes, so enabling them again seeds again. False if the ledger could not be written.
+   */
+  #syncReminderMark(
+    id: string,
+    incidents: Incident[],
+    reminders: ReminderPlan | undefined,
+    nowMs: number,
+  ): boolean {
+    const { ledger, logger } = this.#opts;
+    if (!reminders) {
+      ledger.setRemindersFrom(id, undefined);
+      return true;
+    }
+    if (ledger.remindersFrom(id) !== undefined) return true;
+    try {
+      ledger.seed(
+        id,
+        seedKeys(incidents, reminders).filter((key) => REMINDER_KEY.test(key)),
+        nowMs,
+      );
+    } catch (err) {
+      logger.log("error", "ledger seed failed, the next poll retries", {
+        channel: id,
+        ...errorFields(err),
+      });
+      return false;
+    }
+    logger.log("info", "reminders enabled: due reminders of open incidents skipped", {
+      channel: id,
+    });
+    return true;
   }
 
   /** Pending keys from an older version have no stored notification: rebuild it from the API. */

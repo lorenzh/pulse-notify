@@ -1,13 +1,17 @@
 import { createHash } from "node:crypto";
 import type { EmailChannelConfig, Schedule, Sender } from "../types.ts";
 import { cleanText, type MessageParts, messageParts } from "./message.ts";
-import type { SendMail } from "./smtp.ts";
+import { DEFAULT_CLIENT_NAME, ehloNameFrom, type SendMail } from "./smtp.ts";
 
 export interface EmailOptions {
   sendMail: SendMail;
   timeoutMs?: number | undefined;
   schedule?: Schedule | undefined;
   now?: (() => number) | undefined;
+  /** Global EHLO name (`PULSE_NOTIFY_SMTP_CLIENT_NAME`); a channel's `smtp.clientName` wins. */
+  clientName?: string | undefined;
+  /** Machine host name, the EHLO name when nothing is set. */
+  hostname?: (() => string) | undefined;
 }
 
 /** The address inside `Name <addr>`, or the text itself. */
@@ -45,6 +49,10 @@ function messageId(key: string, from: string): string {
 
 export function createEmailSender(channel: EmailChannelConfig, opts: EmailOptions): Sender {
   const now = opts.now ?? Date.now;
+  const clientName =
+    channel.smtp.clientName ??
+    opts.clientName ??
+    (opts.hostname ? ehloNameFrom(opts.hostname()) : DEFAULT_CLIENT_NAME);
   return async (notification, signal) => {
     const parts = messageParts(notification, channel);
     const prefix =
@@ -64,6 +72,7 @@ export function createEmailSender(channel: EmailChannelConfig, opts: EmailOption
     await opts.sendMail(
       {
         ...channel.smtp,
+        clientName,
         timeoutMs: opts.timeoutMs ?? 5000,
         schedule: opts.schedule,
         signal,

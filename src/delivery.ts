@@ -1,4 +1,4 @@
-import { errorFields } from "./errors.ts";
+import { errorFields, PermanentDeliveryError } from "./errors.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Logger } from "./log.ts";
 import type { Notification, Sender, Sleep } from "./types.ts";
@@ -29,13 +29,23 @@ export interface ChannelDeliveryOptions {
 
 type Outcome =
   | { kind: "delivered"; attempts: number }
-  | { kind: "failed"; attempts: number; error: unknown }
+  | { kind: "failed"; attempts: number; error: unknown; isPermanent: boolean }
   | { kind: "dropped" }
   | { kind: "stopped" };
 
 /** Delay before retry `n` (1, 2, ...): `min(initial * 2^(n-1), max)`. */
 export function retryDelay(n: number, initialMs: number, maxMs: number): number {
   return Math.min(initialMs * 2 ** (n - 1), maxMs);
+}
+
+/**
+ * The final outcome of a failed attempt, or `undefined` when a retry follows. A permanent error
+ * ends the event at once, whatever the attempt limit is; a limit of 0 never ends a retryable one.
+ */
+function failureOf(err: unknown, attempt: number, limit: number): Outcome | undefined {
+  const isPermanent = err instanceof PermanentDeliveryError;
+  if (!isPermanent && (limit === 0 || attempt < limit)) return undefined;
+  return { kind: "failed", attempts: attempt, error: err, isPermanent };
 }
 
 /** One FIFO queue and worker for a channel. */
@@ -129,7 +139,8 @@ export class ChannelDelivery {
         return { kind: "delivered", attempts: attempt };
       } catch (err) {
         if (this.#stopped) return { kind: "stopped" };
-        if (limit > 0 && attempt >= limit) return { kind: "failed", attempts: attempt, error: err };
+        const failed = failureOf(err, attempt, limit);
+        if (failed) return failed;
         logger.log("warn", "delivery attempt failed", {
           channel: channelId,
           key: notification.key,
@@ -173,6 +184,7 @@ export class ChannelDelivery {
         channel: channelId,
         key: notification.key,
         attempts: outcome.attempts,
+        ...(outcome.isPermanent ? { permanent: true, note: "permanent error, not retried" } : {}),
         ...errorFields(outcome.error),
       });
     }
