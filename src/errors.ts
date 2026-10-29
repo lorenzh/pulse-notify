@@ -6,7 +6,10 @@ export class PermanentDeliveryError extends Error {
   readonly status: number | undefined;
   readonly code: string | undefined;
 
-  constructor(message: string, fields: { status?: number; code?: string; cause?: unknown } = {}) {
+  constructor(
+    message: string,
+    fields: { status?: number; code?: string | undefined; cause?: unknown } = {},
+  ) {
     super(message, fields.cause === undefined ? undefined : { cause: fields.cause });
     this.name = "PermanentDeliveryError";
     this.status = fields.status;
