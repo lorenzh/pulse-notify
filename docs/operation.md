@@ -125,8 +125,8 @@ The listener binds before polling starts. If the bind fails, the service prints 
 
 ## API validation and version check
 
-Every item from `GET /incidents` and `GET /checks` is validated with the validators of `@lorenzh/pulse-contract` (`validateIncident`, `validateCheck`). An invalid incident or check is skipped and logged once with a path such as `incidents[0].checkId: ...`. Incidents also need `openedAt` and `resolvedAt` inside the range of `Date`.
+The API calls go through `fetchJson` of `@lorenzh/pulse-contract`, which owns the timeout, the size cap and the wire check. Every item from `GET /incidents` and `GET /checks` is validated with the validators of `@lorenzh/pulse-contract` (`validateIncident`, `validateCheck`). An invalid incident or check is skipped and logged once with a path such as `incidents[0].checkId: ...`. Incidents also need `openedAt` and `resolvedAt` inside the range of `Date`.
 
 A response body is read as a stream and stops at `PULSE_NOTIFY_API_MAX_BYTES` (default 5 MiB). A `Content-Length` over the cap fails at once; a body that grows past the cap is cut off even without or with a wrong length. Both fail the poll and count as a failed poll.
 
-Each API response is checked with `checkWireVersion` against the `x-pulse-contract` header. A mismatch fails the poll like a network error (logged as `api poll failed`). A missing header is logged once as a warning and the poll continues.
+Each API response is checked with `checkWireVersion` against the `x-pulse-contract` header. A mismatch fails the poll like a network error (logged as `api poll failed`). A missing header is logged once as a warning and the poll continues. The status is checked before the header: a non-2xx response fails as `GET <path> returned <n>`, even when its header mismatches.
