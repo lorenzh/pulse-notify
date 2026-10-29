@@ -1,39 +1,24 @@
-import { fetchWithTimeout } from "../timeout.ts";
-import type { Schedule, Sender, WebhookChannelConfig } from "../types.ts";
+import type { Sender, WebhookChannelConfig } from "../types.ts";
+import { type HttpDeps, postJson } from "./http-post.ts";
+import { signBody } from "./signature.ts";
 
-export interface WebhookOptions {
-  fetch?: typeof fetch | undefined;
-  timeoutMs?: number | undefined;
-  schedule?: Schedule;
+export interface WebhookOptions extends HttpDeps {
+  /** Clock for `X-Pulse-Timestamp`. */
+  now?: (() => number) | undefined;
 }
 
 export function createWebhookSender(
   channel: WebhookChannelConfig,
   opts: WebhookOptions = {},
 ): Sender {
+  const now = opts.now ?? Date.now;
   return async (notification, signal) => {
-    const status = await fetchWithTimeout(
-      opts.fetch ?? fetch,
-      channel.url,
-      {
-        method: "POST",
-        redirect: "manual",
-        headers: {
-          "content-type": "application/json",
-          "idempotency-key": notification.key,
-        },
-        body: JSON.stringify(notification),
-        ...(signal ? { signal } : {}),
-      },
-      opts.timeoutMs ?? 5000,
-      async (res) => {
-        await res.body?.cancel();
-        return res.status;
-      },
-      opts.schedule,
-    );
-    if (status < 200 || status > 299) {
-      throw new Error(`webhook responded with status ${status}`);
+    const body = JSON.stringify(notification);
+    const headers: Record<string, string> = { "idempotency-key": notification.key };
+    if (channel.secret !== undefined) {
+      headers["x-pulse-signature"] = signBody(channel.secret, body);
+      headers["x-pulse-timestamp"] = String(Math.floor(now() / 1000));
     }
+    await postJson("webhook", channel.url, headers, body, opts, signal);
   };
 }

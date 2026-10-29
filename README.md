@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/lorenzh/pulse-notify/actions/workflows/ci.yml/badge.svg)](https://github.com/lorenzh/pulse-notify/actions/workflows/ci.yml)
 
-pulse is an uptime monitor with a status page. This repository is its notifier: a long-running service that polls [pulse-api](https://github.com/lorenzh/pulse-api) (`GET /incidents` and `GET /checks`) and sends a notification (check name, reason, time) to the configured channels when an incident opens or resolves. It uses the `Incident` and `Check` types of [pulse-contract](https://github.com/lorenzh/pulse-contract).
+pulse is an uptime monitor with a status page. This repository is its notifier: a long-running service that polls [pulse-api](https://github.com/lorenzh/pulse-api) (`GET /incidents` and `GET /checks`) and sends a notification (check name, reason, time) to the configured channels when an incident opens or resolves, and optionally "still down" reminders while it stays open. Channels: `webhook` (optionally HMAC-signed), `file`, `slack`, `teams` and `email` (SMTP). Each channel can include or exclude checks by id or `*` pattern; secrets come from environment variables or files. The contract has no tags, so routing is by check id. It uses the `Incident` and `Check` types of [pulse-contract](https://github.com/lorenzh/pulse-contract).
 
 pulse is built by Paragon Factory agents from the issues in [pulse-meta](https://github.com/lorenzh/pulse-meta).
 
@@ -37,7 +37,17 @@ docker run --rm \
 
 ## Documentation
 
-Settings, channels, payload, delivery, operation and troubleshooting are in [docs/index.md](docs/index.md).
+Settings, channels, routing, reminders, secrets, signing, payload, delivery, operation and troubleshooting are in [docs/index.md](docs/index.md). A Slack example:
+
+```json
+{
+  "channels": [
+    { "id": "slack", "type": "slack", "urlEnv": "SLACK_WEBHOOK_URL", "remindEverySeconds": 3600 }
+  ]
+}
+```
+
+Settings (environment variables) are listed in [docs/configuration.md](docs/configuration.md); the channel config keys are there too.
 
 ## Development
 

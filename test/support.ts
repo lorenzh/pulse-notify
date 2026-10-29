@@ -90,6 +90,8 @@ export interface ReceivedRequest {
   method: string | undefined;
   headers: IncomingMessage["headers"];
   body: unknown;
+  /** The body bytes as text, for signature checks. */
+  raw: string;
   status: number;
 }
 
@@ -119,13 +121,14 @@ export async function startReceiver(): Promise<Receiver> {
     req.on("end", () => {
       const status = receiver.up ? receiver.status : 503;
       let body: unknown = null;
+      const raw = Buffer.concat(chunks).toString("utf8");
       try {
-        body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        body = JSON.parse(raw);
       } catch {
         // Non-JSON payloads are recorded with a null body.
         body = null;
       }
-      receiver.requests.push({ method: req.method, headers: req.headers, body, status });
+      receiver.requests.push({ method: req.method, headers: req.headers, body, raw, status });
       res.statusCode = status;
       res.end();
     });

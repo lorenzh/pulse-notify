@@ -98,7 +98,8 @@ repository. Node 24+ with native type stripping, ESM, npm, strict TypeScript (`t
 ## This repository
 
 - Entry point and wiring: `src/index.ts` (`npm start` runs `node src/index.ts`). It reads the settings in `src/config.ts` (`PULSE_NOTIFY_CONFIG` is required; other variables and defaults are in `README.md`).
-- Channels are sender functions in `src/channels/` (`webhook.ts`, `file.ts`), created by `createWebhookSender` and `createFileSender` and wired in `src/notifier.ts`. Channel config types are in `src/types.ts`.
+- Channels are sender functions in `src/channels/`: `webhook.ts` (with `signature.ts`), `file.ts`, `slack.ts`, `teams.ts`, `email.ts` (over the own SMTP client `smtp.ts`). `src/channels/factory.ts` (`createSender`) builds the sender per config type; `routing.ts` decides which checks a channel gets; `message.ts` cleans text for chat and email; `http-post.ts` posts JSON without leaking the URL in errors. `src/notifier.ts` wires them. Channel config types are in `src/types.ts`; `src/config.ts` parses them and reads secrets from env or files.
+- Reminders: `src/detector.ts` derives the key `<incident>:reminder:<n>` from the injected clock; `src/delivery.ts` drops a stale reminder (`isStale`).
 - `src/delivery.ts` takes `send`, `sleep`, and `ledger` as injected dependencies.
 - Tests live in `test/`, not next to the code, with helpers in `test/support.ts` (a local fake API server). They use fake senders or a local server on `127.0.0.1`, never a real webhook or mail server.
 

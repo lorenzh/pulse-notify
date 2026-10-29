@@ -1,9 +1,10 @@
 import type { Check, Incident } from "@lorenzh/pulse-contract";
 import { fetchChecks, fetchIncidents } from "./api.ts";
-import { createFileSender } from "./channels/file.ts";
-import { createWebhookSender } from "./channels/webhook.ts";
+import { createSender } from "./channels/factory.ts";
+import { isRouted } from "./channels/routing.ts";
+import type { SendMail } from "./channels/smtp.ts";
 import { ChannelDelivery } from "./delivery.ts";
-import { detectEvents, seedKeys } from "./detector.ts";
+import { detectEvents, eventTimeMs, type ReminderPlan, seedKeys } from "./detector.ts";
 import { errorFields } from "./errors.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Logger } from "./log.ts";
@@ -15,7 +16,6 @@ import type {
   Notification,
   NotificationEvent,
   Schedule,
-  Sender,
   Sleep,
 } from "./types.ts";
 
@@ -37,6 +37,10 @@ export interface NotifierOptions {
   /** Schedules the next poll and request timeouts. */
   schedule?: Schedule;
   metrics?: Metrics;
+  /** Clock for reminders and signatures. */
+  now?: () => number;
+  /** Replaces the SMTP client, for tests. */
+  sendMail?: SendMail;
 }
 
 const realSleep: Sleep = (ms, signal) =>
@@ -66,8 +70,9 @@ function buildNotification(
   event: NotificationEvent,
   incident: Incident,
   names: Map<string, string>,
+  nowMs: number,
 ): Notification {
-  const timeMs = event === "opened" ? incident.openedAt : (incident.resolvedAt as number);
+  const timeMs = eventTimeMs(event, incident, nowMs);
   return {
     key,
     event,
@@ -77,6 +82,7 @@ function buildNotification(
     reason: incident.reason ?? null,
     time: new Date(timeMs).toISOString(),
     timeMs,
+    openedMs: incident.openedAt,
   };
 }
 
@@ -91,22 +97,26 @@ export class Notifier {
   readonly #channels: ChannelState[];
   /** Incident ids and legacy keys already reported, so a bad item is logged once. */
   readonly #reported = new Set<string>();
+  /** Ids of the incidents that the last poll showed as resolved. */
+  #resolved = new Set<number>();
+  readonly #now: () => number;
   #cancelPoll: (() => void) | undefined;
   #running = false;
   #ticking: Promise<void> | undefined;
 
   constructor(opts: NotifierOptions) {
     this.#opts = opts;
+    this.#now = opts.now ?? Date.now;
     const schedule = opts.schedule ?? defaultSchedule;
     this.#channels = opts.config.channels.map((config) => {
-      const send: Sender =
-        config.type === "webhook"
-          ? createWebhookSender(config, {
-              fetch: opts.fetch,
-              timeoutMs: opts.timeoutMs,
-              schedule,
-            })
-          : createFileSender(config);
+      const send = createSender(config, {
+        fetch: opts.fetch,
+        timeoutMs: opts.timeoutMs,
+        schedule,
+        now: this.#now,
+        logger: opts.logger,
+        sendMail: opts.sendMail,
+      });
       const queued = new Set<string>();
       return {
         config,
@@ -121,6 +131,7 @@ export class Notifier {
           retryAttempts: opts.retryAttempts,
           logger: opts.logger,
           release: (key) => queued.delete(key),
+          isStale: (n) => n.event === "reminder" && this.#resolved.has(n.incidentId),
           onOutcome: (outcome) =>
             opts.metrics?.deliveryDone(config.id, outcome === "delivered" ? "success" : "failure"),
         }),
@@ -214,8 +225,11 @@ export class Notifier {
     }
     this.#opts.metrics?.pollDone("ok");
     const names = new Map(checks.map((c) => [c.id, c.name]));
+    // Before any enqueue, so a reminder that is queued when its incident resolves is dropped.
+    this.#resolved = new Set(incidents.filter((i) => i.resolvedAt != null).map((i) => i.id));
+    const nowMs = this.#now();
     for (const channel of this.#channels) {
-      this.#pollChannel(channel, incidents, names);
+      this.#pollChannel(channel, incidents, names, nowMs);
     }
   }
 
@@ -244,12 +258,20 @@ export class Notifier {
     }
   }
 
-  #pollChannel(channel: ChannelState, incidents: Incident[], names: Map<string, string>): void {
+  #pollChannel(
+    channel: ChannelState,
+    incidents: Incident[],
+    names: Map<string, string>,
+    nowMs: number,
+  ): void {
     const { ledger, logger } = this.#opts;
     const id = channel.config.id;
+    const remindSeconds = channel.config.remindEverySeconds;
+    const reminders: ReminderPlan | undefined =
+      remindSeconds === undefined ? undefined : { everyMs: remindSeconds * 1000, nowMs };
     if (!ledger.hasChannel(id)) {
       try {
-        ledger.seed(id, seedKeys(incidents));
+        ledger.seed(id, seedKeys(incidents, reminders));
       } catch (err) {
         logger.log("error", "ledger seed failed, the next poll retries", {
           channel: id,
@@ -263,13 +285,15 @@ export class Notifier {
       });
       return;
     }
-    this.#rebuildLegacyPending(channel, incidents, names);
-    const filter = channel.config.checks;
-    const relevant =
-      filter && filter.length > 0 ? incidents.filter((i) => filter.includes(i.checkId)) : incidents;
-    const events = detectEvents(relevant, (key) => ledger.has(id, key) || channel.queued.has(key));
+    this.#rebuildLegacyPending(channel, incidents, names, nowMs);
+    const relevant = incidents.filter((i) => isRouted(channel.config, i.checkId));
+    const events = detectEvents(
+      relevant,
+      (key) => ledger.has(id, key) || channel.queued.has(key),
+      reminders,
+    );
     for (const { key, event, incident } of events) {
-      this.#enqueue(channel, buildArgs(key, event, incident, names));
+      this.#enqueue(channel, buildArgs(key, event, incident, names, nowMs));
     }
   }
 
@@ -278,6 +302,7 @@ export class Notifier {
     channel: ChannelState,
     incidents: Incident[],
     names: Map<string, string>,
+    nowMs: number,
   ): void {
     const id = channel.config.id;
     for (const { channelId, key, notification } of this.#opts.ledger.pending()) {
@@ -297,7 +322,7 @@ export class Notifier {
         );
         continue;
       }
-      this.#enqueue(channel, buildArgs(key, found.event, found.incident, names));
+      this.#enqueue(channel, buildArgs(key, found.event, found.incident, names, nowMs));
     }
   }
 

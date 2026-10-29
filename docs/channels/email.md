@@ -1,0 +1,51 @@
+# Email channel
+
+Sends a plain text email over SMTP. pulse-notify has its own small SMTP client (`EHLO`, `STARTTLS`, `AUTH PLAIN` and `LOGIN`, `MAIL FROM`, `RCPT TO`, `DATA`, `QUIT`), so there is no extra dependency.
+
+```json
+{
+  "id": "mail-ops",
+  "type": "email",
+  "smtp": {
+    "host": "smtp.example.com",
+    "port": 587,
+    "tls": "starttls",
+    "username": "pulse",
+    "passwordEnv": "SMTP_PASSWORD"
+  },
+  "from": "Pulse <pulse@example.com>",
+  "to": ["ops@example.com"],
+  "subjectPrefix": "[pulse]",
+  "statusUrl": "https://status.example.com"
+}
+```
+
+| Key                       | Required | Meaning                                                                          |
+| ------------------------- | -------- | -------------------------------------------------------------------------------- |
+| `smtp.host`, `smtp.port`  | yes      | The mail server.                                                                 |
+| `smtp.tls`                | no       | `starttls` (default), `tls` (implicit TLS) or `none`.                            |
+| `smtp.username`           | no       | Turns on login. Then exactly one of `passwordEnv` or `passwordFile` is required. |
+| `from`                    | yes      | Address or `Name <address>`.                                                     |
+| `to`                      | yes      | Non-empty array of addresses.                                                    |
+| `subjectPrefix`           | no       | Text put before the subject.                                                     |
+| `statusUrl`, `hideReason` | no       | As for [Slack](slack.md).                                                        |
+- Certificate verification is always on.
+- `none` must be set explicitly. Login over `none` to a host other than `127.0.0.1`/`localhost` is refused at startup.
+- A line break in `from`, `to` or `subjectPrefix` stops startup. A line break in the check name or reason is replaced by a space.
+- The connection and each command use `PULSE_NOTIFY_TIMEOUT_MS`. Any reply that is not 2xx (or 354 for `DATA`) fails the attempt; 4xx and 5xx are both retried like webhook failures.
+- `Message-ID` is `<hash-of-key@domain-of-from>`, so a resend after a crash carries the same ID and a receiver can drop the duplicate.
+- The body is UTF-8 plain text in base64.
+
+Sample message:
+
+```text
+Subject: [pulse] DOWN: Example site
+
+Example site is DOWN.
+
+Check: Example site
+State: DOWN
+Reason: HTTP 503
+Time: 2026-01-01T12:00:00.000Z
+Status: https://status.example.com
+```

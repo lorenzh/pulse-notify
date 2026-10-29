@@ -14,6 +14,7 @@ const note: Notification = {
   reason: "HTTP 500",
   time: "2026-01-01T00:00:00.000Z",
   timeMs: 1767225600000,
+  openedMs: 1767225600000,
 };
 
 test("posts JSON with idempotency key; 2xx is success", async () => {
