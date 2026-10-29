@@ -1,0 +1,16 @@
+.git
+.github
+.repos
+node_modules
+test
+**/*.test.ts
+biome.json
+eslint.config.js
+lefthook*.yml
+tsconfig*.json
+.env*
+.npmrc
+*.db
+notify-state.json*
+Dockerfile
+.dockerignore

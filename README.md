@@ -79,6 +79,23 @@ The webhook body and each line of the file channel are the same JSON object:
 PULSE_NOTIFY_CONFIG=./notify.json PULSE_API_URL=http://localhost:3000 npm start
 ```
 
+## Docker
+
+```sh
+docker build --tag pulse-notify:local .
+docker run --rm \
+  -v "$PWD/notify.json:/config/notify.json:ro" \
+  -v pulse-notify-data:/data \
+  -e PULSE_NOTIFY_CONFIG=/config/notify.json \
+  -e PULSE_API_URL=http://host.docker.internal:3000 \
+  pulse-notify:local
+```
+
+- The image runs as the non-root `node` user and starts `node src/index.ts`. It has no healthcheck.
+- `PULSE_NOTIFY_CONFIG` is required and the image contains no config: mount your file and point the variable at it, as above. Settings are in the table under Configuration.
+- `/data` is owned by `node`. The image sets `PULSE_NOTIFY_STATE=/data/notify-state.json`, so mount a volume at `/data` to keep the delivery ledger across restarts. A `file` channel needs a path under a writable directory such as `/data` (for example `/data/incidents.jsonl`).
+- The image holds only production dependencies and `src`, and no secrets.
+
 ## Install
 
 Requires Node 24 or newer.
