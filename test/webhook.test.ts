@@ -91,3 +91,27 @@ test("a hanging server times out via the injected timer", async () => {
     await close(hang);
   }
 });
+
+test("a stalled response body times out via the injected timer", async () => {
+  let fire: (() => void) | undefined;
+  const stalled: typeof fetch = async () =>
+    // Cancelling this body never completes, like a connection that stalls while closing.
+    new Response(new ReadableStream({ cancel: () => new Promise<void>(() => {}) }), {
+      status: 200,
+    });
+  const send = createWebhookSender(
+    { id: "h", type: "webhook", url: "http://127.0.0.1:1/" },
+    {
+      fetch: stalled,
+      timeoutMs: 20,
+      schedule: (fn) => {
+        fire = fn;
+        return () => {};
+      },
+    },
+  );
+  const sending = send(note);
+  await new Promise((r) => setImmediate(r));
+  fire?.();
+  await assert.rejects(sending, /timeout after 20ms/);
+});

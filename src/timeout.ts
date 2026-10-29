@@ -5,25 +5,37 @@ export const defaultSchedule: Schedule = (fn, ms) => {
   return () => clearTimeout(timer);
 };
 
-/** fetch that aborts after `ms`, using an injectable timer. */
-export async function fetchWithTimeout(
+/**
+ * Fetches and reads the response under one timer, so a stalled body times out too.
+ * `read` runs while the timer is still active. `init.signal` aborts the request early.
+ */
+export async function fetchWithTimeout<T>(
   fetchFn: typeof fetch,
   url: string,
   init: RequestInit,
   ms: number,
+  read: (res: Response) => Promise<T>,
   schedule: Schedule = defaultSchedule,
-): Promise<Response> {
+): Promise<T> {
   const controller = new AbortController();
-  let timedOut = false;
+  const signal = init.signal
+    ? AbortSignal.any([controller.signal, init.signal])
+    : controller.signal;
+  let expire: (err: Error) => void = () => {};
+  const expired = new Promise<never>((_, reject) => {
+    expire = reject;
+  });
+  // The race below handles a rejection; this keeps an unraced one from being unhandled.
+  expired.catch(() => {});
   const cancel = schedule(() => {
-    timedOut = true;
     controller.abort();
+    expire(new Error(`timeout after ${ms}ms`));
   }, ms);
   try {
-    return await fetchFn(url, { ...init, signal: controller.signal });
-  } catch (err) {
-    if (timedOut) throw new Error(`timeout after ${ms}ms`);
-    throw err;
+    return await Promise.race([
+      fetchFn(url, { ...init, signal }).then((res) => read(res)),
+      expired,
+    ]);
   } finally {
     cancel();
   }

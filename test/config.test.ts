@@ -70,6 +70,8 @@ test("loadSettings applies defaults and validates", () => {
     statePath: "./notify-state.json",
     pollMs: 5000,
     retryDelayMs: 1000,
+    retryMaxDelayMs: 60000,
+    retryAttempts: 12,
     timeoutMs: 5000,
   });
   assert.equal(loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_NOTIFY_POLL_MS: "10" }).pollMs, 10);
@@ -80,5 +82,29 @@ test("loadSettings applies defaults and validates", () => {
   assert.throws(
     () => loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_NOTIFY_TIMEOUT_MS: "0" }),
     ConfigError,
+  );
+});
+
+test("loadSettings parses the retry schedule and validates it", () => {
+  const base = { PULSE_NOTIFY_CONFIG: "c" };
+  const s = loadSettings({
+    ...base,
+    PULSE_NOTIFY_RETRY_DELAY_MS: "10",
+    PULSE_NOTIFY_RETRY_MAX_DELAY_MS: "100",
+    PULSE_NOTIFY_RETRY_ATTEMPTS: "0",
+  });
+  assert.equal(s.retryDelayMs, 10);
+  assert.equal(s.retryMaxDelayMs, 100);
+  assert.equal(s.retryAttempts, 0);
+  assert.throws(() => loadSettings({ ...base, PULSE_NOTIFY_RETRY_ATTEMPTS: "-1" }), ConfigError);
+  assert.throws(() => loadSettings({ ...base, PULSE_NOTIFY_RETRY_MAX_DELAY_MS: "x" }), ConfigError);
+  assert.throws(
+    () =>
+      loadSettings({
+        ...base,
+        PULSE_NOTIFY_RETRY_DELAY_MS: "5000",
+        PULSE_NOTIFY_RETRY_MAX_DELAY_MS: "100",
+      }),
+    /at least PULSE_NOTIFY_RETRY_DELAY_MS/,
   );
 });
