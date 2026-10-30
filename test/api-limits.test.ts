@@ -1,7 +1,8 @@
+import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { test } from "node:test";
 import { fetchChecks, fetchIncidents } from "../src/api.ts";
 import { redactUrl } from "../src/redact.ts";
+import { fakeFetch } from "./support.ts";
 
 const wire = { "x-pulse-wire-version": "1" };
 
@@ -16,9 +17,9 @@ function body(chunks: string[], headers: Record<string, string> = {}): Response 
   return new Response(stream, { headers: { ...wire, ...headers } });
 }
 
-const options = (fetchFn: typeof fetch, maxBytes: number) => ({
+const options = (fetchFn: Parameters<typeof fakeFetch>[0], maxBytes: number) => ({
   baseUrl: "https://api.invalid",
-  fetch: fetchFn,
+  fetch: fakeFetch(fetchFn),
   maxBytes,
   schedule: () => () => {},
 });
@@ -65,12 +66,12 @@ test("redactUrl drops user info, query and fragment", () => {
 
 test("a fetch error that carries the url is logged without credentials or query", async () => {
   const url = "https://user:pw@host.example/base?token=x";
-  const failing: typeof fetch = async (input) => {
+  const failing = fakeFetch(async (input) => {
     throw new TypeError(
       `Request cannot be constructed from a URL that includes credentials: ${String(input)}`,
       { cause: Object.assign(new Error(`connect ECONNREFUSED ${url}`), { code: "ECONNREFUSED" }) },
     );
-  };
+  });
   await assert.rejects(
     fetchIncidents({ baseUrl: url, fetch: failing, schedule: () => () => {} }),
     (err: unknown) => {

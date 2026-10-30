@@ -1,9 +1,9 @@
+import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { test } from "node:test";
 import { createWebhookSender } from "../src/channels/webhook.ts";
 import type { Notification, Schedule } from "../src/types.ts";
-import { close, listen, startReceiver } from "./support.ts";
+import { close, fakeFetch, listen, startReceiver } from "./support.ts";
 
 const note: Notification = {
   key: "7:opened",
@@ -95,11 +95,13 @@ test("a hanging server times out via the injected timer", async () => {
 
 test("a stalled response body times out via the injected timer", async () => {
   let fire: (() => void) | undefined;
-  const stalled: typeof fetch = async () =>
-    // Cancelling this body never completes, like a connection that stalls while closing.
-    new Response(new ReadableStream({ cancel: () => new Promise<void>(() => {}) }), {
-      status: 200,
-    });
+  const stalled = fakeFetch(
+    async () =>
+      // Cancelling this body never completes, like a connection that stalls while closing.
+      new Response(new ReadableStream({ cancel: () => new Promise<void>(() => {}) }), {
+        status: 200,
+      }),
+  );
   const send = createWebhookSender(
     { id: "h", type: "webhook", url: "http://127.0.0.1:1/" },
     {

@@ -1,0 +1,4 @@
+[test]
+coverage = true
+coverageThreshold = { lines = 0.8, functions = 0 }
+coveragePathIgnorePatterns = ["**/*.test.ts", "test/**", "**/test/**", "dist/**"]

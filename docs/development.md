@@ -5,15 +5,15 @@ Repo-specific points only. The cross-repo view is in the meta repository: [archi
 ## Run and test
 
 ```sh
-npm ci                                   # install, also the Lefthook pre-commit hook
-PULSE_NOTIFY_CONFIG=./notify.json npm start
-npm run check                            # lint, typecheck and tests
-node --test test/<name>.test.ts          # one test file
+bun install --frozen-lockfile              # install, also the Lefthook pre-commit hook
+PULSE_NOTIFY_CONFIG=./notify.json bun run start
+bun run check                           # lint, typecheck and tests
+bun test test/<name>.test.ts             # one test file
 ```
 
 - Tests are in `test/`, with helpers in `test/support.ts` (a local fake API server). They use fake senders or a local server on `127.0.0.1`, never a real webhook or mail server.
 - Follow TDD: write the failing test first. Inject `sleep`, `schedule` and `fetch`; use no real clock or network.
-- `npm test` requires 80 % line coverage.
+- `bun test` requires 80 % line coverage.
 
 ## Code map
 
@@ -29,7 +29,7 @@ node --test test/<name>.test.ts          # one test file
 
 ## Lint and hooks
 
-- `npm run lint` runs Biome and SonarJS through ESLint (cognitive complexity of 15 or less per function). `npm run format` applies Biome fixes.
-- Lefthook runs two pre-commit commands on staged files: `biome check`, and `pulse-eslint` (the same ESLint config as `npm run lint`: SonarJS plus the type-aware `no-floating-promises`, `no-misused-promises` and `switch-exhaustiveness-check` rules).
+- `bun run lint` runs Biome and SonarJS through ESLint (cognitive complexity of 15 or less per function). `bun run format` applies Biome fixes.
+- Lefthook runs two pre-commit commands on staged files: `biome check`, and `pulse-eslint` (the same ESLint config as `bun run lint`: SonarJS plus the type-aware `no-floating-promises`, `no-misused-promises` and `switch-exhaustiveness-check` rules).
 - The shared Biome, TypeScript, Lefthook, ESLint and CI configuration lives in [pulse-config](https://github.com/lorenzh/pulse-config). Change a rule there, then update the pin here. CI runs the shared `check.yml`.
 - The pulse-contract dependency is pinned to a commit SHA. Types are imported with `import type` only.

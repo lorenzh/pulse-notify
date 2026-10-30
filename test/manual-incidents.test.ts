@@ -1,8 +1,8 @@
+import { afterEach, beforeEach, test } from "bun:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, test } from "node:test";
 import { isManualRouted } from "../src/channels/routing.ts";
 import { detectManualEvents, seedManualKeys } from "../src/detector.ts";
 import { Ledger } from "../src/ledger.ts";

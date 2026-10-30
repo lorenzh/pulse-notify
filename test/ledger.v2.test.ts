@@ -1,13 +1,13 @@
+import { afterAll, test } from "bun:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, test } from "node:test";
 import { Ledger, WRITE_BATCH_MS } from "../src/ledger.ts";
 import type { Notification, Schedule } from "../src/types.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-ledger2-"));
-after(() => rmSync(dir, { recursive: true, force: true }));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 let counter = 0;
 function path(): string {

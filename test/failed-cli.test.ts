@@ -1,8 +1,8 @@
+import { afterAll, afterEach, beforeEach, test } from "bun:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, afterEach, beforeEach, test } from "node:test";
 import { runFailed } from "../src/failed-cli.ts";
 import { main, runCli } from "../src/index.ts";
 import { Ledger } from "../src/ledger.ts";
@@ -18,7 +18,7 @@ import {
 } from "./support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-failed-"));
-after(() => rmSync(dir, { recursive: true, force: true }));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 let api: FakeApi;
 let rx: Receiver;

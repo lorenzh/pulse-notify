@@ -4,7 +4,7 @@
 
 pulse is an uptime monitor with a status page. This repository is its notifier: a long-running service that polls [pulse-api](https://github.com/lorenzh/pulse-api) (`GET /incidents` and `GET /checks`) and sends a notification (check name, reason, time) to the configured channels when an incident opens or resolves, and optionally "still down" reminders while it stays open. Channels: `webhook` (optionally HMAC-signed), `file`, `slack`, `teams` and `email` (SMTP). Each channel can include or exclude checks by id or `*` pattern; secrets come from environment variables or files. The contract has no tags, so routing is by check id. It uses the `Incident` and `Check` types of [pulse-contract](https://github.com/lorenzh/pulse-contract).
 
-Failed events keep their notification and can be listed and resent with `node src/index.ts failed list` and `failed resend <key>|--all [--channel <id>]` while the service is stopped, see [docs/operation.md](docs/operation.md#failed-events-and-resend). A 4xx answer (except 408 and 429) from an HTTP receiver and a 5xx SMTP reply are permanent errors and end the event at once. `/healthz` and `/readyz` turn 503 when polls keep failing.
+Failed events keep their notification and can be listed and resent with `bun src/index.ts failed list` and `failed resend <key>|--all [--channel <id>]` while the service is stopped, see [docs/operation.md](docs/operation.md#failed-events-and-resend). A 4xx answer (except 408 and 429) from an HTTP receiver and a 5xx SMTP reply are permanent errors and end the event at once. `/healthz` and `/readyz` turn 503 when polls keep failing.
 
 pulse is built by Paragon Factory agents from the issues in [pulse-meta](https://github.com/lorenzh/pulse-meta).
 
@@ -12,7 +12,7 @@ Contributing: see [AGENTS.md](AGENTS.md).
 
 ## Quick start
 
-Requires Node 24 or newer and a running pulse-api. Write a config file such as `notify.json`:
+Requires Bun 1.4.0 and a running pulse-api. Write a config file such as `notify.json`:
 
 ```json
 { "channels": [{ "id": "log", "type": "file", "path": "./incidents.jsonl" }] }
@@ -21,8 +21,8 @@ Requires Node 24 or newer and a running pulse-api. Write a config file such as `
 In Docker, use `"path": "/data/incidents.jsonl"` instead. Only `/data` is writable there.
 
 ```sh
-npm ci
-PULSE_NOTIFY_CONFIG=./notify.json PULSE_API_URL=http://localhost:3000 npm start
+bun install --frozen-lockfile
+PULSE_NOTIFY_CONFIG=./notify.json PULSE_API_URL=http://localhost:3000 bun run start
 ```
 
 With Docker:
@@ -53,7 +53,7 @@ Settings (environment variables) are listed in [docs/configuration.md](docs/conf
 
 ## Development
 
-`npm run check` runs lint, typecheck and tests. See [docs/development.md](docs/development.md).
+`bun run check` runs lint, typecheck and tests. See [docs/development.md](docs/development.md).
 
 Licensed under the MIT licence, see [LICENSE](LICENSE).
 

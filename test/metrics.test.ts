@@ -1,5 +1,5 @@
+import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { test } from "node:test";
 import { Metrics } from "../src/metrics.ts";
 
 test("metrics render counters per channel and escape labels", () => {
