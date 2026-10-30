@@ -31,6 +31,14 @@ test("metrics keep the names, help texts and order", () => {
       "# TYPE pulse_notify_polls_total counter",
       'pulse_notify_polls_total{outcome="ok"} 0',
       'pulse_notify_polls_total{outcome="error"} 0',
+      "# HELP pulse_notify_feed_polls_total API feed reads by feed and outcome.",
+      "# TYPE pulse_notify_feed_polls_total counter",
+      'pulse_notify_feed_polls_total{feed="incidents",outcome="ok"} 0',
+      'pulse_notify_feed_polls_total{feed="incidents",outcome="error"} 0',
+      'pulse_notify_feed_polls_total{feed="checks",outcome="ok"} 0',
+      'pulse_notify_feed_polls_total{feed="checks",outcome="error"} 0',
+      'pulse_notify_feed_polls_total{feed="manual-incidents",outcome="ok"} 0',
+      'pulse_notify_feed_polls_total{feed="manual-incidents",outcome="error"} 0',
       "# HELP pulse_notify_deliveries_total Finished deliveries by channel and outcome.",
       "# TYPE pulse_notify_deliveries_total counter",
       'pulse_notify_deliveries_total{channel="log",outcome="success"} 0',
@@ -44,4 +52,17 @@ test("metrics keep the names, help texts and order", () => {
       "",
     ].join("\n"),
   );
+});
+
+test("feed reads count per feed and outcome; poll outcomes are counted apart", () => {
+  const metrics = new Metrics(["log"], () => 0);
+  metrics.feedPollDone("checks", "error");
+  metrics.feedPollDone("checks", "error");
+  metrics.feedPollDone("incidents", "ok");
+  metrics.pollDone("ok");
+  const text = metrics.render();
+  assert.match(text, /pulse_notify_feed_polls_total\{feed="checks",outcome="error"\} 2\n/);
+  assert.match(text, /pulse_notify_feed_polls_total\{feed="incidents",outcome="ok"\} 1\n/);
+  assert.match(text, /pulse_notify_feed_polls_total\{feed="manual-incidents",outcome="ok"\} 0\n/);
+  assert.match(text, /^pulse_notify_polls_total\{outcome="ok"\} 1$/m);
 });

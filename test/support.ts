@@ -67,6 +67,8 @@ export interface FakeApi {
   failing: boolean;
   /** Answers 500 on `/manual-incidents` only. */
   failingManual: boolean;
+  /** Paths (like `/checks`) that answer with the given status instead of data. */
+  failingPaths: Map<string, number>;
   /** Paths requested so far, in order. */
   requested: string[];
   close(): Promise<void>;
@@ -80,13 +82,15 @@ export async function startFakeApi(): Promise<FakeApi> {
     manualIncidents: [],
     failing: false,
     failingManual: false,
+    failingPaths: new Map(),
     requested: [],
     close: () => close(server),
   };
   const server = createServer((req, res) => {
     api.requested.push(req.url ?? "");
-    if (api.failing || (api.failingManual && req.url === "/manual-incidents")) {
-      res.statusCode = 500;
+    const failStatus = api.failingPaths.get(req.url ?? "");
+    if (api.failing || (api.failingManual && req.url === "/manual-incidents") || failStatus) {
+      res.statusCode = failStatus ?? 500;
       res.end();
       return;
     }
@@ -172,6 +176,30 @@ export function httpCheck(id: string, name: string): Check {
 
 export function heartbeatCheck(id: string, name: string): Check {
   return { id, name, type: "heartbeat", period: 60_000, grace: 5000 };
+}
+
+export function tlsCheck(id: string, name: string): Check {
+  return {
+    id,
+    name,
+    type: "tls",
+    host: "example.invalid",
+    port: 443,
+    warnDays: 14,
+    intervalMs: 60_000,
+  };
+}
+
+export function tcpCheck(id: string, name: string): Check {
+  return { id, name, type: "tcp", host: "db.example.invalid", port: 5432, intervalMs: 60_000 };
+}
+
+export function dnsCheck(id: string, name: string): Check {
+  return { id, name, type: "dns", dnsName: "example.com", recordType: "A", intervalMs: 60_000 };
+}
+
+export function domainCheck(id: string, name: string): Check {
+  return { id, name, type: "domain", domain: "example.com", warnDays: 30, intervalMs: 3_600_000 };
 }
 
 /** Narrows a received body to a JSON object, failing the test otherwise. */

@@ -1,6 +1,6 @@
-import type { Check, Incident, ManualIncident } from "@lorenzh/pulse-contract";
+import type { Incident, ManualIncident } from "@lorenzh/pulse-contract";
 import type { Logger } from "@lorenzh/pulse-kit";
-import { fetchChecks, fetchIncidents, fetchManualIncidents } from "./api.ts";
+import { ApiReadError, fetchChecks, fetchIncidents, fetchManualIncidents } from "./api.ts";
 import { createSender } from "./channels/factory.ts";
 import type { SendMail } from "./channels/mailer.ts";
 import { isManualRouted, isRouted } from "./channels/routing.ts";
@@ -16,7 +16,7 @@ import {
 } from "./detector.ts";
 import { errorFields } from "./errors.ts";
 import type { Ledger } from "./ledger.ts";
-import type { Metrics } from "./metrics.ts";
+import type { FeedName, Metrics } from "./metrics.ts";
 import { defaultSchedule } from "./timeout.ts";
 import type {
   ChannelConfig,
@@ -61,7 +61,7 @@ export interface NotifierOptions {
 
 /** How a notifier polls: used for the health check. */
 export interface PollHealth {
-  /** Polls in a row that failed (fetch or detection threw); 0 after a good poll. */
+  /** Polls in a row that failed (a feed read or detection threw); 0 after a good poll. */
   consecutiveFailedPolls: number;
 }
 
@@ -156,8 +156,12 @@ export class Notifier {
   #failedPolls = 0;
   /** Ids of the incidents in the last successful poll; `undefined` before the first one. */
   #visible: Set<number> | undefined;
-  /** Ids of the manual incidents in the last successful read; kept when the api answers 404. */
+  /** Ids of the manual incidents in the last successful read; kept on 404 or a failed read. */
   #visibleManual: Set<number> | undefined;
+  /** Check names from the last good `/checks` read; kept while that read fails. */
+  #checkNames = new Map<string, string>();
+  /** Failure kinds already logged per feed; cleared when the feed answers again. */
+  readonly #feedFailures = new Map<FeedName, Set<string>>();
   #lastPruneMs: number | undefined;
   #cancelPoll: (() => void) | undefined;
   #running = false;
@@ -297,7 +301,10 @@ export class Notifier {
     return this.#ticking;
   }
 
-  /** Resolves true when the API answered, false when the fetch failed. */
+  /**
+   * Reads the three feeds in parallel; each one that answered is used even when another failed.
+   * Resolves true only when all three answered (a 404 on manual incidents counts).
+   */
   async #poll(): Promise<boolean> {
     const api = {
       baseUrl: this.#opts.apiUrl,
@@ -308,41 +315,60 @@ export class Notifier {
       onVersionAbsent: () => this.#reportVersionAbsent(),
       onInvalidCheck: (error: string) => this.#reportInvalidCheck(error),
     };
-    let incidents: Incident[];
-    let checks: Check[];
-    let manual: ManualIncident[];
-    try {
-      const [result, fetched, manualResult] = await Promise.all([
-        fetchIncidents(api),
-        fetchChecks(api),
-        fetchManualIncidents(api),
-      ]);
-      incidents = result.incidents;
-      checks = fetched;
-      manual = manualResult.incidents;
-      this.#reportRejected(result.rejected);
+    const [incidentsRead, checksRead, manualRead] = await Promise.allSettled([
+      fetchIncidents(api),
+      fetchChecks(api),
+      fetchManualIncidents(api),
+    ]);
+    const result = this.#feedValue("incidents", incidentsRead);
+    const checks = this.#feedValue("checks", checksRead);
+    const manualResult = this.#feedValue("manual-incidents", manualRead);
+    const isOk = result !== undefined && checks !== undefined && manualResult !== undefined;
+    this.#opts.metrics?.pollDone(isOk ? "ok" : "error");
+    if (result) this.#reportRejected(result.rejected);
+    if (manualResult) {
       this.#reportRejected(
         manualResult.rejected.map((r) => ({ ...r, id: `manual:${String(r.id)}` })),
       );
-      if (!manualResult.isAbsent) this.#visibleManual = new Set(manual.map((i) => i.id));
-    } catch (err) {
-      this.#opts.logger.error("api poll failed", errorFields(err));
-      this.#opts.metrics?.pollDone("error");
-      return false;
+      if (!manualResult.isAbsent) {
+        this.#visibleManual = new Set(manualResult.incidents.map((i) => i.id));
+      }
     }
-    this.#opts.metrics?.pollDone("ok");
-    const names = new Map(checks.map((c) => [c.id, c.name]));
+    if (checks) this.#checkNames = new Map(checks.map((c) => [c.id, c.name]));
+    const incidents = result?.incidents;
     // Before any enqueue, so a reminder that is queued when its incident resolves is dropped.
-    this.#resolved = new Set(incidents.filter((i) => i.resolvedAt != null).map((i) => i.id));
+    if (incidents) {
+      this.#resolved = new Set(incidents.filter((i) => i.resolvedAt != null).map((i) => i.id));
+    }
     const nowMs = this.#now();
     for (const channel of this.#channels) {
-      this.#pollChannel(channel, incidents, manual, names, nowMs);
+      this.#pollChannel(channel, incidents, manualResult?.incidents, nowMs);
     }
-    // After the new events are queued, so a newer reminder supersedes a held one.
-    this.#releaseHeld();
-    this.#visible = new Set(incidents.map((i) => i.id));
-    this.#pruneLedger(nowMs);
-    return true;
+    if (incidents) {
+      // After the new events are queued, so a newer reminder supersedes a held one.
+      this.#releaseHeld();
+      this.#visible = new Set(incidents.map((i) => i.id));
+      this.#pruneLedger(nowMs);
+    }
+    return isOk;
+  }
+
+  /** The value of a feed read, or `undefined` after logging (once per kind) and counting its failure. */
+  #feedValue<T>(feed: FeedName, read: PromiseSettledResult<T>): T | undefined {
+    if (read.status === "fulfilled") {
+      this.#opts.metrics?.feedPollDone(feed, "ok");
+      if (this.#feedFailures.delete(feed)) this.#opts.logger.info("api feed recovered", { feed });
+      return read.value;
+    }
+    this.#opts.metrics?.feedPollDone(feed, "error");
+    const kind = read.reason instanceof ApiReadError ? read.reason.kind : "unknown";
+    const logged = this.#feedFailures.get(feed) ?? new Set<string>();
+    this.#feedFailures.set(feed, logged);
+    if (!logged.has(kind)) {
+      logged.add(kind);
+      this.#opts.logger.error("api poll failed", { feed, ...errorFields(read.reason) });
+    }
+    return undefined;
   }
 
   /** Removes old settled entries at the first poll and then once per hour. */
@@ -389,43 +415,70 @@ export class Notifier {
     }
   }
 
+  /**
+   * `undefined` means the feed failed this poll: its detection is skipped. A new channel is
+   * seeded only when both incident feeds answered, so a recovered feed sends no burst.
+   */
   #pollChannel(
+    channel: ChannelState,
+    incidents: Incident[] | undefined,
+    manual: ManualIncident[] | undefined,
+    nowMs: number,
+  ): void {
+    const remindSeconds = channel.config.remindEverySeconds;
+    const reminders: ReminderPlan | undefined =
+      remindSeconds === undefined ? undefined : { everyMs: remindSeconds * 1000, nowMs };
+    if (!this.#opts.ledger.hasChannel(channel.config.id)) {
+      if (incidents && manual) this.#seedChannel(channel, incidents, manual, reminders, nowMs);
+      return;
+    }
+    if (incidents) {
+      if (!this.#syncReminderMark(channel.config.id, incidents, reminders, nowMs)) return;
+      this.#rebuildLegacyPending(channel, incidents, nowMs);
+      this.#detectAutomatic(channel, incidents, reminders, nowMs);
+    }
+    if (manual) this.#detectManual(channel, manual);
+  }
+
+  #seedChannel(
     channel: ChannelState,
     incidents: Incident[],
     manual: ManualIncident[],
-    names: Map<string, string>,
+    reminders: ReminderPlan | undefined,
     nowMs: number,
   ): void {
     const { ledger, logger } = this.#opts;
     const id = channel.config.id;
-    const remindSeconds = channel.config.remindEverySeconds;
-    const reminders: ReminderPlan | undefined =
-      remindSeconds === undefined ? undefined : { everyMs: remindSeconds * 1000, nowMs };
-    if (!ledger.hasChannel(id)) {
-      try {
-        ledger.seed(
-          id,
-          [
-            ...seedKeys(incidents, reminders),
-            ...seedManualKeys(manual.filter((i) => isManualRouted(channel.config, i.componentIds))),
-          ],
-          reminders ? nowMs : undefined,
-        );
-      } catch (err) {
-        logger.error("ledger seed failed, the next poll retries", {
-          channel: id,
-          ...errorFields(err),
-        });
-        return;
-      }
-      logger.info("channel seeded with existing incidents", {
+    try {
+      ledger.seed(
+        id,
+        [
+          ...seedKeys(incidents, reminders),
+          ...seedManualKeys(manual.filter((i) => isManualRouted(channel.config, i.componentIds))),
+        ],
+        reminders ? nowMs : undefined,
+      );
+    } catch (err) {
+      logger.error("ledger seed failed, the next poll retries", {
         channel: id,
-        incidents: incidents.length,
+        ...errorFields(err),
       });
       return;
     }
-    if (!this.#syncReminderMark(id, incidents, reminders, nowMs)) return;
-    this.#rebuildLegacyPending(channel, incidents, names, nowMs);
+    logger.info("channel seeded with existing incidents", {
+      channel: id,
+      incidents: incidents.length,
+    });
+  }
+
+  #detectAutomatic(
+    channel: ChannelState,
+    incidents: Incident[],
+    reminders: ReminderPlan | undefined,
+    nowMs: number,
+  ): void {
+    const { ledger } = this.#opts;
+    const id = channel.config.id;
     const relevant = incidents.filter((i) => isRouted(channel.config, i.checkId));
     const events = detectEvents(
       relevant,
@@ -434,9 +487,14 @@ export class Notifier {
     );
     for (const { key, event, incident } of events) {
       this.#enqueue(channel, key, () =>
-        buildNotification(...buildArgs(key, event, incident, names, nowMs)),
+        buildNotification(...buildArgs(key, event, incident, this.#checkNames, nowMs)),
       );
     }
+  }
+
+  #detectManual(channel: ChannelState, manual: ManualIncident[]): void {
+    const { ledger } = this.#opts;
+    const id = channel.config.id;
     const isHandled = (key: string): boolean => ledger.has(id, key) || channel.queued.has(key);
     const relevantManual = manual.filter((i) => isManualRouted(channel.config, i.componentIds));
     for (const detected of detectManualEvents(relevantManual, isHandled)) {
@@ -481,12 +539,7 @@ export class Notifier {
   }
 
   /** Pending keys from an older version have no stored notification: rebuild it from the API. */
-  #rebuildLegacyPending(
-    channel: ChannelState,
-    incidents: Incident[],
-    names: Map<string, string>,
-    nowMs: number,
-  ): void {
+  #rebuildLegacyPending(channel: ChannelState, incidents: Incident[], nowMs: number): void {
     const id = channel.config.id;
     for (const { channelId, key, notification } of this.#opts.ledger.pending()) {
       if (channelId !== id || notification || channel.queued.has(key)) continue;
@@ -502,7 +555,7 @@ export class Notifier {
         continue;
       }
       this.#enqueue(channel, key, () =>
-        buildNotification(...buildArgs(key, found.event, found.incident, names, nowMs)),
+        buildNotification(...buildArgs(key, found.event, found.incident, this.#checkNames, nowMs)),
       );
     }
   }

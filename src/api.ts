@@ -39,10 +39,28 @@ export interface IncidentsResult {
 
 export const DEFAULT_API_MAX_BYTES = DEFAULT_MAX_BODY_BYTES;
 
+/**
+ * A failed api read. `kind` is the `FetchJsonError` kind; for `http` it carries the status
+ * (`http:500`), so callers can tell failures apart without reading the message.
+ */
+export class ApiReadError extends Error {
+  readonly kind: string;
+
+  constructor(message: string, kind: string) {
+    super(message);
+    this.name = "ApiReadError";
+    this.kind = kind;
+  }
+}
+
+function failureKind(error: FetchJsonError): string {
+  return error.kind === "http" ? `http:${error.status}` : error.kind;
+}
+
 /** An error without the original cause and with the API url redacted in its text. */
-function redactedError(err: unknown, baseUrl: string): Error {
+function redactedError(err: unknown, baseUrl: string, kind: string): ApiReadError {
   const message = err instanceof Error ? err.message : String(err);
-  const error = new Error(redactInText(message, baseUrl));
+  const error = new ApiReadError(redactInText(message, baseUrl), kind);
   let current: unknown = err;
   for (let depth = 0; current instanceof Error && depth < 5; depth++) {
     const code = (current as { code?: unknown }).code;
@@ -111,7 +129,7 @@ async function getArray(
   if (isAbsentTolerated && result.error.kind === "http" && result.error.status === 404) {
     return undefined;
   }
-  throw redactedError(apiError(result.error, path), opts.baseUrl);
+  throw redactedError(apiError(result.error, path), opts.baseUrl, failureKind(result.error));
 }
 
 /** The range of `Date` in milliseconds; outside it `toISOString()` throws. */
