@@ -25,7 +25,7 @@ pulse-notify reads environment variables and one JSON config file. Both are read
 
 The schedule is in [channels.md](channels.md#delivery-and-retries).
 
-- The numeric variables must be integers within their bound. Anything else stops startup with `<NAME>: must be an integer of at least <min>`, for example `PULSE_NOTIFY_POLL_MS: must be an integer of at least 1`. `PULSE_NOTIFY_RETRY_ATTEMPTS` allows `0`: `PULSE_NOTIFY_RETRY_ATTEMPTS: must be an integer >= 0`.
+- The numeric variables must be integers within their bound. Anything else stops startup with `<NAME>: must be an integer of at least <min>`, for example `PULSE_NOTIFY_POLL_MS: must be an integer of at least 1`. `PULSE_NOTIFY_RETRY_ATTEMPTS` allows `0`: `PULSE_NOTIFY_RETRY_ATTEMPTS: must be an integer of at least 0`.
 - `PULSE_NOTIFY_RETRY_MAX_DELAY_MS` below `PULSE_NOTIFY_RETRY_DELAY_MS` stops startup with `PULSE_NOTIFY_RETRY_MAX_DELAY_MS: must be at least PULSE_NOTIFY_RETRY_DELAY_MS`.
 - `PULSE_API_URL` must be an `http:` or `https:` URL. The startup log and every log line or error that carries it show the URL without user info, query and fragment; an error about it never repeats the value.
 - An empty value counts as unset, so the default applies.

@@ -65,6 +65,10 @@ export interface FakeApi {
   /** `undefined` answers 404, like an older api. */
   manualIncidents: ManualIncident[] | undefined;
   failing: boolean;
+  /** Answers 500 on `/manual-incidents` only. */
+  failingManual: boolean;
+  /** Paths requested so far, in order. */
+  requested: string[];
   close(): Promise<void>;
 }
 
@@ -75,10 +79,13 @@ export async function startFakeApi(): Promise<FakeApi> {
     checks: [],
     manualIncidents: [],
     failing: false,
+    failingManual: false,
+    requested: [],
     close: () => close(server),
   };
   const server = createServer((req, res) => {
-    if (api.failing) {
+    api.requested.push(req.url ?? "");
+    if (api.failing || (api.failingManual && req.url === "/manual-incidents")) {
       res.statusCode = 500;
       res.end();
       return;
