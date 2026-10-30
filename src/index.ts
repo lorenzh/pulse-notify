@@ -1,10 +1,21 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import type { Server } from "node:http";
 import { hostname } from "node:os";
+import {
+  createLogger,
+  type Env,
+  type Logger,
+  type LogLevel,
+  type OpsServer,
+  type Readiness,
+  readLogLevel,
+  readString,
+  runService,
+  StartupError,
+  startOpsServer,
+} from "@lorenzh/pulse-kit";
 import { ConfigError, loadConfigFile, loadLockLeaseSeconds, loadSettings } from "./config.ts";
 import { runFailed } from "./failed-cli.ts";
-import { closeHealthServer, createHealthServer } from "./health.ts";
 import { Ledger } from "./ledger.ts";
 import {
   acquireLock,
@@ -13,11 +24,9 @@ import {
   type LockDeps,
   LockLostError,
 } from "./ledger-lock.ts";
-import { createLogger, type Logger } from "./log.ts";
 import { Metrics } from "./metrics.ts";
 import { Notifier, type NotifierOptions, type PollHealth } from "./notifier.ts";
 import { redactUrl } from "./redact.ts";
-import { defaultSchedule } from "./timeout.ts";
 import type { Schedule } from "./types.ts";
 
 export const name = "pulse-notify";
@@ -67,17 +76,13 @@ const unrefSchedule: Schedule = (fn, ms) => {
 };
 
 export interface MainDeps {
-  /** Signal source; defaults to the real process. */
-  process?: { on(signal: "SIGINT" | "SIGTERM", handler: () => void): unknown };
+  /** Called when the service must end by itself (lost state lock). */
   exit?: (code: number) => void;
-  schedule?: Schedule;
   createNotifier?: (opts: NotifierOptions) => Stoppable;
-  /** Where JSON log lines go; defaults to stderr. */
+  /** Where JSON log lines go, without the newline; defaults to stderr. */
   write?: (line: string) => void;
-  /** Where the plain one-line startup error goes; defaults to stderr. */
-  writeError?: (line: string) => void;
-  /** Longest wait for the notifier to stop; defaults to `SHUTDOWN_TIMEOUT_MS`. */
-  shutdownTimeoutMs?: number;
+  /** Use this logger instead of building one from the settings. */
+  logger?: Logger;
   /** Clock, host name, pid check and token for the state lock; defaults to the real ones. */
   lock?: Partial<LockEnv>;
   /** Timer for the lock heartbeat; defaults to an unreferenced real timer. */
@@ -85,8 +90,19 @@ export interface MainDeps {
 }
 
 export interface Running extends Stoppable {
-  /** Resolves with the health listener port, or `undefined` when it is off. */
+  /**
+   * Resolves with the health listener port, or `undefined` when it is off. Rejects with a
+   * `StartupError` when the listener cannot bind.
+   */
   listening: Promise<number | undefined>;
+  /** Frees the state lock at once; for a stop that ran out of time. */
+  releaseLock(): void;
+}
+
+function bindReason(err: unknown): string {
+  const code =
+    err instanceof Error ? (err.cause as { code?: unknown } | undefined)?.code : undefined;
+  return typeof code === "string" ? code : errorReason(err);
 }
 
 function errorReason(err: unknown): string {
@@ -113,17 +129,12 @@ function lockDeps(
   return { ...realLockEnv, ...env, leaseSeconds, logger };
 }
 
-export function main(
-  env: Record<string, string | undefined> = process.env,
-  deps: MainDeps = {},
-): Running {
+export function main(env: Env = process.env, deps: MainDeps = {}): Running {
   const exit = deps.exit ?? ((code: number) => process.exit(code));
-  const schedule = deps.schedule ?? defaultSchedule;
-  const writeError = deps.writeError ?? ((line: string) => process.stderr.write(line));
   const logRef: { logger?: Logger } = {};
   const state: {
     notifier?: Stoppable;
-    health?: Server;
+    health?: OpsServer;
     ledger?: Ledger | undefined;
     lock?: LedgerLock | undefined;
     isShuttingDown: boolean;
@@ -134,7 +145,7 @@ export function main(
     finishing ??= (async () => {
       await state.notifier?.stop().catch(() => {});
       await state.ledger?.flush().catch((err: unknown) => {
-        logRef.logger?.log("error", "ledger flush failed, pending keys are resent", {
+        logRef.logger?.error("ledger flush failed, pending keys are resent", {
           error: errorReason(err),
         });
       });
@@ -142,44 +153,15 @@ export function main(
     })();
     return finishing;
   };
-  // Registered before any config or ledger work, so a signal during startup still exits 0.
-  const shutdown = (): void => {
-    if (state.isShuttingDown) return;
-    state.isShuttingDown = true;
-    let cancel: () => void = () => {};
-    let isBoundHit = false;
-    const bound = new Promise<void>((resolve) => {
-      cancel = schedule(() => {
-        isBoundHit = true;
-        resolve();
-      }, deps.shutdownTimeoutMs ?? SHUTDOWN_TIMEOUT_MS);
-    });
-    // A failed stop is not fatal: the unfinished keys stay pending in the ledger.
-    const stopped = Promise.all([
-      finish(),
-      state.health ? closeHealthServer(state.health) : undefined,
-    ]);
-    void Promise.race([stopped, bound]).finally(() => {
-      cancel();
-      if (isBoundHit) {
-        logRef.logger?.log("warn", "shutdown timed out, exiting", {
-          timeoutMs: deps.shutdownTimeoutMs ?? SHUTDOWN_TIMEOUT_MS,
-        });
-        state.lock?.release();
-      }
-      exit(0);
-    });
-  };
-  const signals = deps.process ?? process;
-  signals.on("SIGINT", shutdown);
-  signals.on("SIGTERM", shutdown);
 
   const settings = loadSettings(env);
   const config = loadConfigFile(settings.configPath, {
     env,
     readFile: (path) => readFileSync(path, "utf8"),
   });
-  const logger = createLogger(deps.write, Date.now, settings.logLevel);
+  const write = deps.write ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const logger =
+    deps.logger ?? createLogger({ level: settings.logLevel, write: (_level, line) => write(line) });
   logRef.logger = logger;
   const lock = acquireLock(
     settings.statePath,
@@ -190,7 +172,7 @@ export function main(
   try {
     ledger = openLedger(settings.statePath, {
       onError: (err) =>
-        logger.log("error", "ledger write failed, pending keys are resent", {
+        logger.error("ledger write failed, pending keys are resent", {
           error: errorReason(err),
         }),
     });
@@ -241,7 +223,7 @@ export function main(
   const startNotifier = (): void => {
     notifier.start();
     isStarted = true;
-    logger.log("info", "pulse-notify started", {
+    logger.info("pulse-notify started", {
       channels: config.channels.map((c) => c.id),
       apiUrl: redactUrl(settings.apiUrl),
     });
@@ -251,39 +233,51 @@ export function main(
     startNotifier();
   } else {
     const { healthHost, healthPort, healthMaxFailedPolls } = settings;
-    const health = createHealthServer({
-      notReady: () => {
-        if (state.isShuttingDown) return "shutting down";
-        if (!isStarted) return "starting";
-        const failed = notifier.pollHealth?.().consecutiveFailedPolls ?? 0;
-        return failed >= healthMaxFailedPolls ? `polls failing (${failed} in a row)` : undefined;
-      },
-      metrics: () => metrics.render(),
-    });
-    state.health = health;
+    const readiness = (): Readiness => {
+      if (state.isShuttingDown) return { ready: false, reason: "shutting down" };
+      if (!isStarted) return { ready: false, reason: "starting" };
+      const failed = notifier.pollHealth?.().consecutiveFailedPolls ?? 0;
+      return failed >= healthMaxFailedPolls
+        ? { ready: false, reason: `polls failing (${failed} in a row)` }
+        : { ready: true };
+    };
     // The notifier starts only once the listener is bound, so a bind error does no service work.
-    listening = new Promise((resolve) => {
-      health.once("error", (err) => {
-        if (!state.isShuttingDown) {
-          writeError(
-            `pulse-notify: cannot listen on ${healthHost}:${healthPort} (PULSE_HEALTH_HOST/PULSE_HEALTH_PORT): ${errorReason(err)}\n`,
-          );
-          lock.release();
-          exit(2);
+    listening = startOpsServer({
+      host: healthHost,
+      port: healthPort,
+      live: readiness,
+      ready: readiness,
+      metrics: () => metrics.render(),
+      allowHead: true,
+    }).then(
+      (server) => {
+        state.health = server;
+        if (state.isShuttingDown) {
+          void server.close();
+        } else {
+          startNotifier();
         }
-        resolve(undefined);
-      });
-      health.listen(healthPort, healthHost, () => {
-        const address = health.address();
-        resolve(typeof address === "object" && address ? address.port : undefined);
-        if (!state.isShuttingDown) startNotifier();
-      });
-    });
+        return server.port;
+      },
+      (err: unknown) => {
+        lock.release();
+        throw new StartupError(
+          `cannot listen on ${healthHost}:${healthPort} (PULSE_HEALTH_HOST/PULSE_HEALTH_PORT): ${bindReason(err)}`,
+          { cause: err },
+        );
+      },
+    );
   }
   const stop = async (): Promise<void> => {
-    await Promise.all([finish(), state.health ? closeHealthServer(state.health) : undefined]);
+    state.isShuttingDown = true;
+    await Promise.all([finish(), state.health?.close()]);
   };
-  const running: Running = { start: () => notifier.start(), stop, listening };
+  const running: Running = {
+    start: () => notifier.start(),
+    stop,
+    listening,
+    releaseLock: () => state.lock?.release(),
+  };
   if (notifier.pollHealth) {
     running.pollHealth = () => notifier.pollHealth?.() ?? { consecutiveFailedPolls: 0 };
   }
@@ -310,11 +304,11 @@ function startHeartbeat(
       lock.heartbeat();
     } catch (err) {
       if (err instanceof LockLostError) {
-        opts.logger.log("error", "state lock lost, stopping", { error: err.message });
+        opts.logger.error("state lock lost, stopping", { error: err.message });
         opts.onLost();
         return;
       }
-      opts.logger.log("warn", "state lock heartbeat failed", { error: errorReason(err) });
+      opts.logger.warn("state lock heartbeat failed", { error: errorReason(err) });
     }
     schedule(beat, intervalMs);
   };
@@ -336,12 +330,12 @@ export interface CliDeps {
  */
 export async function runCli(
   args: string[],
-  env: Record<string, string | undefined> = process.env,
+  env: Env = process.env,
   deps: CliDeps = {},
 ): Promise<number> {
   const write = deps.write ?? ((line: string) => process.stdout.write(line));
   const writeError = deps.writeError ?? ((line: string) => process.stderr.write(line));
-  const statePath = env.PULSE_NOTIFY_STATE || "./notify-state.json";
+  const statePath = readString(env, "PULSE_NOTIFY_STATE") ?? "./notify-state.json";
   let lock: LedgerLock | undefined;
   try {
     lock = acquireLock(statePath, lockDeps(deps.lock, loadLockLeaseSeconds(env)));
@@ -351,7 +345,7 @@ export async function runCli(
     for (const line of result.lines) write(`${line}\n`);
     return result.code;
   } catch (err) {
-    if (!(err instanceof ConfigError)) throw err;
+    if (!(err instanceof ConfigError || err instanceof StartupError)) throw err;
     writeError(`pulse-notify: ${err.message}\n`);
     return 2;
   } finally {
@@ -359,15 +353,76 @@ export async function runCli(
   }
 }
 
+export interface RunDeps {
+  /** Signals, exit and stderr; defaults to the real process. */
+  proc?: Parameters<typeof runService>[0]["proc"];
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
+  main?: MainDeps;
+}
+
+/** A level that does not parse is reported by `loadSettings`; until then log at info. */
+function startupLogLevel(env: Env): LogLevel {
+  try {
+    return readLogLevel(env);
+  } catch {
+    // The same bad value fails `loadSettings` with a clear startup error.
+    return "info";
+  }
+}
+
+/** Starts the service under `runService`: signals, startup errors and the shutdown bound. */
+export function run(env: Env = process.env, deps: RunDeps = {}): Promise<void> {
+  const proc = deps.proc ?? process;
+  const write = deps.main?.write ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const logger = createLogger({
+    level: startupLogLevel(env),
+    write: (_level, line) => write(line),
+  });
+  let running: Running | undefined;
+  return runService({
+    service: "notify",
+    log: logger,
+    timeoutMs: SHUTDOWN_TIMEOUT_MS,
+    proc: {
+      on: (signal, fn) => proc.on(signal, fn),
+      stderr: proc.stderr,
+      exit: (code) => {
+        // The lock is a lease; free it when the stop ran out of time.
+        running?.releaseLock();
+        proc.exit(code);
+      },
+    },
+    ...(deps.setTimeout ? { setTimeout: deps.setTimeout } : {}),
+    ...(deps.clearTimeout ? { clearTimeout: deps.clearTimeout } : {}),
+    start: async () => {
+      try {
+        running = main(env, {
+          ...deps.main,
+          logger,
+          exit: deps.main?.exit ?? ((code) => proc.exit(code)),
+        });
+        await running.listening;
+      } catch (err) {
+        if (err instanceof ConfigError) throw new StartupError(err.message, { cause: err });
+        throw err;
+      }
+    },
+    stop: async () => {
+      await running?.stop();
+    },
+  });
+}
+
 if (import.meta.main) {
   try {
     if (process.argv[2] === "failed") {
       process.exitCode = await runCli(process.argv.slice(3));
     } else {
-      main();
+      await run();
     }
   } catch (err) {
-    if (err instanceof ConfigError) {
+    if (err instanceof ConfigError || err instanceof StartupError) {
       process.stderr.write(`pulse-notify: ${err.message}\n`);
       process.exit(2);
     }

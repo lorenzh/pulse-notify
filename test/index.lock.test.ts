@@ -31,7 +31,6 @@ function setup(over: { env?: Record<string, string>; deps?: MainDeps } = {}) {
   const running = main(
     { PULSE_NOTIFY_CONFIG: configPath, PULSE_NOTIFY_STATE: state, ...over.env },
     {
-      process: { on() {} },
       exit: (code) => exits.push(code),
       write: (l) => lines.push(l),
       heartbeatSchedule,
@@ -75,7 +74,6 @@ test("a second process on the same state file is a configuration error", async (
       main(
         { PULSE_NOTIFY_CONFIG: configPath, PULSE_NOTIFY_STATE: s.state },
         {
-          process: { on() {} },
           lock: { hostname: () => "host-a", pid: 222, isPidAlive: () => true },
           createNotifier: (): Stoppable => ({ start() {}, async stop() {} }),
         },
@@ -94,7 +92,6 @@ test("a bad state file frees the lock again", () => {
       main(
         { PULSE_NOTIFY_CONFIG: configPath, PULSE_NOTIFY_STATE: state },
         {
-          process: { on() {} },
           createNotifier: (): Stoppable => ({ start() {}, async stop() {} }),
         },
       ),
@@ -143,7 +140,6 @@ test("batched ledger changes are flushed on stop, before the lock is freed", asy
   const running = main(
     { PULSE_NOTIFY_CONFIG: configPath, PULSE_NOTIFY_STATE: state },
     {
-      process: { on() {} },
       write: () => {},
       heartbeatSchedule: () => () => {},
       createNotifier: (opts): Stoppable => ({

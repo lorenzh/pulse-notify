@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@lorenzh/pulse-contract": "github:lorenzh/pulse-contract#cc8c1faa412ab2523b4573313937330c42349043",
+    "@lorenzh/pulse-kit": "github:lorenzh/pulse-kit#72adb59b980e2dd4802a1fb8b28eaa5b43b040fc",
     "nodemailer": "10.3.1"
   }
 }

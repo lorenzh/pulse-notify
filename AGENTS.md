@@ -26,7 +26,8 @@ repository. Node 24+ with native type stripping, ESM, npm, strict TypeScript (`t
 - `pulse-contract` holds the shared types, their validators and the wire version check. It depends on no other repo.
 - Import contract types with `import type`; import its validators and version check as values. A service never imports another service.
 - Services talk to each other only over HTTP at run time, in the shapes the contract defines.
-- Pin the contract dependency to a full commit SHA on its `main`; update the pin when the spec needs a newer contract.
+- Use pulse-kit, pulse-contract or an approved package before writing infrastructure code. Propose an addition to pulse-kit instead of a local helper.
+- Pin the contract and kit dependencies to a full commit SHA on its `main`; update the pin when the spec needs a newer contract.
 - A change that needs a contract change waits for the merged contract change. Never copy contract types into a service.
 - Edit only this repository. Other repositories in the workspace are read-only context.
 - Do not add `.factory/`, plan, or note files to this repository.
@@ -97,9 +98,10 @@ repository. Node 24+ with native type stripping, ESM, npm, strict TypeScript (`t
 
 ## This repository
 
-- Entry point and wiring: `src/index.ts` (`npm start` runs `node src/index.ts`). It reads the settings in `src/config.ts` (`PULSE_NOTIFY_CONFIG` is required; other variables and defaults are in `README.md`).
+- Entry point and wiring: `src/index.ts` (`npm start` runs `node src/index.ts`). It reads the settings in `src/config.ts` (env reads use the pulse-kit readers; `run` wires `runService`) (`PULSE_NOTIFY_CONFIG` is required; other variables and defaults are in `README.md`).
 - Channels are sender functions in `src/channels/`: `webhook.ts` (with `signature.ts`), `file.ts`, `slack.ts`, `teams.ts`, `email.ts` (builds the message; `smtp-send.ts` sends it with nodemailer, the approved SMTP library; `mailer.ts` holds the mail types and EHLO name helpers). `src/channels/factory.ts` (`createSender`) builds the sender per config type; `routing.ts` decides which checks a channel gets; `message.ts` cleans text for chat and email; `http-post.ts` posts JSON without leaking the URL in errors. `src/notifier.ts` wires them. Channel config types are in `src/types.ts`; `src/config.ts` parses them and reads secrets from env or files.
 - Permanent errors: `PermanentDeliveryError` in `src/errors.ts`, thrown by `http-post.ts` (4xx except 408 and 429) and `smtp-send.ts` (5xx reply); `src/delivery.ts` ends such an event at once. `src/redact.ts` strips user info and query from the API url for logs.
+- Logging, the ops server (`/healthz`, `/readyz`, `/metrics`), the metrics registry, `formatDuration` and shutdown come from `@lorenzh/pulse-kit`; `src/metrics.ts` only registers this service's series. `errorFields` stays in `src/errors.ts`.
 - Ledger: `src/ledger.ts` (format version 2, batched `settle` and prune, `flush()` at shutdown) and `src/ledger-lock.ts` (lease lock `<state>.lock`). The `failed list|resend` subcommand is `src/failed-cli.ts`, run by `runCli` in `src/index.ts` (`node src/index.ts failed ...`, exit 2 while the service holds the lock).
 - Reminders: `src/detector.ts` derives the key `<incident>:reminder:<n>` from the injected clock; `src/delivery.ts` drops a stale reminder (`isStale`).
 - `src/delivery.ts` takes `send`, `sleep`, and `ledger` as injected dependencies.

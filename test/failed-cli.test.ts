@@ -209,7 +209,7 @@ test("end to end: a 404 receiver fails the event, the CLI resends it, the servic
   };
   const start = () => {
     const lines: string[] = [];
-    const running = main(env, { process: { on: () => {} }, write: (l) => lines.push(l) });
+    const running = main(env, { write: (l) => lines.push(l) });
     return { running, lines };
   };
   const waitFor = async (check: () => boolean): Promise<void> => {

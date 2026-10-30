@@ -6,46 +6,69 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
+import { StartupError } from "@lorenzh/pulse-kit";
 import { ConfigError } from "../src/config.ts";
-import { main, type Stoppable } from "../src/index.ts";
+import { main, run, type Stoppable } from "../src/index.ts";
 import { close, listen } from "./support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-main-"));
 after(() => rmSync(dir, { recursive: true, force: true }));
 
-function setup(stop: () => Promise<void>) {
+function fakeProc() {
+  const handlers: Record<string, () => void> = {};
+  const exits: number[] = [];
+  const stderr: string[] = [];
+  return {
+    handlers,
+    exits,
+    stderr,
+    proc: {
+      on: (signal: "SIGINT" | "SIGTERM", fn: () => void) => {
+        handlers[signal] = fn;
+      },
+      exit: (code: number) => {
+        exits.push(code);
+      },
+      stderr: {
+        write: (line: string) => {
+          stderr.push(line);
+        },
+      },
+    },
+  };
+}
+
+async function setup(stop: () => Promise<void>, over: { lines?: string[] } = {}) {
   const configPath = join(dir, "config.json");
   writeFileSync(
     configPath,
     JSON.stringify({ channels: [{ id: "log", type: "file", path: join(dir, "o.jsonl") }] }),
   );
-  const handlers: Record<string, () => void> = {};
-  const exits: number[] = [];
-  let boundTimer: (() => void) | undefined;
-  main(
+  const fake = fakeProc();
+  let boundTimer: { fn: () => void; ms: number } | undefined;
+  await run(
     { PULSE_NOTIFY_CONFIG: configPath, PULSE_NOTIFY_STATE: join(dir, "state.json") },
     {
-      process: {
-        on: (signal, handler) => {
-          handlers[signal] = handler;
-        },
+      proc: fake.proc,
+      setTimeout: ((fn: () => void, ms: number) => {
+        boundTimer = { fn, ms };
+        return 0;
+      }) as unknown as typeof setTimeout,
+      clearTimeout: (() => {}) as typeof clearTimeout,
+      main: {
+        write: (line) => over.lines?.push(line),
+        createNotifier: (): Stoppable => ({ start() {}, stop }),
       },
-      exit: (code) => exits.push(code),
-      schedule: (fn) => {
-        boundTimer = fn;
-        return () => {};
-      },
-      createNotifier: (): Stoppable => ({ start() {}, stop }),
     },
   );
-  return { handlers, exits, fireBound: () => boundTimer?.() };
+  return { ...fake, fireBound: () => boundTimer?.fn(), bound: () => boundTimer };
 }
 
 const flush = () => new Promise((r) => setImmediate(r));
 
 test("SIGTERM exits with 0 only after stop resolved", async () => {
   const gate = Promise.withResolvers<void>();
-  const { handlers, exits } = setup(() => gate.promise);
+  const { handlers, exits } = await setup(() => gate.promise);
   handlers.SIGTERM?.();
   await flush();
   assert.deepEqual(exits, []);
@@ -55,7 +78,7 @@ test("SIGTERM exits with 0 only after stop resolved", async () => {
 });
 
 test("a slow stop does not hang: the bound forces the exit", async () => {
-  const { handlers, exits, fireBound } = setup(() => new Promise(() => {}));
+  const { handlers, exits, fireBound } = await setup(() => new Promise(() => {}));
   handlers.SIGINT?.();
   await flush();
   assert.deepEqual(exits, []);
@@ -64,28 +87,29 @@ test("a slow stop does not hang: the bound forces the exit", async () => {
   assert.deepEqual(exits, [0]);
 });
 
-test("signal handlers are registered before settings, config and ledger are read", () => {
+test("signal handlers are registered before settings, config and ledger are read", async () => {
   const order: string[] = [];
-  assert.throws(
-    () =>
-      main(
-        {},
-        {
-          process: {
-            on: (signal) => {
-              order.push(signal);
-            },
-          },
+  const fake = fakeProc();
+  await run(
+    {},
+    {
+      proc: {
+        ...fake.proc,
+        on: (signal, fn) => {
+          order.push(signal);
+          fake.proc.on(signal, fn);
         },
-      ),
-    /PULSE_NOTIFY_CONFIG is required/,
+      },
+    },
   );
   assert.deepEqual(order, ["SIGINT", "SIGTERM"]);
+  assert.deepEqual(fake.exits, [2]);
+  assert.deepEqual(fake.stderr, ["pulse-notify: PULSE_NOTIFY_CONFIG is required\n"]);
 });
 
 test("a second signal does nothing more", async () => {
   let stops = 0;
-  const { handlers, exits } = setup(async () => {
+  const { handlers, exits } = await setup(async () => {
     stops++;
   });
   handlers.SIGTERM?.();
@@ -108,7 +132,6 @@ test("a bad state file is a one-line configuration error", () => {
       main(
         { PULSE_NOTIFY_CONFIG: configPath, PULSE_NOTIFY_STATE: state },
         {
-          process: { on() {} },
           createNotifier: (): Stoppable => ({ start() {}, async stop() {} }),
         },
       ),
@@ -124,8 +147,6 @@ test("health listener: ready after start, metrics without secrets, 503 while shu
       channels: [{ id: "hook", type: "webhook", url: "https://user:s3cret@example.com/tok3n" }],
     }),
   );
-  const handlers: Record<string, () => void> = {};
-  const exits: number[] = [];
   const gate = Promise.withResolvers<void>();
   const running = main(
     {
@@ -134,12 +155,6 @@ test("health listener: ready after start, metrics without secrets, 503 while shu
       PULSE_HEALTH_PORT: "0",
     },
     {
-      process: {
-        on: (signal, handler) => {
-          handlers[signal] = handler;
-        },
-      },
-      exit: (code) => exits.push(code),
       write: () => {},
       createNotifier: (): Stoppable => ({ start() {}, stop: () => gate.promise }),
     },
@@ -147,9 +162,13 @@ test("health listener: ready after start, metrics without secrets, 503 while shu
   const port = await running.listening;
   assert.ok(port);
   const base = `http://127.0.0.1:${port}`;
-  const health = await fetch(`${base}/healthz`);
-  assert.equal(health.status, 200);
-  assert.equal(await health.text(), "ok\n");
+  for (const path of ["/healthz", "/readyz"]) {
+    const res = await fetch(`${base}${path}`);
+    assert.equal(res.status, 200, path);
+    assert.equal(await res.text(), "ok\n", path);
+  }
+  assert.equal((await fetch(`${base}/readyz`, { method: "HEAD" })).status, 200);
+  assert.equal((await fetch(`${base}/readyz`, { method: "POST" })).status, 405);
   const metrics = await (await fetch(`${base}/metrics`)).text();
   for (const series of [
     "pulse_up 1",
@@ -161,53 +180,30 @@ test("health listener: ready after start, metrics without secrets, 503 while shu
   }
   assert.doesNotMatch(metrics, /s3cret|tok3n|example\.com/);
   assert.equal((await fetch(`${base}/nope`)).status, 404);
-  handlers.SIGTERM?.();
-  const after = await fetch(`${base}/healthz`).catch(() => undefined);
+  const stopped = running.stop();
+  const after = await fetch(`${base}/readyz`).catch(() => undefined);
   if (after) assert.equal(after.status, 503);
   gate.resolve();
-  await flush();
+  await stopped;
 });
 
 test("a stuck stop logs a warn at the shutdown bound, then exits 0", async () => {
-  const configPath = join(dir, "c4.json");
-  writeFileSync(
-    configPath,
-    JSON.stringify({ channels: [{ id: "log", type: "file", path: join(dir, "o4.jsonl") }] }),
-  );
-  const handlers: Record<string, () => void> = {};
-  const exits: number[] = [];
   const lines: string[] = [];
-  let bound: { fn: () => void; ms: number } | undefined;
-  main(
-    { PULSE_NOTIFY_CONFIG: configPath, PULSE_NOTIFY_STATE: join(dir, "state4.json") },
-    {
-      process: {
-        on: (signal, handler) => {
-          handlers[signal] = handler;
-        },
-      },
-      exit: (code) => exits.push(code),
-      write: (line) => lines.push(line),
-      shutdownTimeoutMs: 50,
-      schedule: (fn, ms) => {
-        bound = { fn, ms };
-        return () => {};
-      },
-      createNotifier: (): Stoppable => ({ start() {}, stop: () => new Promise(() => {}) }),
-    },
-  );
+  const { handlers, exits, bound, fireBound } = await setup(() => new Promise(() => {}), {
+    lines,
+  });
   handlers.SIGTERM?.();
   await flush();
   assert.deepEqual(exits, []);
-  assert.equal(bound?.ms, 50);
-  bound?.fn();
+  assert.equal(bound()?.ms, 5000);
+  fireBound();
   await flush();
   assert.deepEqual(exits, [0]);
   const warn = lines.map((l) => JSON.parse(l)).find((e) => e.level === "warn");
   assert.ok(warn);
 });
 
-test("an occupied health port exits 2 with one plain line and no started log or start", async () => {
+test("an occupied health port rejects with one startup error and no started log or start", async () => {
   const blocker = createServer();
   await listen(blocker);
   const busy = (blocker.address() as AddressInfo).port;
@@ -217,8 +213,6 @@ test("an occupied health port exits 2 with one plain line and no started log or 
     configPath,
     JSON.stringify({ channels: [{ id: "log", type: "file", path: join(dir, "o5.jsonl") }] }),
   );
-  const exits: number[] = [];
-  const errors: string[] = [];
   const lines: string[] = [];
   let starts = 0;
   const running = main(
@@ -228,10 +222,7 @@ test("an occupied health port exits 2 with one plain line and no started log or 
       PULSE_HEALTH_PORT: String(busy),
     },
     {
-      process: { on() {} },
-      exit: (code) => exits.push(code),
       write: (line) => lines.push(line),
-      writeError: (line) => errors.push(line),
       createNotifier: (): Stoppable => ({
         start() {
           starts += 1;
@@ -240,12 +231,13 @@ test("an occupied health port exits 2 with one plain line and no started log or 
       }),
     },
   );
-  assert.equal(await running.listening, undefined);
-  assert.deepEqual(exits, [2]);
-  assert.equal(errors.length, 1);
-  assert.match(
-    errors[0] ?? "",
-    /^pulse-notify: cannot listen on 127\.0\.0\.1:\d+ \(PULSE_HEALTH_HOST\/PULSE_HEALTH_PORT\): .+\n$/,
+  await assert.rejects(
+    running.listening,
+    (err) =>
+      err instanceof StartupError &&
+      /^cannot listen on 127\.0\.0\.1:\d+ \(PULSE_HEALTH_HOST\/PULSE_HEALTH_PORT\): .+$/.test(
+        err.message,
+      ),
   );
   assert.equal(starts, 0);
   assert.deepEqual(lines, []);

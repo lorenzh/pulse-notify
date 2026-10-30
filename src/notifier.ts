@@ -1,4 +1,5 @@
 import type { Check, Incident } from "@lorenzh/pulse-contract";
+import type { Logger } from "@lorenzh/pulse-kit";
 import { fetchChecks, fetchIncidents } from "./api.ts";
 import { createSender } from "./channels/factory.ts";
 import type { SendMail } from "./channels/mailer.ts";
@@ -7,7 +8,6 @@ import { ChannelDelivery } from "./delivery.ts";
 import { detectEvents, eventTimeMs, type ReminderPlan, seedKeys } from "./detector.ts";
 import { errorFields } from "./errors.ts";
 import type { Ledger } from "./ledger.ts";
-import type { Logger } from "./log.ts";
 import type { Metrics } from "./metrics.ts";
 import { defaultSchedule } from "./timeout.ts";
 import type {
@@ -231,7 +231,7 @@ export class Notifier {
       counts.set(channelId, (counts.get(channelId) ?? 0) + 1);
     }
     for (const [channel, count] of counts) {
-      this.#opts.logger.log("info", "resending pending notifications", { channel, count });
+      this.#opts.logger.info("resending pending notifications", { channel, count });
     }
   }
 
@@ -255,7 +255,7 @@ export class Notifier {
       })
       .catch((err: unknown) => {
         this.#failedPolls++;
-        this.#opts.logger.log("error", "poll failed unexpectedly", errorFields(err));
+        this.#opts.logger.error("poll failed unexpectedly", errorFields(err));
       })
       .finally(() => {
         this.#ticking = undefined;
@@ -282,7 +282,7 @@ export class Notifier {
       checks = fetched;
       this.#reportRejected(result.rejected);
     } catch (err) {
-      this.#opts.logger.log("error", "api poll failed", errorFields(err));
+      this.#opts.logger.error("api poll failed", errorFields(err));
       this.#opts.metrics?.pollDone("error");
       return false;
     }
@@ -307,7 +307,7 @@ export class Notifier {
     this.#lastPruneMs = nowMs;
     const days = this.#opts.stateRetentionDays ?? 30;
     const count = this.#opts.ledger.prune(days * DAY_MS, this.#visible);
-    if (count > 0) this.#opts.logger.log("info", "old ledger entries pruned", { count });
+    if (count > 0) this.#opts.logger.info("old ledger entries pruned", { count });
   }
 
   #releaseHeld(): void {
@@ -323,14 +323,14 @@ export class Notifier {
   #reportVersionAbsent(): void {
     if (this.#reported.has("wire-version-absent")) return;
     this.#reported.add("wire-version-absent");
-    this.#opts.logger.log("warn", "api sent no wire version header; continuing");
+    this.#opts.logger.warn("api sent no wire version header; continuing");
   }
 
   #reportInvalidCheck(error: string): void {
     const key = `check:${error}`;
     if (this.#reported.has(key)) return;
     this.#reported.add(key);
-    this.#opts.logger.log("warn", "check skipped: malformed data", { reason: error });
+    this.#opts.logger.warn("check skipped: malformed data", { reason: error });
   }
 
   #reportRejected(rejected: { id: unknown; reason: string }[]): void {
@@ -338,7 +338,7 @@ export class Notifier {
       const key = `incident:${String(id)}`;
       if (this.#reported.has(key)) continue;
       this.#reported.add(key);
-      this.#opts.logger.log("error", "incident skipped: malformed data", {
+      this.#opts.logger.error("incident skipped: malformed data", {
         incidentId: id,
         reason,
       });
@@ -360,13 +360,13 @@ export class Notifier {
       try {
         ledger.seed(id, seedKeys(incidents, reminders), reminders ? nowMs : undefined);
       } catch (err) {
-        logger.log("error", "ledger seed failed, the next poll retries", {
+        logger.error("ledger seed failed, the next poll retries", {
           channel: id,
           ...errorFields(err),
         });
         return;
       }
-      logger.log("info", "channel seeded with existing incidents", {
+      logger.info("channel seeded with existing incidents", {
         channel: id,
         incidents: incidents.length,
       });
@@ -409,13 +409,13 @@ export class Notifier {
         nowMs,
       );
     } catch (err) {
-      logger.log("error", "ledger seed failed, the next poll retries", {
+      logger.error("ledger seed failed, the next poll retries", {
         channel: id,
         ...errorFields(err),
       });
       return false;
     }
-    logger.log("info", "reminders enabled: due reminders of open incidents skipped", {
+    logger.info("reminders enabled: due reminders of open incidents skipped", {
       channel: id,
     });
     return true;
@@ -436,14 +436,10 @@ export class Notifier {
         const reportKey = `legacy:${id}:${key}`;
         if (this.#reported.has(reportKey)) continue;
         this.#reported.add(reportKey);
-        this.#opts.logger.log(
-          "error",
-          "pending notification cannot be rebuilt: incident not found",
-          {
-            channel: id,
-            key,
-          },
-        );
+        this.#opts.logger.error("pending notification cannot be rebuilt: incident not found", {
+          channel: id,
+          key,
+        });
         continue;
       }
       this.#enqueue(channel, buildArgs(key, found.event, found.incident, names, nowMs));
@@ -459,7 +455,7 @@ export class Notifier {
     try {
       notification = buildNotification(...args);
     } catch (err) {
-      this.#opts.logger.log("error", "notification cannot be built, the next poll retries", {
+      this.#opts.logger.error("notification cannot be built, the next poll retries", {
         channel: channel.config.id,
         key: args[0],
         ...errorFields(err),

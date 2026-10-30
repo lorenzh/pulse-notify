@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Check, Incident } from "@lorenzh/pulse-contract";
-import type { Logger, LogLevel } from "../src/log.ts";
+import type { Logger, LogLevel } from "@lorenzh/pulse-kit";
 
 export interface LogEntry {
   level: LogLevel;
@@ -17,9 +17,9 @@ export interface SpyLogger extends Logger {
 export function spyLogger(): SpyLogger {
   const entries: LogEntry[] = [];
   const waiters: { predicate: (e: LogEntry) => boolean; resolve: (e: LogEntry) => void }[] = [];
-  return {
-    entries,
-    log(level, msg, fields = {}) {
+  const record =
+    (level: LogLevel) =>
+    (msg: string, fields: Record<string, unknown> = {}): void => {
       const entry = { level, msg, fields };
       entries.push(entry);
       for (const w of [...waiters]) {
@@ -28,7 +28,13 @@ export function spyLogger(): SpyLogger {
           w.resolve(entry);
         }
       }
-    },
+    };
+  return {
+    entries,
+    debug: record("debug"),
+    info: record("info"),
+    warn: record("warn"),
+    error: record("error"),
     waitFor(predicate) {
       const found = entries.find(predicate);
       if (found) return Promise.resolve(found);

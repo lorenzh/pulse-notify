@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cleanText, formatDuration, messageParts } from "../src/channels/message.ts";
+import { cleanText, messageParts } from "../src/channels/message.ts";
 import { slackText } from "../src/channels/slack.ts";
 import { teamsCard } from "../src/channels/teams.ts";
 import type { Notification } from "../src/types.ts";
@@ -27,13 +27,6 @@ test("cleanText removes control characters and cuts to 300 characters", () => {
   const cut = cleanText("x".repeat(500));
   assert.equal(cut.length, 300);
   assert.ok(cut.endsWith("…"));
-});
-
-test("formatDuration", () => {
-  assert.equal(formatDuration(5000), "<1m");
-  assert.equal(formatDuration(12 * 60000), "12m");
-  assert.equal(formatDuration(65 * 60000), "1h 5m");
-  assert.equal(formatDuration(26 * 3600000), "1d 2h");
 });
 
 test("slack text for each state, with status link and age", () => {

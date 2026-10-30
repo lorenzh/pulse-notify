@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import type { Logger } from "@lorenzh/pulse-kit";
 import { ConfigError } from "./config.ts";
-import type { Logger } from "./log.ts";
 
 /** Seconds between heartbeats for a lease. */
 export function heartbeatIntervalSeconds(leaseSeconds: number): number {
@@ -270,7 +270,7 @@ function takeOver(path: string, deps: LockDeps): LedgerLock {
   const holder = holderOf(fresh);
   if (!isStale(holder, deps)) throw inUse(path, holder, deps.now());
   deps.afterMarker?.();
-  deps.logger?.log("warn", "taking over a stale state lock", {
+  deps.logger?.warn("taking over a stale state lock", {
     path,
     ...(holder ? { holderHostname: holder.hostname, holderPid: holder.pid } : {}),
   });
