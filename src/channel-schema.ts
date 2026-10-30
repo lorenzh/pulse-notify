@@ -42,6 +42,8 @@ const baseShape = {
   id: z.string(),
   checks: checkList("checks"),
   excludeChecks: checkList("excludeChecks"),
+  components: checkList("components"),
+  excludeComponents: checkList("excludeComponents"),
   remindEverySeconds: z
     .number("remindEverySeconds must be an integer of at least 60")
     .int("remindEverySeconds must be an integer of at least 60")

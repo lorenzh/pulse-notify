@@ -52,6 +52,10 @@ Backup: copy the file. It is replaced atomically, so a copy is always a whole fi
 
 If you delete the ledger, every channel counts as new on the next start. It records the current incidents as `seeded` and sends nothing for them. If you remove a channel id and add it back later, it is not seeded again: the ledger keeps the channel. The re-added channel receives the incidents from the time it was removed.
 
+## Manual incidents
+
+Manual incident events share the ledger with automatic ones. Their keys start with `manual:`; the pruning of old settled entries keeps the keys of manual incidents that the api still lists. `failed list` shows their event as `opened`, `update:<n>` as `update`, or `resolved`.
+
 ## Restart behavior
 
 - The environment and the config file are read at start. To change a channel, a URL or a setting, restart.

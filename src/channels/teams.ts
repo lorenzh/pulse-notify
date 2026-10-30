@@ -10,6 +10,12 @@ function escapeTeams(text: string): string {
 /** One message with one Adaptive Card attachment, the shape the Workflows URL accepts. */
 export function teamsCard(parts: MessageParts): Record<string, unknown> {
   const facts: { title: string; value: string }[] = [];
+  const m = parts.manual;
+  if (m) {
+    facts.push({ title: "Impact", value: m.impact }, { title: "Status", value: m.status });
+    facts.push({ title: "Message", value: escapeTeams(m.message) });
+    if (m.components !== "") facts.push({ title: "Components", value: escapeTeams(m.components) });
+  }
   if (parts.reason !== undefined) facts.push({ title: "Reason", value: escapeTeams(parts.reason) });
   facts.push({ title: "Time", value: parts.time });
   if (parts.openFor !== undefined) facts.push({ title: "Open for", value: parts.openFor });

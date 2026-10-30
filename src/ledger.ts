@@ -89,6 +89,7 @@ function migrate(raw: unknown, loadedAt: number, path: string): LedgerData {
 
 const REMINDER_KEY = /^(\d+):reminder:(\d+)$/;
 const INCIDENT_KEY = /^(\d+):/;
+const MANUAL_KEY = /^manual:(\d+):/;
 
 interface Removed {
   key: string;
@@ -464,11 +465,15 @@ export class Ledger {
 
   /**
    * Removes settled entries (not `pending`) older than `maxAgeMs`, with their notifications.
-   * A key of an incident in `visible` stays, or it would look unhandled and be sent again.
+   * A key of an incident in `visible` (or a manual one in `visibleManual`) stays, or it would look unhandled and be sent again.
    * When `visible` is `undefined` (no successful poll yet), every incident key stays.
    * Returns the number of removed entries. Written in a batch.
    */
-  prune(maxAgeMs: number, visible: ReadonlySet<number> | undefined): number {
+  prune(
+    maxAgeMs: number,
+    visible: ReadonlySet<number> | undefined,
+    visibleManual?: ReadonlySet<number>,
+  ): number {
     const cutoff = this.#now() - maxAgeMs;
     let count = 0;
     for (const [channelId, entries] of Object.entries(this.#data.channels)) {
@@ -476,6 +481,10 @@ export class Ledger {
         if (entry.status === "pending" || entry.at >= cutoff) continue;
         const match = INCIDENT_KEY.exec(key);
         if (match && (visible === undefined || visible.has(Number(match[1])))) continue;
+        const manual = MANUAL_KEY.exec(key);
+        if (manual && (visibleManual === undefined || visibleManual.has(Number(manual[1])))) {
+          continue;
+        }
         this.#remove(entries, channelId, key);
         count++;
       }

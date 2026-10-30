@@ -1,4 +1,4 @@
-import type { Incident } from "@lorenzh/pulse-contract";
+import type { Incident, ManualIncident } from "@lorenzh/pulse-contract";
 import type { NotificationEvent } from "./types.ts";
 
 export interface DetectedEvent {
@@ -28,6 +28,7 @@ export function eventTimeMs(event: NotificationEvent, incident: Incident, nowMs:
       return incident.openedAt;
     case "resolved":
       return incident.resolvedAt as number;
+    case "update":
     case "reminder":
       return nowMs;
     default: {
@@ -83,4 +84,69 @@ export function seedKeys(incidents: Incident[], reminders?: ReminderPlan): strin
     }
   }
   return keys;
+}
+
+export interface DetectedManualEvent {
+  key: string;
+  event: "opened" | "update" | "resolved";
+  incident: ManualIncident;
+  /** Index of the update this event is about; 0 is the creation message. */
+  updateIndex: number;
+  timeMs: number;
+}
+
+export function manualKey(id: number, event: "opened" | "resolved"): string {
+  return `manual:${id}:${event}`;
+}
+
+export function manualUpdateKey(id: number, n: number): string {
+  return `manual:${id}:update:${n}`;
+}
+
+/** The events of one manual incident, in order. The resolving update is `resolved`, not `update`. */
+function manualEventsOf(incident: ManualIncident): DetectedManualEvent[] {
+  const events: DetectedManualEvent[] = [];
+  const last = incident.updates.length - 1;
+  events.push({
+    key: manualKey(incident.id, "opened"),
+    event: "opened",
+    incident,
+    updateIndex: 0,
+    timeMs: incident.createdAt,
+  });
+  for (const [n, update] of incident.updates.entries()) {
+    if (n === 0) continue;
+    const isResolving = n === last && incident.resolvedAt !== null;
+    events.push({
+      key: isResolving ? manualKey(incident.id, "resolved") : manualUpdateKey(incident.id, n),
+      event: isResolving ? "resolved" : "update",
+      incident,
+      updateIndex: n,
+      timeMs: update.at,
+    });
+  }
+  // A resolved incident with only its creation message resolves without a later update.
+  if (incident.resolvedAt !== null && last === 0) {
+    events.push({
+      key: manualKey(incident.id, "resolved"),
+      event: "resolved",
+      incident,
+      updateIndex: 0,
+      timeMs: incident.resolvedAt,
+    });
+  }
+  return events;
+}
+
+/** Manual events not yet handled; a restart that has all keys recorded yields none. */
+export function detectManualEvents(
+  incidents: ManualIncident[],
+  handled: (key: string) => boolean,
+): DetectedManualEvent[] {
+  return incidents.flatMap(manualEventsOf).filter((e) => !handled(e.key));
+}
+
+/** Keys that count as handled for all currently visible manual incidents. */
+export function seedManualKeys(incidents: ManualIncident[]): string[] {
+  return incidents.flatMap(manualEventsOf).map((e) => e.key);
 }

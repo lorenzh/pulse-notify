@@ -1,4 +1,13 @@
-export type NotificationEvent = "opened" | "resolved" | "reminder";
+export type NotificationEvent = "opened" | "update" | "resolved" | "reminder";
+
+/** The extra fields of a notification about a manual incident. */
+export interface ManualDetails {
+  impact: string;
+  status: string;
+  /** The message of the update this event is about. */
+  message: string;
+  componentIds: string[];
+}
 
 export interface Notification {
   key: string;
@@ -12,6 +21,8 @@ export interface Notification {
   timeMs: number;
   /** Epoch milliseconds when the incident opened; the age of a reminder is `timeMs - openedMs`. */
   openedMs: number;
+  /** Set for manual incidents; `incidentId` is then the manual id and `checkName` the title. */
+  manual?: ManualDetails;
 }
 
 interface ChannelBase {
@@ -20,6 +31,10 @@ interface ChannelBase {
   checks?: string[];
   /** Check ids or `*` globs to skip. Wins over `checks`. */
   excludeChecks?: string[];
+  /** Component ids for manual incidents; absent or empty means no include filter. */
+  components?: string[];
+  /** Component ids whose manual incidents are skipped. Wins over `components`. */
+  excludeComponents?: string[];
   /** Seconds between "still down" reminders for an open incident; absent means none. */
   remindEverySeconds?: number;
 }

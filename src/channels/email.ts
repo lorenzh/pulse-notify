@@ -15,8 +15,16 @@ export interface EmailOptions {
 }
 
 function bodyText(parts: MessageParts): string {
-  const lines = [`${parts.name} is ${parts.state}.`, "", `Check: ${parts.name}`];
-  lines.push(`State: ${parts.state}`);
+  const m = parts.manual;
+  const lines = m
+    ? [`${parts.state}: ${parts.name}`, "", `Incident: ${parts.name}`]
+    : [`${parts.name} is ${parts.state}.`, "", `Check: ${parts.name}`];
+  if (m) {
+    lines.push(`Impact: ${m.impact}`, `Status: ${m.status}`, `Message: ${m.message}`);
+    if (m.components !== "") lines.push(`Components: ${m.components}`);
+  } else {
+    lines.push(`State: ${parts.state}`);
+  }
   if (parts.reason !== undefined) lines.push(`Reason: ${parts.reason}`);
   lines.push(`Time: ${parts.time}`);
   if (parts.openFor !== undefined) lines.push(`Open for: ${parts.openFor}`);

@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { Check, Incident } from "@lorenzh/pulse-contract";
+import type { Check, Incident, ManualIncident } from "@lorenzh/pulse-contract";
 import type { Logger, LogLevel } from "@lorenzh/pulse-kit";
 
 export interface LogEntry {
@@ -62,6 +62,8 @@ export interface FakeApi {
   url: string;
   incidents: Incident[];
   checks: Check[];
+  /** `undefined` answers 404, like an older api. */
+  manualIncidents: ManualIncident[] | undefined;
   failing: boolean;
   close(): Promise<void>;
 }
@@ -71,6 +73,7 @@ export async function startFakeApi(): Promise<FakeApi> {
     url: "",
     incidents: [],
     checks: [],
+    manualIncidents: [],
     failing: false,
     close: () => close(server),
   };
@@ -82,7 +85,9 @@ export async function startFakeApi(): Promise<FakeApi> {
     }
     res.setHeader("content-type", "application/json");
     if (req.url === "/incidents") res.end(JSON.stringify(api.incidents));
-    else if (req.url === "/checks") res.end(JSON.stringify(api.checks));
+    else if (req.url === "/manual-incidents" && api.manualIncidents) {
+      res.end(JSON.stringify(api.manualIncidents));
+    } else if (req.url === "/checks") res.end(JSON.stringify(api.checks));
     else {
       res.statusCode = 404;
       res.end("{}");
@@ -168,4 +173,18 @@ export function asRecord(body: unknown): Record<string, unknown> {
     throw new Error("expected a JSON object body");
   }
   return body as Record<string, unknown>;
+}
+
+export function manualIncident(over: Partial<ManualIncident> & { id: number }): ManualIncident {
+  const createdAt = Date.UTC(2026, 0, 1, 12, 0, 0);
+  return {
+    title: "Search is slow",
+    componentIds: ["web"],
+    impact: "minor",
+    status: "investigating",
+    createdAt,
+    resolvedAt: null,
+    updates: [{ at: createdAt, status: "investigating", message: "We are looking." }],
+    ...over,
+  };
 }
