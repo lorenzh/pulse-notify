@@ -201,11 +201,13 @@ test("a 404 from an older api is no error and automatic incidents still work", a
     ["1:opened"],
   );
   assert.equal(logger.entries.filter((e) => e.level === "error").length, 0);
+  assert.ok(api.requested.includes("/manual-incidents"));
 });
 
 test("a failing manual read fails the poll", async () => {
-  api.failing = true;
+  api.failingManual = true;
   const n = make();
   await n.tick();
+  assert.ok(api.requested.includes("/manual-incidents"));
   assert.equal(n.pollHealth().consecutiveFailedPolls, 1);
 });
