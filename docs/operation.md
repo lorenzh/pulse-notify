@@ -55,7 +55,7 @@ If you delete the ledger, every channel counts as new on the next start. It reco
 ## Restart behavior
 
 - The environment and the config file are read at start. To change a channel, a URL or a setting, restart.
-- At start, every `pending` ledger entry that has a stored notification is sent again, oldest first, before the first poll. Pending `reminder` entries are the exception: they are held until the first successful poll. Then a reminder of a resolved incident is dropped (ledger `dropped`, nothing sent), and a reminder is dropped when a newer reminder of the same incident and channel is queued, pending or delivered. While the first poll keeps failing, held reminders stay `pending`. One `info` line `resending pending notifications` per channel gives the `count`. This only applies to channels that are already in the ledger.
+- At start, every `pending` ledger entry that has a stored notification is sent again, oldest first, before the first poll. Pending `reminder` entries are the exception: they are held until the first successful poll. Then a reminder of a resolved incident is dropped (ledger `dropped`, nothing sent), and a reminder is dropped when a newer reminder of the same incident and channel is queued or is in the ledger with any status except `dropped`. While the first poll keeps failing, held reminders stay `pending`. One `info` line `resending pending notifications` per channel gives the `count`. This only applies to channels that are already in the ledger.
 - A `pending` entry written by an older version has no stored notification. The poll rebuilds it from the API incident (key `<id>:<event>`) and sends it. If the incident is no longer returned, `pending notification cannot be rebuilt: incident not found` is logged once per start and the key stays `pending`.
 - Events that failed stay `failed` and are not retried by the service (unless `PULSE_NOTIFY_RETRY_ATTEMPTS=0`). Use [`failed resend`](#failed-events-and-resend).
 - Enabling `remindEverySeconds` on an existing channel does not send a burst of reminders, see [channels.md](channels.md#reminders).
@@ -126,7 +126,7 @@ The listener binds before polling starts. If the bind fails, the service prints 
 
 ## API validation and version check
 
-The API calls go through `fetchJson` of `@lorenzh/pulse-contract`, which owns the timeout, the size cap and the wire check. Every item from `GET /incidents` and `GET /checks` is validated with the validators of `@lorenzh/pulse-contract` (`validateIncident`, `validateCheck`). An invalid incident or check is skipped and logged once with a path such as `incidents[0].checkId: ...`. Incidents also need `openedAt` and `resolvedAt` inside the range of `Date`.
+The API calls go through `fetchJson` of `@lorenzh/pulse-contract`, which owns the timeout, the size cap and the wire check. Every item from `GET /incidents` and `GET /checks` is validated with the validators of `@lorenzh/pulse-contract` (`validateIncident`, `validateCheck`). An invalid incident or check is skipped and logged once with a path such as `incidents[0].checkId: ...`. Incidents also need `openedAt` and `resolvedAt` inside the range of `Date` (±8.64e15 ms). The validators enforce the bounds of the contract; an item outside them is skipped, the other items are still used.
 
 A response body is read as a stream and stops at `PULSE_NOTIFY_API_MAX_BYTES` (default 5 MiB). A `Content-Length` over the cap fails at once; a body that grows past the cap is cut off even without or with a wrong length. Both fail the poll and count as a failed poll.
 
