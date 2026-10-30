@@ -5,9 +5,11 @@ import {
   type FetchJsonOptions,
   fetchJson,
   type Incident,
+  type ManualIncident,
   type Validation,
   validateCheck,
   validateIncident,
+  validateManualIncident,
 } from "@lorenzh/pulse-contract";
 import { redactInText } from "./redact.ts";
 import type { Schedule } from "./types.ts";
@@ -83,7 +85,17 @@ function validateArray(path: string): (raw: unknown) => Validation<unknown[]> {
       : { ok: false, error: `GET ${path} did not return an array` };
 }
 
-async function getArray(opts: ApiOptions, path: string): Promise<unknown[]> {
+async function getArray(
+  opts: ApiOptions,
+  path: string,
+  isAbsentTolerated: true,
+): Promise<unknown[] | undefined>;
+async function getArray(opts: ApiOptions, path: string): Promise<unknown[]>;
+async function getArray(
+  opts: ApiOptions,
+  path: string,
+  isAbsentTolerated = false,
+): Promise<unknown[] | undefined> {
   const url = new URL(path, opts.baseUrl.endsWith("/") ? opts.baseUrl : `${opts.baseUrl}/`);
   const options: FetchJsonOptions<unknown[]> = {
     fetch: opts.fetch ?? fetch,
@@ -96,6 +108,9 @@ async function getArray(opts: ApiOptions, path: string): Promise<unknown[]> {
   if (opts.schedule) options.schedule = opts.schedule;
   const result = await fetchJson(url.toString().replace(/\/$/, ""), options);
   if (result.ok) return result.value;
+  if (isAbsentTolerated && result.error.kind === "http" && result.error.status === 404) {
+    return undefined;
+  }
   throw redactedError(apiError(result.error, path), opts.baseUrl);
 }
 
@@ -146,4 +161,41 @@ export async function fetchChecks(opts: ApiOptions): Promise<Check[]> {
     }
   }
   return checks;
+}
+
+export interface ManualIncidentsResult {
+  incidents: ManualIncident[];
+  rejected: RejectedIncident[];
+  /** True when the api answered 404: an older api without manual incidents. */
+  isAbsent: boolean;
+}
+
+/** Reads `/manual-incidents`. A 404 means "none" (`isAbsent`); other failures throw. */
+export async function fetchManualIncidents(opts: ApiOptions): Promise<ManualIncidentsResult> {
+  const result: ManualIncidentsResult = { incidents: [], rejected: [], isAbsent: false };
+  const items = await getArray(opts, "manual-incidents", true);
+  if (items === undefined) return { ...result, isAbsent: true };
+  for (const [i, raw] of items.entries()) {
+    const path = `manual-incidents[${i}]`;
+    const validated = validateManualIncident(raw, path);
+    const isValid =
+      validated.ok && isDateMs(validated.value.createdAt) && updatesHaveDates(validated.value);
+    if (validated.ok && isValid) {
+      result.incidents.push(validated.value);
+    } else {
+      const id = typeof raw === "object" && raw !== null ? (raw as { id?: unknown }).id : undefined;
+      result.rejected.push({
+        id,
+        reason: validated.ok ? "time is not a valid date" : validated.error,
+      });
+    }
+  }
+  return result;
+}
+
+function updatesHaveDates(incident: ManualIncident): boolean {
+  return (
+    incident.updates.every((u) => isDateMs(u.at)) &&
+    (incident.resolvedAt === null || isDateMs(incident.resolvedAt))
+  );
 }

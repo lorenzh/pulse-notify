@@ -154,11 +154,16 @@ function resolveSmtp(
 /** Keys that the config leaves out stay absent in the result. */
 function baseOf(
   raw: RawChannel,
-): Pick<ChannelConfig, "id" | "checks" | "excludeChecks" | "remindEverySeconds"> {
+): Pick<
+  ChannelConfig,
+  "id" | "checks" | "excludeChecks" | "components" | "excludeComponents" | "remindEverySeconds"
+> {
   return {
     id: raw.id,
     ...(raw.checks === undefined ? {} : { checks: raw.checks }),
     ...(raw.excludeChecks === undefined ? {} : { excludeChecks: raw.excludeChecks }),
+    ...(raw.components === undefined ? {} : { components: raw.components }),
+    ...(raw.excludeComponents === undefined ? {} : { excludeComponents: raw.excludeComponents }),
     ...(raw.remindEverySeconds === undefined ? {} : { remindEverySeconds: raw.remindEverySeconds }),
   };
 }

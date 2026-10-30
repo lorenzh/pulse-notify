@@ -15,6 +15,20 @@ function isListed(list: string[] | undefined, checkId: string): boolean {
   return list?.some((entry) => isEntryMatch(entry, checkId)) ?? false;
 }
 
+/**
+ * Whether the channel wants a manual incident. Check filters do not apply; component filters do.
+ * An incident without components matches only a channel without a `components` include list.
+ */
+export function isManualRouted(
+  channel: Pick<ChannelConfig, "components" | "excludeComponents">,
+  componentIds: string[],
+): boolean {
+  if (channel.excludeComponents?.some((id) => componentIds.includes(id))) return false;
+  const include = channel.components;
+  if (include === undefined || include.length === 0) return true;
+  return componentIds.some((id) => include.includes(id));
+}
+
 /** Whether the channel wants notifications about the check: `excludeChecks` wins over `checks`. */
 export function isRouted(
   channel: Pick<ChannelConfig, "checks" | "excludeChecks">,

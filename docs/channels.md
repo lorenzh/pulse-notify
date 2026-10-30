@@ -67,6 +67,18 @@ Every channel can limit the checks it reports:
 - Routing applies to all channel types and to reminders.
 - There are no tags: pulse-contract has no tags on checks, so route by id or by pattern.
 
+## Manual incidents
+
+Notify also reads `GET /manual-incidents` and announces each manual incident: one `opened` event when it is created (key `manual:<id>:opened`), one `update` event per later update (`manual:<id>:update:<n>`, `n` is the update's index) and one `resolved` event (`manual:<id>:resolved`). An update that resolves the incident gives only `resolved`. Each key is delivered once per channel, at least once, through the ledger. Deleting an incident cannot retract a message that was sent.
+
+- Routing uses component ids, not check ids. `components`: include list (absent or empty means no filter). `excludeComponents`: exclude list, it wins. Unknown ids are allowed and match nothing.
+- `checks` and `excludeChecks` are ignored for manual incidents.
+- An incident without components matches every channel except one with a `components` include list.
+- The payload has `incidentId` (the manual id), `checkName` (the title), an empty `checkId` and `reason: null`, plus `manual`: `{ impact, status, message, componentIds }`. `message` is the text of the update the event is about. `time` is the update time.
+- Chat and email messages show title, impact, status, the message and the component ids; control characters are cleaned and chat markup is escaped.
+- On the first start of a channel, existing manual incidents are recorded without sending.
+- An api that answers 404 for `/manual-incidents` (older version) counts as having none. Other failures fail the poll.
+
 ## Reminders
 
 Set `remindEverySeconds` (an integer of at least 60) on a channel to get a "still down" message while an incident stays open. It works for every channel type.

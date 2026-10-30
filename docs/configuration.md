@@ -59,13 +59,15 @@ Top level:
 
 Every channel:
 
-| Key                  | Required | Meaning                                                                                                       |
-| -------------------- | -------- | ------------------------------------------------------------------------------------------------------------- |
-| `id`                 | yes      | Non-empty string, unique in the file. The delivery ledger is keyed by it.                                     |
-| `type`               | yes      | `webhook`, `file`, `slack`, `teams` or `email`                                                                |
-| `checks`             | no       | Check ids or `*` globs. Absent or empty means all checks. Unknown ids are allowed and match nothing.          |
-| `excludeChecks`      | no       | Check ids or `*` globs to skip. Wins over `checks`. See [routing](channels.md#routing).                       |
-| `remindEverySeconds` | no       | Integer of at least 60. Sends a `reminder` while an incident is open. See [reminders](channels.md#reminders). |
+| Key                  | Required | Meaning                                                                                                              |
+| -------------------- | -------- | -------------------------------------------------------------------------------------------------------------------- |
+| `id`                 | yes      | Non-empty string, unique in the file. The delivery ledger is keyed by it.                                            |
+| `type`               | yes      | `webhook`, `file`, `slack`, `teams` or `email`                                                                       |
+| `checks`             | no       | Check ids or `*` globs. Absent or empty means all checks. Unknown ids are allowed and match nothing.                 |
+| `excludeChecks`      | no       | Check ids or `*` globs to skip. Wins over `checks`. See [routing](channels.md#routing).                              |
+| `components`         | no       | Component ids for manual incidents. Absent or empty means all. See [manual incidents](channels.md#manual-incidents). |
+| `excludeComponents`  | no       | Component ids whose manual incidents are skipped. Wins over `components`.                                            |
+| `remindEverySeconds` | no       | Integer of at least 60. Sends a `reminder` while an incident is open. See [reminders](channels.md#reminders).        |
 
 Per type:
 

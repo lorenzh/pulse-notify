@@ -1,11 +1,19 @@
-import type { Check, Incident } from "@lorenzh/pulse-contract";
+import type { Check, Incident, ManualIncident } from "@lorenzh/pulse-contract";
 import type { Logger } from "@lorenzh/pulse-kit";
-import { fetchChecks, fetchIncidents } from "./api.ts";
+import { fetchChecks, fetchIncidents, fetchManualIncidents } from "./api.ts";
 import { createSender } from "./channels/factory.ts";
 import type { SendMail } from "./channels/mailer.ts";
-import { isRouted } from "./channels/routing.ts";
+import { isManualRouted, isRouted } from "./channels/routing.ts";
 import { ChannelDelivery } from "./delivery.ts";
-import { detectEvents, eventTimeMs, type ReminderPlan, seedKeys } from "./detector.ts";
+import {
+  type DetectedManualEvent,
+  detectEvents,
+  detectManualEvents,
+  eventTimeMs,
+  type ReminderPlan,
+  seedKeys,
+  seedManualKeys,
+} from "./detector.ts";
 import { errorFields } from "./errors.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Metrics } from "./metrics.ts";
@@ -107,6 +115,30 @@ function buildNotification(
   };
 }
 
+function buildManualNotification(detected: DetectedManualEvent): Notification {
+  const { incident, event, key, timeMs, updateIndex } = detected;
+  const update = incident.updates[updateIndex];
+  const message = event === "resolved" ? (incident.updates.at(-1)?.message ?? "") : update?.message;
+  if (message === undefined) throw new Error(`manual incident ${incident.id} has no update`);
+  return {
+    key,
+    event,
+    incidentId: incident.id,
+    checkId: "",
+    checkName: incident.title,
+    reason: null,
+    time: new Date(timeMs).toISOString(),
+    timeMs,
+    openedMs: incident.createdAt,
+    manual: {
+      impact: incident.impact,
+      status: event === "resolved" ? "resolved" : (update?.status ?? incident.status),
+      message,
+      componentIds: incident.componentIds,
+    },
+  };
+}
+
 type BuildArgs = Parameters<typeof buildNotification>;
 
 function buildArgs(...args: BuildArgs): BuildArgs {
@@ -124,6 +156,8 @@ export class Notifier {
   #failedPolls = 0;
   /** Ids of the incidents in the last successful poll; `undefined` before the first one. */
   #visible: Set<number> | undefined;
+  /** Ids of the manual incidents in the last successful read; kept when the api answers 404. */
+  #visibleManual: Set<number> | undefined;
   #lastPruneMs: number | undefined;
   #cancelPoll: (() => void) | undefined;
   #running = false;
@@ -276,11 +310,21 @@ export class Notifier {
     };
     let incidents: Incident[];
     let checks: Check[];
+    let manual: ManualIncident[];
     try {
-      const [result, fetched] = await Promise.all([fetchIncidents(api), fetchChecks(api)]);
+      const [result, fetched, manualResult] = await Promise.all([
+        fetchIncidents(api),
+        fetchChecks(api),
+        fetchManualIncidents(api),
+      ]);
       incidents = result.incidents;
       checks = fetched;
+      manual = manualResult.incidents;
       this.#reportRejected(result.rejected);
+      this.#reportRejected(
+        manualResult.rejected.map((r) => ({ ...r, id: `manual:${String(r.id)}` })),
+      );
+      if (!manualResult.isAbsent) this.#visibleManual = new Set(manual.map((i) => i.id));
     } catch (err) {
       this.#opts.logger.error("api poll failed", errorFields(err));
       this.#opts.metrics?.pollDone("error");
@@ -292,7 +336,7 @@ export class Notifier {
     this.#resolved = new Set(incidents.filter((i) => i.resolvedAt != null).map((i) => i.id));
     const nowMs = this.#now();
     for (const channel of this.#channels) {
-      this.#pollChannel(channel, incidents, names, nowMs);
+      this.#pollChannel(channel, incidents, manual, names, nowMs);
     }
     // After the new events are queued, so a newer reminder supersedes a held one.
     this.#releaseHeld();
@@ -306,7 +350,7 @@ export class Notifier {
     if (this.#lastPruneMs !== undefined && nowMs - this.#lastPruneMs < PRUNE_EVERY_MS) return;
     this.#lastPruneMs = nowMs;
     const days = this.#opts.stateRetentionDays ?? 30;
-    const count = this.#opts.ledger.prune(days * DAY_MS, this.#visible);
+    const count = this.#opts.ledger.prune(days * DAY_MS, this.#visible, this.#visibleManual);
     if (count > 0) this.#opts.logger.info("old ledger entries pruned", { count });
   }
 
@@ -348,6 +392,7 @@ export class Notifier {
   #pollChannel(
     channel: ChannelState,
     incidents: Incident[],
+    manual: ManualIncident[],
     names: Map<string, string>,
     nowMs: number,
   ): void {
@@ -358,7 +403,14 @@ export class Notifier {
       remindSeconds === undefined ? undefined : { everyMs: remindSeconds * 1000, nowMs };
     if (!ledger.hasChannel(id)) {
       try {
-        ledger.seed(id, seedKeys(incidents, reminders), reminders ? nowMs : undefined);
+        ledger.seed(
+          id,
+          [
+            ...seedKeys(incidents, reminders),
+            ...seedManualKeys(manual.filter((i) => isManualRouted(channel.config, i.componentIds))),
+          ],
+          reminders ? nowMs : undefined,
+        );
       } catch (err) {
         logger.error("ledger seed failed, the next poll retries", {
           channel: id,
@@ -381,7 +433,14 @@ export class Notifier {
       reminders,
     );
     for (const { key, event, incident } of events) {
-      this.#enqueue(channel, buildArgs(key, event, incident, names, nowMs));
+      this.#enqueue(channel, key, () =>
+        buildNotification(...buildArgs(key, event, incident, names, nowMs)),
+      );
+    }
+    const isHandled = (key: string): boolean => ledger.has(id, key) || channel.queued.has(key);
+    const relevantManual = manual.filter((i) => isManualRouted(channel.config, i.componentIds));
+    for (const detected of detectManualEvents(relevantManual, isHandled)) {
+      this.#enqueue(channel, detected.key, () => buildManualNotification(detected));
     }
   }
 
@@ -442,7 +501,9 @@ export class Notifier {
         });
         continue;
       }
-      this.#enqueue(channel, buildArgs(key, found.event, found.incident, names, nowMs));
+      this.#enqueue(channel, key, () =>
+        buildNotification(...buildArgs(key, found.event, found.incident, names, nowMs)),
+      );
     }
   }
 
@@ -450,19 +511,19 @@ export class Notifier {
    * Builds first, so a build error leaves the key unqueued and the next poll tries again.
    * Only the build is caught: errors from `enqueue` must surface.
    */
-  #enqueue(channel: ChannelState, args: BuildArgs): void {
+  #enqueue(channel: ChannelState, key: string, build: () => Notification): void {
     let notification: Notification;
     try {
-      notification = buildNotification(...args);
+      notification = build();
     } catch (err) {
       this.#opts.logger.error("notification cannot be built, the next poll retries", {
         channel: channel.config.id,
-        key: args[0],
+        key,
         ...errorFields(err),
       });
       return;
     }
-    channel.queued.add(args[0]);
+    channel.queued.add(key);
     channel.delivery.enqueue(notification);
   }
 

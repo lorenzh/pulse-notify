@@ -15,8 +15,8 @@ const USAGE = [
 /** The event of an entry: from its notification, else from its key (`12:opened`). */
 function eventOf(entry: FailedEntry): string {
   if (entry.notification) return entry.notification.event;
-  const part = entry.key.split(":")[1];
-  return part ?? "unknown";
+  const parts = entry.key.split(":");
+  return (parts[0] === "manual" ? parts[2] : parts[1]) ?? "unknown";
 }
 
 function describe(entry: FailedEntry): string {
