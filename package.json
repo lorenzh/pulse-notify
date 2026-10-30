@@ -20,11 +20,11 @@
   "devDependencies": {
     "@biomejs/biome": "2.6.3",
     "@lorenzh/pulse-config": "github:lorenzh/pulse-config#51e95b0eb463b27a196a33b428607bd92443e4f0",
-    "@types/node": "^26.6.5",
+    "@types/node": "26.6.6",
     "@types/nodemailer": "8.0.2",
     "lefthook": "2.2.2",
     "@types/bun": "1.4.0",
-    "typescript7": "npm:typescript@^7.0.2"
+    "typescript7": "npm:typescript@7.0.2"
   },
   "dependencies": {
     "@lorenzh/pulse-contract": "github:lorenzh/pulse-contract#206bf010c50bc5d19c234f0877aacb9efe1123b8",
