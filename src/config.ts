@@ -9,9 +9,11 @@ import {
   readUrl,
   StartupError,
 } from "@lorenzh/pulse-kit";
+import { z } from "zod";
 import { DEFAULT_API_MAX_BYTES } from "./api.ts";
+import { channelSchema, type RawChannel } from "./channel-schema.ts";
 import { isLoopbackHost } from "./channels/loopback.ts";
-import { envelopeAddress, isEhloName } from "./channels/mailer.ts";
+import { isEhloName } from "./channels/mailer.ts";
 import {
   DEFAULT_RETRY_ATTEMPTS,
   DEFAULT_RETRY_DELAY_MS,
@@ -33,19 +35,6 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function rejectUnknownKeys(
-  raw: Record<string, unknown>,
-  allowed: readonly string[],
-  path: string,
-  where: string,
-): void {
-  for (const key of Object.keys(raw)) {
-    if (!allowed.includes(key)) {
-      throw new ConfigError(`${path}: unknown key ${JSON.stringify(key)} in ${where}`);
-    }
-  }
-}
-
 /** Where secrets come from; injected so tests need no real environment. */
 export interface SecretSource {
   env: Record<string, string | undefined>;
@@ -57,58 +46,16 @@ const realSource = (): SecretSource => ({
   readFile: (path) => readFileSync(path, "utf8"),
 });
 
-function parseCheckList(
-  raw: Record<string, unknown>,
-  key: string,
-  id: string,
-): string[] | undefined {
-  const value = raw[key];
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value) || !value.every((c) => typeof c === "string")) {
-    throw new ConfigError(`channel "${id}": ${key} must be an array of strings`);
-  }
-  return value as string[];
-}
-
-function isHttpUrl(url: unknown): url is string {
-  if (typeof url !== "string") return false;
-  try {
-    const protocol = new URL(url).protocol;
-    return protocol === "http:" || protocol === "https:";
-  } catch {
-    // An unparseable URL is simply not an HTTP URL.
-    return false;
-  }
-}
-
-function parseRemind(value: unknown, id: string): number | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 60) {
-    throw new ConfigError(`channel "${id}": remindEverySeconds must be an integer of at least 60`);
-  }
-  return value;
-}
-
-/** The common keys of every channel; absent keys stay absent. */
-function parseBase(raw: Record<string, unknown>, id: string): ChannelBase {
-  const base: ChannelBase = { id };
-  const checks = parseCheckList(raw, "checks", id);
-  if (checks !== undefined) base.checks = checks;
-  const excludeChecks = parseCheckList(raw, "excludeChecks", id);
-  if (excludeChecks !== undefined) base.excludeChecks = excludeChecks;
-  const remind = parseRemind(raw.remindEverySeconds, id);
-  if (remind !== undefined) base.remindEverySeconds = remind;
-  return base;
-}
-
-type ChannelBase = Pick<ChannelConfig, "id" | "checks" | "excludeChecks" | "remindEverySeconds">;
-
-const BASE_KEYS = ["id", "type", "checks", "excludeChecks", "remindEverySeconds"] as const;
-
 function trimTrailingNewlines(text: string): string {
   let end = text.length;
   while (end > 0 && (text[end - 1] === "\n" || text[end - 1] === "\r")) end--;
   return text.slice(0, end);
+}
+
+/** The `<name>Env` / `<name>File` pair of a channel, already checked for shape. */
+interface SecretRefs {
+  env: string | undefined;
+  file: string | undefined;
 }
 
 /**
@@ -116,26 +63,21 @@ function trimTrailingNewlines(text: string): string {
  * never the value. A file loses one trailing newline.
  */
 function readSecret(
-  raw: Record<string, unknown>,
+  refs: SecretRefs,
   id: string,
   name: string,
   source: SecretSource,
 ): string | undefined {
   const envKey = `${name}Env`;
   const fileKey = `${name}File`;
-  const envName = raw[envKey];
-  const filePath = raw[fileKey];
-  if (envName === undefined && filePath === undefined) return undefined;
-  if (envName !== undefined && filePath !== undefined) {
+  if (refs.env === undefined && refs.file === undefined) return undefined;
+  if (refs.env !== undefined && refs.file !== undefined) {
     throw new ConfigError(`channel "${id}": set only one of ${envKey} and ${fileKey}`);
   }
-  const key = envName === undefined ? fileKey : envKey;
-  const ref = envName ?? filePath;
-  if (typeof ref !== "string" || ref === "") {
-    throw new ConfigError(`channel "${id}": ${key} must be a non-empty string`);
-  }
+  const key = refs.env === undefined ? fileKey : envKey;
+  const ref = refs.env ?? refs.file ?? "";
   let value: string | undefined;
-  if (envName === undefined) {
+  if (refs.env === undefined) {
     try {
       value = trimTrailingNewlines(source.readFile(ref));
     } catch (err) {
@@ -150,80 +92,23 @@ function readSecret(
   return value;
 }
 
-function requireSecret(
-  raw: Record<string, unknown>,
-  id: string,
-  name: string,
-  source: SecretSource,
-): string {
-  const value = readSecret(raw, id, name, source);
+function requireSecret(refs: SecretRefs, id: string, name: string, source: SecretSource): string {
+  const value = readSecret(refs, id, name, source);
   if (value === undefined) {
     throw new ConfigError(`channel "${id}": ${name}Env or ${name}File is required`);
   }
   return value;
 }
 
-function parseStatusUrl(raw: Record<string, unknown>, id: string): string | undefined {
-  if (raw.statusUrl === undefined) return undefined;
-  if (!isHttpUrl(raw.statusUrl)) {
-    throw new ConfigError(`channel "${id}": statusUrl must be a valid http(s) url`);
-  }
-  return raw.statusUrl;
-}
-
-function parseHideReason(raw: Record<string, unknown>, id: string): boolean | undefined {
-  if (raw.hideReason === undefined) return undefined;
-  if (typeof raw.hideReason !== "boolean") {
-    throw new ConfigError(`channel "${id}": hideReason must be true or false`);
-  }
-  return raw.hideReason;
-}
-
-/** The keys that chat and email channels share. */
-function parseMessageOptions(
-  raw: Record<string, unknown>,
-  id: string,
-): { statusUrl?: string; hideReason?: boolean } {
-  const out: { statusUrl?: string; hideReason?: boolean } = {};
-  const statusUrl = parseStatusUrl(raw, id);
-  if (statusUrl !== undefined) out.statusUrl = statusUrl;
-  const hideReason = parseHideReason(raw, id);
-  if (hideReason !== undefined) out.hideReason = hideReason;
-  return out;
-}
-
-function parseWebhook(
-  raw: Record<string, unknown>,
-  base: ChannelBase,
-  path: string,
-  where: string,
-  source: SecretSource,
-): ChannelConfig {
-  rejectUnknownKeys(raw, [...BASE_KEYS, "url", "secretEnv", "secretFile"], path, where);
-  if (!isHttpUrl(raw.url)) {
-    throw new ConfigError(`channel "${base.id}": webhook needs a valid http(s) url`);
-  }
-  const secret = readSecret(raw, base.id, "secret", source);
-  return { ...base, type: "webhook", url: raw.url, ...(secret === undefined ? {} : { secret }) };
-}
-
-function parseFile(
-  raw: Record<string, unknown>,
-  base: ChannelBase,
-  path: string,
-  where: string,
-): ChannelConfig {
-  rejectUnknownKeys(raw, [...BASE_KEYS, "path"], path, where);
-  if (typeof raw.path !== "string" || raw.path === "") {
-    throw new ConfigError(`channel "${base.id}": file channel needs a path`);
-  }
-  return { ...base, type: "file", path: raw.path };
-}
-
 /** Slack and Teams URLs are credentials: https only, except for a local test server. */
-function parseChatUrl(raw: Record<string, unknown>, id: string, source: SecretSource): string {
-  const url = requireSecret(raw, id, "url", source);
-  const key = raw.urlEnv === undefined ? "urlFile" : "urlEnv";
+function resolveChatUrl(
+  refs: { urlEnv?: string | undefined; urlFile?: string | undefined },
+  id: string,
+  source: SecretSource,
+): string {
+  const secretRefs = { env: refs.urlEnv, file: refs.urlFile };
+  const url = requireSecret(secretRefs, id, "url", source);
+  const key = refs.urlEnv === undefined ? "urlFile" : "urlEnv";
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -238,126 +123,116 @@ function parseChatUrl(raw: Record<string, unknown>, id: string, source: SecretSo
   return url;
 }
 
-function parseChat(
-  raw: Record<string, unknown>,
-  base: ChannelBase,
-  type: "slack" | "teams",
-  path: string,
-  where: string,
+function resolveSmtp(
+  smtp: Extract<RawChannel, { type: "email" }>["smtp"],
+  id: string,
   source: SecretSource,
-): ChannelConfig {
-  rejectUnknownKeys(
-    raw,
-    [...BASE_KEYS, "urlEnv", "urlFile", "statusUrl", "hideReason"],
-    path,
-    where,
-  );
-  const url = parseChatUrl(raw, base.id, source);
-  return { ...base, type, url, ...parseMessageOptions(raw, base.id) };
-}
-
-function parseAddress(value: unknown, id: string, key: string): string {
-  if (typeof value !== "string" || value.trim() === "" || /[\r\n]/.test(value)) {
-    throw new ConfigError(`channel "${id}": ${key} must be a single-line address`);
-  }
-  if (!/^[^\s<>@]+@[^\s<>@]+$/.test(envelopeAddress(value))) {
-    throw new ConfigError(`channel "${id}": ${key} must hold an email address`);
-  }
-  return value;
-}
-
-function parseRecipients(value: unknown, id: string): string[] {
-  if (!Array.isArray(value) || value.length === 0) {
-    throw new ConfigError(`channel "${id}": to must be a non-empty array of addresses`);
-  }
-  return value.map((v) => parseAddress(v, id, "to"));
-}
-
-function parseSmtpTls(value: unknown, id: string): SmtpConfig["tls"] {
-  if (value === undefined) return "starttls";
-  if (value === "starttls" || value === "tls" || value === "none") return value;
-  throw new ConfigError(`channel "${id}": smtp.tls must be "starttls", "tls" or "none"`);
-}
-
-function parseSmtp(value: unknown, id: string, path: string, source: SecretSource): SmtpConfig {
-  if (!isObject(value)) throw new ConfigError(`channel "${id}": smtp must be an object`);
-  const where = "smtp";
-  rejectUnknownKeys(
-    value,
-    ["host", "port", "tls", "username", "passwordEnv", "passwordFile", "clientName"],
-    path,
-    `channels ${JSON.stringify(id)} ${where}`,
-  );
-  if (typeof value.host !== "string" || value.host === "" || /\s/.test(value.host)) {
-    throw new ConfigError(`channel "${id}": smtp.host must be a host name`);
-  }
-  const { port } = value;
-  if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new ConfigError(`channel "${id}": smtp.port must be an integer from 1 to 65535`);
-  }
-  const tls = parseSmtpTls(value.tls, id);
-  const smtp: SmtpConfig = { host: value.host, port, tls };
-  if (value.clientName !== undefined) {
-    if (typeof value.clientName !== "string" || !isEhloName(value.clientName)) {
-      throw new ConfigError(
-        `channel "${id}": smtp.clientName must be a host name or an address literal`,
-      );
-    }
-    smtp.clientName = value.clientName;
-  }
-  if (value.username === undefined) {
-    if (value.passwordEnv !== undefined || value.passwordFile !== undefined) {
+): SmtpConfig {
+  const out: SmtpConfig = { host: smtp.host, port: smtp.port, tls: smtp.tls };
+  if (smtp.clientName !== undefined) out.clientName = smtp.clientName;
+  if (smtp.username === undefined) {
+    if (smtp.passwordEnv !== undefined || smtp.passwordFile !== undefined) {
       throw new ConfigError(`channel "${id}": smtp password needs a username`);
     }
-    return smtp;
+    return out;
   }
-  if (
-    typeof value.username !== "string" ||
-    value.username === "" ||
-    /[\r\n]/.test(value.username)
-  ) {
-    throw new ConfigError(`channel "${id}": smtp.username must be a single-line string`);
-  }
-  if (tls === "none" && !isLoopbackHost(value.host)) {
+  if (smtp.tls === "none" && !isLoopbackHost(smtp.host)) {
     throw new ConfigError(
       `channel "${id}": smtp login is refused with tls "none" on a remote host`,
     );
   }
-  smtp.username = value.username;
-  smtp.password = requireSecret(value, id, "password", source);
-  return smtp;
+  out.username = smtp.username;
+  out.password = requireSecret(
+    { env: smtp.passwordEnv, file: smtp.passwordFile },
+    id,
+    "password",
+    source,
+  );
+  return out;
 }
 
-function parseEmail(
-  raw: Record<string, unknown>,
-  base: ChannelBase,
-  path: string,
-  where: string,
-  source: SecretSource,
-): ChannelConfig {
-  rejectUnknownKeys(
-    raw,
-    [...BASE_KEYS, "smtp", "from", "to", "subjectPrefix", "statusUrl", "hideReason"],
-    path,
-    where,
-  );
-  const smtp = parseSmtp(raw.smtp, base.id, path, source);
-  const from = parseAddress(raw.from, base.id, "from");
-  const to = parseRecipients(raw.to, base.id);
-  const out: ChannelConfig = { ...base, type: "email", smtp, from, to };
-  if (raw.subjectPrefix !== undefined) {
-    if (typeof raw.subjectPrefix !== "string" || /[\r\n]/.test(raw.subjectPrefix)) {
-      throw new ConfigError(`channel "${base.id}": subjectPrefix must be a single-line string`);
+/** Keys that the config leaves out stay absent in the result. */
+function baseOf(
+  raw: RawChannel,
+): Pick<ChannelConfig, "id" | "checks" | "excludeChecks" | "remindEverySeconds"> {
+  return {
+    id: raw.id,
+    ...(raw.checks === undefined ? {} : { checks: raw.checks }),
+    ...(raw.excludeChecks === undefined ? {} : { excludeChecks: raw.excludeChecks }),
+    ...(raw.remindEverySeconds === undefined ? {} : { remindEverySeconds: raw.remindEverySeconds }),
+  };
+}
+
+function messageOptionsOf(raw: {
+  statusUrl?: string | undefined;
+  hideReason?: boolean | undefined;
+}): { statusUrl?: string; hideReason?: boolean } {
+  return {
+    ...(raw.statusUrl === undefined ? {} : { statusUrl: raw.statusUrl }),
+    ...(raw.hideReason === undefined ? {} : { hideReason: raw.hideReason }),
+  };
+}
+
+/** Turns a validated channel into its config; this is the separate secret step. */
+function resolveChannel(raw: RawChannel, source: SecretSource): ChannelConfig {
+  const base = baseOf(raw);
+  switch (raw.type) {
+    case "webhook": {
+      const secret = readSecret(
+        { env: raw.secretEnv, file: raw.secretFile },
+        raw.id,
+        "secret",
+        source,
+      );
+      return {
+        ...base,
+        type: "webhook",
+        url: raw.url,
+        ...(secret === undefined ? {} : { secret }),
+      };
     }
-    out.subjectPrefix = raw.subjectPrefix;
+    case "file":
+      return { ...base, type: "file", path: raw.path };
+    case "slack":
+    case "teams":
+      return {
+        ...base,
+        type: raw.type,
+        url: resolveChatUrl(raw, raw.id, source),
+        ...messageOptionsOf(raw),
+      };
+    case "email": {
+      const smtp = resolveSmtp(raw.smtp, raw.id, source);
+      return {
+        ...base,
+        type: "email",
+        smtp,
+        from: raw.from,
+        to: raw.to,
+        ...(raw.subjectPrefix === undefined ? {} : { subjectPrefix: raw.subjectPrefix }),
+        ...messageOptionsOf(raw),
+      };
+    }
+    default: {
+      const never: never = raw;
+      return never;
+    }
   }
-  return { ...out, ...parseMessageOptions(raw, base.id) };
+}
+
+/** The first issue as one line; unknown keys name the file and the place. */
+function formatIssue(issue: z.core.$ZodIssue, file: string, prefix: string, id?: string): string {
+  if (issue.code === "unrecognized_keys") {
+    const place = [prefix, ...issue.path.map(String)].join(".");
+    return `${file}: unknown key ${JSON.stringify(issue.keys[0])} in ${place}`;
+  }
+  return id === undefined ? issue.message : `channel "${id}": ${issue.message}`;
 }
 
 function parseChannel(
   raw: unknown,
   index: number,
-  path: string,
+  file: string,
   source: SecretSource,
 ): ChannelConfig {
   const where = `channels[${index}]`;
@@ -366,21 +241,28 @@ function parseChannel(
   if (typeof id !== "string" || id === "") {
     throw new ConfigError(`${where}.id must be a non-empty string`);
   }
-  const base = parseBase(raw, id);
-  switch (type) {
-    case "webhook":
-      return parseWebhook(raw, base, path, where, source);
-    case "file":
-      return parseFile(raw, base, path, where);
-    case "slack":
-    case "teams":
-      return parseChat(raw, base, type, path, where, source);
-    case "email":
-      return parseEmail(raw, base, path, where, source);
-    default:
-      throw new ConfigError(`channel "${id}": unknown type ${JSON.stringify(type)}`);
+  const schema = channelSchema(type);
+  if (schema === undefined) {
+    throw new ConfigError(`channel "${id}": unknown type ${JSON.stringify(type)}`);
   }
+  const result = schema.safeParse(raw);
+  if (!result.success) {
+    const [issue] = result.error.issues;
+    throw new ConfigError(
+      issue === undefined ? `${where}: invalid channel` : formatIssue(issue, file, where, id),
+    );
+  }
+  return resolveChannel(result.data, source);
 }
+
+const configSchema = z.strictObject(
+  {
+    channels: z
+      .array(z.unknown(), "config.channels must be a non-empty array")
+      .min(1, "config.channels must be a non-empty array"),
+  },
+  "config must be an object",
+);
 
 /** `path` names the file in unknown-key errors. Secrets are read from `source` right here. */
 export function parseConfig(
@@ -388,12 +270,15 @@ export function parseConfig(
   path = "config",
   source: SecretSource = realSource(),
 ): Config {
-  if (!isObject(raw)) throw new ConfigError("config must be an object");
-  rejectUnknownKeys(raw, ["channels"], path, "config");
-  if (!Array.isArray(raw.channels) || raw.channels.length === 0) {
-    throw new ConfigError("config.channels must be a non-empty array");
+  const top = configSchema.safeParse(raw);
+  if (!top.success) {
+    const issue =
+      top.error.issues.find((i) => i.code === "unrecognized_keys") ?? top.error.issues[0];
+    throw new ConfigError(
+      issue === undefined ? "config must be an object" : formatIssue(issue, path, "config"),
+    );
   }
-  const channels = raw.channels.map((c, i) => parseChannel(c, i, path, source));
+  const channels = top.data.channels.map((c, i) => parseChannel(c, i, path, source));
   const seen = new Set<string>();
   for (const channel of channels) {
     if (seen.has(channel.id)) throw new ConfigError(`duplicate channel id "${channel.id}"`);

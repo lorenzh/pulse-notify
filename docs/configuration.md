@@ -75,7 +75,7 @@ Per type:
 | `slack`, `teams` | `urlEnv` / `urlFile`       | one of   | Where the `https:` webhook URL is read from; `statusUrl`, `hideReason` are optional. See [slack.md](channels/slack.md), [teams.md](channels/teams.md). |
 | `email`          | `smtp`, `from`, `to`       | yes      | See [email.md](channels/email.md).`subjectPrefix`, `statusUrl`, `hideReason` are optional.                                                             |
 
-Unknown keys are rejected at startup, for example `notify.json: unknown key "check" in channels[0]`. Check the spelling of `checks`. Details of each channel are in [channels.md](channels.md).
+Unknown keys are rejected at startup, for example `notify.json: unknown key "check" in channels[0]`. Check the spelling of `checks`. The place is a path, so an unknown key inside the SMTP block reads `notify.json: unknown key "extra" in channels[0].smtp`. Details of each channel are in [channels.md](channels.md).
 
 Secrets and credential URLs (Slack, Teams, SMTP password, webhook signing secret) are read from environment variables or files, see [secrets](channels.md#secrets). Relative secret file paths are relative to the working directory. Do not put secrets in a webhook `url`: the config file holds it in clear text. pulse-notify does not log URLs.
 

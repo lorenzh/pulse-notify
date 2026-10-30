@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -328,3 +328,83 @@ test("smtp without login and tls none on loopback are allowed", () => {
   );
   assert.equal(config.channels.length, 2);
 });
+
+test("unknown keys in smtp name the path to the object", () => {
+  assert.throws(
+    () =>
+      parseConfig(
+        { channels: [{ ...email, smtp: { ...email.smtp, extra: 1 } }] },
+        "cfg.json",
+        source,
+      ),
+    (err) =>
+      err instanceof ConfigError &&
+      err.message === 'cfg.json: unknown key "extra" in channels[0].smtp',
+  );
+});
+
+test("shape errors name the channel and the key, in the order of the keys", () => {
+  const cases: [unknown, string][] = [
+    [
+      { ...email, smtp: { ...email.smtp, port: 70000 } },
+      'channel "m": smtp.port must be an integer from 1 to 65535',
+    ],
+    [{ ...email, smtp: "x" }, 'channel "m": smtp must be an object'],
+    [
+      { ...email, smtp: { ...email.smtp, host: "a b" } },
+      'channel "m": smtp.host must be a host name',
+    ],
+    [
+      { ...email, smtp: { ...email.smtp, clientName: "bad name" } },
+      'channel "m": smtp.clientName must be a host name or an address literal',
+    ],
+    [{ ...slack, urlEnv: "" }, 'channel "s": urlEnv must be a non-empty string'],
+    [{ ...hook, secretFile: 5 }, 'channel "h": secretFile must be a non-empty string'],
+  ];
+  for (const [channel, message] of cases) {
+    assert.throws(
+      () => parseConfig({ channels: [channel] }, "cfg.json", source),
+      (err) => err instanceof ConfigError && err.message === message,
+    );
+  }
+});
+
+test("error messages never hold the rejected value", () => {
+  assert.throws(
+    () => parseConfig({ channels: [{ ...hook, url: "user:hunter2@a/b" }] }),
+    (err) => err instanceof ConfigError && !err.message.includes("hunter2"),
+  );
+});
+
+test("every channels example in the docs loads", () => {
+  const anySecret = {
+    env: new Proxy({}, { get: () => "https://hooks.example.com/x" }),
+    readFile: () => "https://hooks.example.com/x\n",
+  };
+  let loaded = 0;
+  for (const name of [
+    "README.md",
+    ...readdirSync("docs").map((f) => `docs/${f}`),
+    ...readdirSync("docs/channels").map((f) => `docs/channels/${f}`),
+  ]) {
+    if (!name.endsWith(".md")) continue;
+    const text = readFileSync(name, "utf8");
+    for (const block of text.matchAll(/```json\n([\s\S]*?)```/g)) {
+      let json: unknown;
+      try {
+        json = JSON.parse(block[1] ?? "");
+      } catch {
+        // A fragment that is not a whole document is not a config example.
+        continue;
+      }
+      if (!isConfigExample(json)) continue;
+      assert.doesNotThrow(() => parseConfig(json, name, anySecret), name);
+      loaded++;
+    }
+  }
+  assert.ok(loaded > 0);
+});
+
+function isConfigExample(json: unknown): boolean {
+  return typeof json === "object" && json !== null && "channels" in json;
+}
