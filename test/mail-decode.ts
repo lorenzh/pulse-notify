@@ -1,3 +1,5 @@
+import { TextDecoder } from "node:util";
+
 export interface DecodedMail {
   headers: Record<string, string>;
   body: string;

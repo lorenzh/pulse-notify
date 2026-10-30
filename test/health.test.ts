@@ -1,8 +1,8 @@
+import { afterAll, afterEach, beforeEach, test } from "bun:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, afterEach, beforeEach, test } from "node:test";
 import { main, type Stoppable } from "../src/index.ts";
 import { Ledger } from "../src/ledger.ts";
 import { Metrics } from "../src/metrics.ts";
@@ -10,7 +10,7 @@ import { Notifier } from "../src/notifier.ts";
 import { type FakeApi, httpCheck, incident, spyLogger, startFakeApi } from "./support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-health-"));
-after(() => rmSync(dir, { recursive: true, force: true }));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 const configPath = join(dir, "config.json");
 writeFileSync(
   configPath,

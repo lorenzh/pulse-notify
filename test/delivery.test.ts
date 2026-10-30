@@ -1,8 +1,8 @@
+import { afterAll, test } from "bun:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, test } from "node:test";
 import { ChannelDelivery } from "../src/delivery.ts";
 import { Ledger } from "../src/ledger.ts";
 import type { Notification } from "../src/types.ts";
@@ -23,7 +23,7 @@ function note(key: string): Notification {
 }
 
 const dirs: string[] = [];
-after(() => {
+afterAll(() => {
   for (const d of dirs) rmSync(d, { recursive: true, force: true });
 });
 

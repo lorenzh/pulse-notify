@@ -1,13 +1,13 @@
+import { afterAll, test } from "bun:test";
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, test } from "node:test";
 import { Ledger } from "../src/ledger.ts";
 import type { Notification } from "../src/types.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-ledger-race-"));
-after(() => {
+afterAll(() => {
   chmodSync(dir, 0o700);
   rmSync(dir, { recursive: true, force: true });
 });

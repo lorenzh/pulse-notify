@@ -1,12 +1,12 @@
+import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { test } from "node:test";
 import { WIRE_VERSION, WIRE_VERSION_HEADER } from "@lorenzh/pulse-contract";
 import { fetchChecks, fetchIncidents } from "../src/api.ts";
-import { httpCheck, incident } from "./support.ts";
+import { fakeFetch, httpCheck, incident } from "./support.ts";
 
 async function check(over: Record<string, unknown>) {
   const body = [{ ...incident({ id: 1 }), ...over }];
-  const fake: typeof fetch = async () => new Response(JSON.stringify(body), { status: 200 });
+  const fake = fakeFetch(async () => new Response(JSON.stringify(body), { status: 200 }));
   return fetchIncidents({ baseUrl: "http://127.0.0.1:1", fetch: fake });
 }
 
@@ -31,7 +31,7 @@ test("the edges of the Date range are accepted", async () => {
 const base = "http://127.0.0.1:1";
 
 function respond(body: unknown, headers: Record<string, string> = {}): typeof fetch {
-  return async () => new Response(JSON.stringify(body), { status: 200, headers });
+  return fakeFetch(async () => new Response(JSON.stringify(body), { status: 200, headers }));
 }
 
 test("an incident missing a required field is rejected with a path", async () => {
@@ -96,8 +96,9 @@ test("a check with an out-of-range value is skipped and reported", async () => {
 });
 
 test("a non-2xx status wins over a wire version mismatch", async () => {
-  const fetchFn: typeof fetch = async () =>
-    new Response("[]", { status: 503, headers: { [WIRE_VERSION_HEADER]: "999" } });
+  const fetchFn = fakeFetch(
+    async () => new Response("[]", { status: 503, headers: { [WIRE_VERSION_HEADER]: "999" } }),
+  );
   await assert.rejects(
     fetchChecks({ baseUrl: base, fetch: fetchFn }),
     /^Error: GET checks returned 503$/,
@@ -105,12 +106,12 @@ test("a non-2xx status wins over a wire version mismatch", async () => {
 });
 
 test("a body that is not an array fails the call", async () => {
-  const fetchFn: typeof fetch = async () => new Response("{}", { status: 200 });
+  const fetchFn = fakeFetch(async () => new Response("{}", { status: 200 }));
   await assert.rejects(fetchChecks({ baseUrl: base, fetch: fetchFn }), /did not return an array/);
 });
 
 test("a stalled call times out through the injected schedule", async () => {
-  const fetchFn: typeof fetch = () => new Promise<Response>(() => {});
+  const fetchFn = fakeFetch(() => new Promise<Response>(() => {}));
   const schedule = (fn: () => void): (() => void) => {
     queueMicrotask(fn);
     return () => {};
@@ -123,9 +124,9 @@ test("a stalled call times out through the injected schedule", async () => {
 
 test("a network error keeps its code and loses the credentials", async () => {
   const secretBase = "http://user:hunter2@127.0.0.1:1";
-  const fetchFn: typeof fetch = async () => {
+  const fetchFn = fakeFetch(async () => {
     throw Object.assign(new Error(`connect failed ${secretBase}/checks`), { code: "ECONNREFUSED" });
-  };
+  });
   const err = await fetchChecks({ baseUrl: secretBase, fetch: fetchFn }).catch((e: unknown) => e);
   assert.ok(err instanceof Error);
   assert.equal((err as { code?: unknown }).code, "ECONNREFUSED");

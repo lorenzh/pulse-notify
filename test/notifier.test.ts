@@ -1,14 +1,15 @@
+import { afterEach, beforeEach, test } from "bun:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, test } from "node:test";
 import { Ledger } from "../src/ledger.ts";
 import { Notifier } from "../src/notifier.ts";
 import type { ChannelConfig, Schedule, Sleep } from "../src/types.ts";
 import {
   asRecord,
   type FakeApi,
+  fakeFetch,
   heartbeatCheck,
   httpCheck,
   incident,
@@ -162,10 +163,15 @@ test("a permanently down channel logs after 4 attempts and does not delay the he
     release = r;
   });
   let sleeping = 0;
+  let parkedFirst!: () => void;
+  const parked = new Promise<void>((r) => {
+    parkedFirst = r;
+  });
   const n = await started({
     retryAttempts: 4,
     sleep: async () => {
       sleeping++;
+      parkedFirst();
       await gate;
     },
   });
@@ -174,6 +180,7 @@ test("a permanently down channel logs after 4 attempts and does not delay the he
   await n.tick(); // returns although the webhook is retrying
   await logger.waitFor((e) => e.msg === "notification delivered" && e.fields.channel === "log");
   assert.equal(lines().length, 1);
+  await parked; // the retry wait follows a real HTTP reply, so Bun may reach it after the log line
   assert.equal(sleeping, 1); // the webhook worker is parked in its first retry wait
   assert.equal(
     logger.entries.some((e) => e.level === "error"),
@@ -448,10 +455,10 @@ test("a malformed incident is logged once; the others are delivered", async () =
 test("a stalled api body times out, is logged, and the next poll runs", async () => {
   let calls = 0;
   let timer: (() => void) | undefined;
-  const stalled: typeof fetch = async () => {
+  const stalled = fakeFetch(async () => {
     calls++;
     return new Response(new ReadableStream({ start() {} }), { status: 200 });
-  };
+  });
   const n = make({
     fetch: stalled,
     timeoutMs: 50,

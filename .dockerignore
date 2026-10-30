@@ -13,7 +13,6 @@ eslint.config.js
 lefthook*.yml
 tsconfig*.json
 .env*
-.npmrc
 *.db
 notify-state.json*
 Dockerfile

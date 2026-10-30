@@ -6,20 +6,20 @@ Instructions for coding agents in this repository. They bind every change.
 
 pulse is an uptime monitor with a status page, split over several repositories. Work arrives as an
 issue with an approved spec from the meta repository; implement only the section for this
-repository. Node 24+ with native type stripping, ESM, npm, strict TypeScript (`tsc --noEmit`),
-`node:test`, Biome, ESLint, Lefthook.
+repository. Bun 1.4.0 (runtime, package manager, test runner), ESM, strict TypeScript (`tsc --noEmit`),
+`bun:test`, Biome, ESLint, Lefthook.
 
 ## Commands
 
-| Task                                                          | Command                                    |
-| ------------------------------------------------------------- | ------------------------------------------ |
-| Install from the lockfile (also installs the pre-commit hook) | `npm ci`                                   |
-| All checks: CI runs the same steps                            | `npm run check`                            |
-| One test file                                                 | `node --test src/<name>.test.ts`           |
-| Tests whose name matches                                      | `node --test --test-name-pattern "<text>"` |
-| Typecheck                                                     | `npm run typecheck`                        |
-| Lint and format check / apply fixes                           | `npm run lint` / `npm run format`          |
-- A change is done when `npm run check` passes; the pre-commit hook runs Biome and ESLint. Never run `git commit --no-verify`, and never weaken the shared config (`biome.json`, `tsconfig.json`, CI) to pass.
+| Task                                                          | Command                                 |
+| ------------------------------------------------------------- | --------------------------------------- |
+| Install from the lockfile (also installs the pre-commit hook) | `bun install --frozen-lockfile`         |
+| All checks: CI runs the same steps                            | `bun run check`                         |
+| One test file                                                 | `bun test test/<name>.test.ts`          |
+| Tests whose name matches                                      | `bun test --test-name-pattern "<text>"` |
+| Typecheck                                                     | `bun run typecheck`                     |
+| Lint and format check / apply fixes                           | `bun run lint` / `bun run format`       |
+- A change is done when `bun run check` passes; the pre-commit hook runs Biome and ESLint. Never run `git commit --no-verify`, and never weaken the shared config (`biome.json`, `tsconfig.json`, CI) to pass.
 
 ## Repository boundaries
 
@@ -34,7 +34,7 @@ repository. Node 24+ with native type stripping, ESM, npm, strict TypeScript (`t
 
 ## TypeScript
 
-- The source runs unbuilt under Node type stripping: erasable syntax only (no `enum`, `namespace`, parameter properties). Use string-literal unions or `as const` objects.
+- The source runs unbuilt under Bun: erasable syntax only (no `enum`, `namespace`, parameter properties). Use string-literal unions or `as const` objects.
 - Relative imports carry the `.ts` extension. Built-ins use the `node:` prefix.
 - Type-only imports use `import type`; mixed imports mark types inline: `import { type X, y }`.
 - No `any`, also not in tests. Use `unknown` and narrow it, or the contract type.
@@ -73,13 +73,13 @@ repository. Node 24+ with native type stripping, ESM, npm, strict TypeScript (`t
 - No real clock and no real timers: inject `now` and a fake `setTimeout`, and advance them in the test.
 - No external network. Start servers on `127.0.0.1` port `0` inside the test and close them in `after`.
 - Each test writes only to its own `mkdtemp` directory or an in-memory database, and cleans it up.
-- `npm test` enforces at least 80 % line coverage and `npm run lint` limits cognitive complexity to 15 per function (SonarJS); never lower either to pass.
+- `bun test` enforces at least 80 % line coverage and `bun run lint` limits cognitive complexity to 15 per function (SonarJS); never lower either to pass.
 
 ## End-to-end checks
 
 - Each service has at least one test that starts its real server on port `0` and drives it over HTTP, with fake peers for other services.
 - A change to an endpoint or a response shape gets such a test, with the response typed by the contract.
-- Before handoff of a user-visible change, start the service with `npm start` and exercise the changed behavior once; report the command and result.
+- Before handoff of a user-visible change, start the service with `bun run start` and exercise the changed behavior once; report the command and result.
 
 ## Documentation
 
@@ -98,11 +98,11 @@ repository. Node 24+ with native type stripping, ESM, npm, strict TypeScript (`t
 
 ## This repository
 
-- Entry point and wiring: `src/index.ts` (`npm start` runs `node src/index.ts`). It reads the settings in `src/config.ts` (env reads use the pulse-kit readers; `run` wires `runService`) (`PULSE_NOTIFY_CONFIG` is required; other variables and defaults are in `README.md`).
+- Entry point and wiring: `src/index.ts` (`bun run start` runs `bun src/index.ts`). It reads the settings in `src/config.ts` (env reads use the pulse-kit readers; `run` wires `runService`) (`PULSE_NOTIFY_CONFIG` is required; other variables and defaults are in `README.md`).
 - Channels are sender functions in `src/channels/`: `webhook.ts` (with `signature.ts`), `file.ts`, `slack.ts`, `teams.ts`, `email.ts` (builds the message; `smtp-send.ts` sends it with nodemailer, the approved SMTP library; `mailer.ts` holds the mail types and EHLO name helpers). `src/channels/factory.ts` (`createSender`) builds the sender per config type; `routing.ts` decides which checks a channel gets; `message.ts` cleans text for chat and email; `http-post.ts` posts JSON without leaking the URL in errors. `src/notifier.ts` wires them. Channel config types are in `src/types.ts`; `src/config.ts` parses them with the zod `strictObject` schemas in `src/channel-schema.ts` (shape only), then resolves secrets from env or files in a separate step.
 - Permanent errors: `PermanentDeliveryError` in `src/errors.ts`, thrown by `http-post.ts` (4xx except 408 and 429) and `smtp-send.ts` (5xx reply); `src/delivery.ts` ends such an event at once. `src/redact.ts` strips user info and query from the API url for logs.
 - Logging, the ops server (`/healthz`, `/readyz`, `/metrics`), the metrics registry, `formatDuration` and shutdown come from `@lorenzh/pulse-kit`; `src/metrics.ts` only registers this service's series. `errorFields` stays in `src/errors.ts`.
-- Ledger: `src/ledger.ts` (format version 2, batched `settle` and prune, `flush()` at shutdown) and `src/ledger-lock.ts` (lease lock `<state>.lock`). The `failed list|resend` subcommand is `src/failed-cli.ts`, run by `runCli` in `src/index.ts` (`node src/index.ts failed ...`, exit 2 while the service holds the lock).
+- Ledger: `src/ledger.ts` (format version 2, batched `settle` and prune, `flush()` at shutdown) and `src/ledger-lock.ts` (lease lock `<state>.lock`). The `failed list|resend` subcommand is `src/failed-cli.ts`, run by `runCli` in `src/index.ts` (`bun src/index.ts failed ...`, exit 2 while the service holds the lock).
 - Reminders: `src/detector.ts` derives the key `<incident>:reminder:<n>` from the injected clock; `src/delivery.ts` drops a stale reminder (`isStale`).
 - `src/delivery.ts` takes `send`, `sleep`, and `ledger` as injected dependencies.
 - Tests live in `test/`, not next to the code, with helpers in `test/support.ts` (a local fake API server). They use fake senders or a local server on `127.0.0.1`, never a real webhook or mail server.

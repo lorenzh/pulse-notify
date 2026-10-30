@@ -1,5 +1,5 @@
+import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { test } from "node:test";
 import { errorFields } from "../src/errors.ts";
 
 test("errorFields walks the cause chain for code and innermost cause", () => {

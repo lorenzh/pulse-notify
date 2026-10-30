@@ -1,14 +1,14 @@
+import { afterAll, test } from "bun:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, test } from "node:test";
 import { ConfigError } from "../src/config.ts";
 import { type MainDeps, main, type Stoppable } from "../src/index.ts";
 import type { Schedule } from "../src/types.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-main-lock-"));
-after(() => rmSync(dir, { recursive: true, force: true }));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 let counter = 0;
 const configPath = join(dir, "config.json");

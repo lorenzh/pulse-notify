@@ -1,5 +1,5 @@
+import { beforeAll, test } from "bun:test";
 import assert from "node:assert/strict";
-import { before, test } from "node:test";
 import {
   ehloNameFrom,
   isEhloName,
@@ -12,7 +12,7 @@ import { decodeHeader, decodeMail } from "./mail-decode.ts";
 import { makeCert, startSmtpStub, startTlsSmtpStub, type TestCert } from "./smtp-stub.ts";
 
 let cert: TestCert;
-before(() => {
+beforeAll(() => {
   cert = makeCert();
 });
 

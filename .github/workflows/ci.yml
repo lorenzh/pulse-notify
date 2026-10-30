@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   check:
-    uses: lorenzh/pulse-config/.github/workflows/check.yml@dc7c69698f96e7babebc1e3cddc081d71e5a4201
+    uses: lorenzh/pulse-config/.github/workflows/check.yml@51e95b0eb463b27a196a33b428607bd92443e4f0
 
   docker:
     runs-on: ubuntu-latest

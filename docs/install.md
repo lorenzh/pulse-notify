@@ -2,16 +2,16 @@
 
 pulse-notify needs a running pulse-api and a channel config file (see [configuration.md](configuration.md)).
 
-## npm
+## Bun
 
-Requires Node 24 or newer.
+Requires Bun 1.4.0.
 
 ```sh
-npm ci
-PULSE_NOTIFY_CONFIG=./notify.json PULSE_API_URL=http://localhost:3000 npm start
+bun install --frozen-lockfile
+PULSE_NOTIFY_CONFIG=./notify.json PULSE_API_URL=http://localhost:3000 bun run start
 ```
 
-`npm start` runs `node src/index.ts`. The source runs unbuilt with Node type stripping. Stop it with `SIGINT` or `SIGTERM`; it exits with code 0.
+`bun run start` runs `bun src/index.ts`. The source runs unbuilt with Bun. Stop it with `SIGINT` or `SIGTERM`; it exits with code 0.
 
 If `PULSE_NOTIFY_CONFIG` is missing or the config is invalid, it prints `pulse-notify: <message>` to stderr and exits with code 2.
 
@@ -27,9 +27,9 @@ docker run --rm \
   pulse-notify:local
 ```
 
-- The image runs as the non-root `node` user and starts `node src/index.ts`. It has no healthcheck and exposes no port.
+- The image runs as the non-root `bun` user and starts `bun src/index.ts`. It has no healthcheck and exposes no port.
 - The image contains no config. Mount your file and point `PULSE_NOTIFY_CONFIG` at it.
-- `/data` is owned by `node`. The image sets `PULSE_NOTIFY_STATE=/data/notify-state.json`. Mount a volume at `/data` to keep the delivery ledger across restarts. See [operation.md](operation.md).
+- `/data` is owned by `bun`. The image sets `PULSE_NOTIFY_STATE=/data/notify-state.json`. Mount a volume at `/data` to keep the delivery ledger across restarts. See [operation.md](operation.md).
 - A `file` channel needs a path under a writable directory such as `/data`, for example `/data/incidents.jsonl`.
 - The image holds only production dependencies and `src`, and no secrets.
 

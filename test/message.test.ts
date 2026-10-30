@@ -1,5 +1,5 @@
+import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { test } from "node:test";
 import { cleanText, messageParts } from "../src/channels/message.ts";
 import { slackText } from "../src/channels/slack.ts";
 import { teamsCard } from "../src/channels/teams.ts";

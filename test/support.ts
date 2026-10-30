@@ -188,3 +188,10 @@ export function manualIncident(over: Partial<ManualIncident> & { id: number }): 
     ...over,
   };
 }
+
+type FetchCall = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+/** Gives a fake the full `typeof fetch` shape, which Bun's types extend with `preconnect`. */
+export function fakeFetch(call: FetchCall): typeof fetch {
+  return Object.assign(call, { preconnect: () => {} });
+}

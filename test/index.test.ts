@@ -1,3 +1,4 @@
+import { afterAll, test } from "bun:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -5,14 +6,13 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, test } from "node:test";
 import { StartupError } from "@lorenzh/pulse-kit";
 import { ConfigError } from "../src/config.ts";
 import { main, run, type Stoppable } from "../src/index.ts";
 import { close, listen } from "./support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-main-"));
-after(() => rmSync(dir, { recursive: true, force: true }));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 function fakeProc() {
   const handlers: Record<string, () => void> = {};
@@ -207,7 +207,7 @@ test("an occupied health port rejects with one startup error and no started log 
   const blocker = createServer();
   await listen(blocker);
   const busy = (blocker.address() as AddressInfo).port;
-  after(() => close(blocker));
+  afterAll(() => close(blocker));
   const configPath = join(dir, "c5.json");
   writeFileSync(
     configPath,
@@ -246,7 +246,7 @@ test("an occupied health port rejects with one startup error and no started log 
 test("entry point: occupied health port prints one line and exits 2", async () => {
   const blocker = createServer();
   await listen(blocker);
-  after(() => close(blocker));
+  afterAll(() => close(blocker));
   const busy = (blocker.address() as AddressInfo).port;
   const configPath = join(dir, "c6.json");
   writeFileSync(

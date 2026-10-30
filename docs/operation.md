@@ -28,14 +28,14 @@ Cost: after a hard crash on another host, a restart there is refused for up to o
 An event that ends as `failed` (a [permanent error](channels.md#delivery-and-retries) or the last attempt) keeps its notification in the ledger. With the service stopped, list and resend them:
 
 ```sh
-node src/index.ts failed list
-node src/index.ts failed resend 12:opened
-node src/index.ts failed resend 12:opened --channel ops-hook
-node src/index.ts failed resend --all
-node src/index.ts failed resend --all --channel ops-hook
+bun src/index.ts failed list
+bun src/index.ts failed resend 12:opened
+bun src/index.ts failed resend 12:opened --channel ops-hook
+bun src/index.ts failed resend --all
+bun src/index.ts failed resend --all --channel ops-hook
 ```
 
-(In Docker: `docker run --rm -v pulse-notify-data:/data -e PULSE_NOTIFY_STATE=/data/notify-state.json pulse-notify:local node src/index.ts failed list`.)
+(In Docker: `docker run --rm -v pulse-notify-data:/data -e PULSE_NOTIFY_STATE=/data/notify-state.json pulse-notify:local bun src/index.ts failed list`.)
 
 - `failed list` prints one tab-separated line per failed entry: channel, key, failure time (UTC), event, and `payload` or `no payload`. With no entries it prints `no failed notifications` and exits 0.
 - `failed resend` sets the entry back to `pending` with the same key and stored notification. The service sends it at its next start through the normal pending path, with the same `idempotency-key`. Reminders go through the same stale check, so a resent reminder of a resolved incident is dropped.

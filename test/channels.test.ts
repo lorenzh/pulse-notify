@@ -1,9 +1,9 @@
+import { afterEach, beforeEach, test } from "bun:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, test } from "node:test";
 import type { MailMessage, SendMail, SmtpOptions } from "../src/channels/mailer.ts";
 import { Ledger } from "../src/ledger.ts";
 import { Metrics } from "../src/metrics.ts";
@@ -12,6 +12,7 @@ import type { ChannelConfig } from "../src/types.ts";
 import {
   asRecord,
   type FakeApi,
+  fakeFetch,
   httpCheck,
   incident,
   type Receiver,
@@ -122,12 +123,12 @@ test("teams gets a message with an adaptive card; 202 is success", async () => {
 test("HTTP 500 and 429 are retried until delivered; redirects fail", async () => {
   const statuses = [500, 429, 200];
   let calls = 0;
-  const fetchFn: typeof fetch = async (input, init) => {
+  const fetchFn = fakeFetch(async (input, init) => {
     const url = String(input);
     if (url.startsWith(api.url)) return fetch(input, init);
     const status = statuses[calls++] ?? 200;
     return new Response(null, { status });
-  };
+  });
   const n = new Notifier({
     config: {
       channels: [{ id: "s", type: "slack", url: "https://hooks.example.test/T/secret-path" }],
