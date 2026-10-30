@@ -72,8 +72,8 @@ Every channel can limit the checks it reports:
 Set `remindEverySeconds` (an integer of at least 60) on a channel to get a "still down" message while an incident stays open. It works for every channel type.
 
 - The event is `reminder`, the key is `<incidentId>:reminder:<n>` with `n = floor((now - openedAt) / interval)`. The first reminder comes one interval after the incident opened.
-- `time` and `timeMs` are the reminder time. `openedMs` gives the incident's start, so the age is `timeMs - openedMs`. Chat and email messages show it as `Open for`.
-- After a restart, a pending reminder is held until the first successful poll, then dropped if its incident resolved or a newer reminder exists. Nothing is repeated, because `n` is derived from the clock and the ledger holds the key.
+- `time` and `timeMs` are the reminder time. `openedMs` gives the incident's start, so the age is `timeMs - openedMs`. Chat and email messages show it as `Open for`. Whole hours or days read `1h`, not `1h 0m` (`formatDuration` of pulse-kit).
+- After a restart, a pending reminder is held until the first successful poll, then dropped if its incident resolved or a newer reminder exists. A reminder is superseded by a newer one of the same incident that is queued or in the ledger with any status except `dropped`. Nothing is repeated, because `n` is derived from the clock and the ledger holds the key.
 - After an outage of pulse-notify or the channel only the latest due reminder is sent, not one for every missed interval.
 - A new channel starts with the current `n`: reminders for incidents that are already open begin at the next interval.
 - Switching `remindEverySeconds` on for an existing channel does the same: at the first poll the due reminder of every open incident is recorded as `seeded` and nothing is sent, so there is no burst. The ledger stores the time as `remindersFrom` for the channel. Later incidents and later intervals remind normally. Removing `remindEverySeconds` drops `remindersFrom`, so switching it on again seeds again. Known limit: after an upgrade from a version 1 ledger, one due reminder per open incident is skipped once.

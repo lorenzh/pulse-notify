@@ -25,13 +25,15 @@ pulse-notify reads environment variables and one JSON config file. Both are read
 
 The schedule is in [channels.md](channels.md#delivery-and-retries).
 
-- The numeric variables must be non-negative integers. Anything else stops startup with `<NAME> must be a non-negative integer`.
-- `PULSE_NOTIFY_RETRY_MAX_DELAY_MS` below `PULSE_NOTIFY_RETRY_DELAY_MS` stops startup with `PULSE_NOTIFY_RETRY_MAX_DELAY_MS must be at least PULSE_NOTIFY_RETRY_DELAY_MS`.
+- The numeric variables must be integers within their bound. Anything else stops startup with `<NAME>: must be an integer of at least <min>`, for example `PULSE_NOTIFY_POLL_MS: must be an integer of at least 1`. `PULSE_NOTIFY_RETRY_ATTEMPTS` allows `0`: `PULSE_NOTIFY_RETRY_ATTEMPTS: must be an integer >= 0`.
+- `PULSE_NOTIFY_RETRY_MAX_DELAY_MS` below `PULSE_NOTIFY_RETRY_DELAY_MS` stops startup with `PULSE_NOTIFY_RETRY_MAX_DELAY_MS: must be at least PULSE_NOTIFY_RETRY_DELAY_MS`.
 - `PULSE_API_URL` must be an `http:` or `https:` URL. The startup log and every log line or error that carries it show the URL without user info, query and fragment; an error about it never repeats the value.
 - An empty value counts as unset, so the default applies.
 - Example: `PULSE_NOTIFY_POLL_MS=30000` polls every 30 seconds.
 
 ## Channel config file
+
+A shape error in a channel names the channel id, for example `channel "mail": smtp.port must be an integer from 1 to 65535`. This form is deliberate: the id tells which channel to fix. An error about the file as a whole reads `config must be an object`.
 
 `PULSE_NOTIFY_CONFIG` points to a JSON file:
 

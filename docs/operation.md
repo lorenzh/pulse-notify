@@ -126,7 +126,7 @@ The listener binds before polling starts. If the bind fails, the service prints 
 
 ## API validation and version check
 
-The API calls go through `fetchJson` of `@lorenzh/pulse-contract`, which owns the timeout, the size cap and the wire check. Every item from `GET /incidents` and `GET /checks` is validated with the validators of `@lorenzh/pulse-contract` (`validateIncident`, `validateCheck`). An invalid incident or check is skipped and logged once with a path such as `incidents[0].checkId: ...`. Incidents also need `openedAt` and `resolvedAt` inside the range of `Date`.
+The API calls go through `fetchJson` of `@lorenzh/pulse-contract`, which owns the timeout, the size cap and the wire check. Every item from `GET /incidents` and `GET /checks` is validated with the validators of `@lorenzh/pulse-contract` (`validateIncident`, `validateCheck`). An invalid incident or check is skipped and logged once with a path such as `incidents[0].checkId: ...`. Incidents also need `openedAt` and `resolvedAt` inside the range of `Date` (±8.64e15 ms). The validators enforce the bounds of the contract; an item outside them is skipped, the other items are still used.
 
 A response body is read as a stream and stops at `PULSE_NOTIFY_API_MAX_BYTES` (default 5 MiB). A `Content-Length` over the cap fails at once; a body that grows past the cap is cut off even without or with a wrong length. Both fail the poll and count as a failed poll.
 

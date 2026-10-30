@@ -248,6 +248,25 @@ test("the marker is removed when the takeover fails", () => {
   assert.equal(read(state).token, "old");
 });
 
+test("the marker is taken during a successful takeover and removed after acquisition", () => {
+  const state = statePath();
+  writeLock(state, { pid: 55, hostname: "host-a", token: "old", heartbeat: 1 });
+  let isMarkerSeen = false;
+  const lock = acquireLock(
+    state,
+    deps({
+      isPidAlive: () => false,
+      afterMarker: () => {
+        isMarkerSeen = existsSync(`${state}.lock.takeover`);
+      },
+    }),
+  );
+  assert.equal(isMarkerSeen, true);
+  assert.equal(read(state).token, "token-own");
+  assert.equal(existsSync(`${state}.lock.takeover`), false);
+  lock.release();
+});
+
 test("the parent directory is created before the lock", () => {
   const state = join(dir, "a", "b", "state.json");
   const lock = acquireLock(state, deps());

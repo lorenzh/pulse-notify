@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -63,21 +63,37 @@ test("a claim during a paused batch write is not erased by the batch rename", as
   assert.equal(raw.channels.ch["2:opened"].status, "pending");
 });
 
-test("a failed batch write keeps the ledger dirty so a later flush persists", async () => {
+test("a failed rewrite after the batch rename keeps the ledger dirty so a later flush persists", async () => {
   const file = path();
-  let isFailing = true;
+  let release: () => void = () => {};
+  let paused: () => void = () => {};
+  const isPaused = new Promise<void>((resolve) => {
+    paused = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
   const ledger = new Ledger(file, {
     schedule: () => () => {},
     hooks: {
       beforeRename: async () => {
-        if (isFailing) throw new Error("disk gone");
+        paused();
+        await gate;
       },
     },
   });
-  ledger.claim("ch", "k", note("k"));
-  ledger.settle("ch", "k", "delivered");
-  await assert.rejects(ledger.flush(), /disk gone/);
-  isFailing = false;
+  ledger.claim("ch", "1:opened", note("1:opened"));
+  ledger.settle("ch", "1:opened", "delivered");
+  const flushed = ledger.flush();
+  await isPaused;
+  ledger.claim("ch", "2:opened", note("2:opened"));
+  // A directory in the way makes the rewrite after the rename fail; the rename itself succeeds.
+  mkdirSync(`${file}.tmp`);
+  release();
+  await assert.rejects(flushed);
+  rmSync(`${file}.tmp`, { recursive: true });
   await ledger.flush();
-  assert.equal(new Ledger(file).status("ch", "k"), "delivered");
+  const onDisk = new Ledger(file);
+  assert.equal(onDisk.status("ch", "2:opened"), "pending");
+  assert.equal(onDisk.status("ch", "1:opened"), "delivered");
 });
