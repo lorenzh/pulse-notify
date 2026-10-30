@@ -77,7 +77,7 @@ Notify also reads `GET /manual-incidents` and announces each manual incident: on
 - The payload has `incidentId` (the manual id), `checkName` (the title), an empty `checkId` and `reason: null`, plus `manual`: `{ impact, status, message, componentIds }`. `message` is the text of the update the event is about. `time` is the update time.
 - Chat and email messages show title, impact, status, the message and the component ids; control characters are cleaned and chat markup is escaped.
 - On the first start of a channel, existing manual incidents are recorded without sending.
-- An api that answers 404 for `/manual-incidents` (older version) counts as having none. Other failures fail the poll.
+- An api that answers 404 for `/manual-incidents` (older version) counts as having none. Other failures fail the poll, but automatic incidents are still delivered; see [operation.md](operation.md#failing-feeds).
 
 ## Reminders
 

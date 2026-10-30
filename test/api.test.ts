@@ -101,7 +101,7 @@ test("a non-2xx status wins over a wire version mismatch", async () => {
   );
   await assert.rejects(
     fetchChecks({ baseUrl: base, fetch: fetchFn }),
-    /^Error: GET checks returned 503$/,
+    /^ApiReadError: GET checks returned 503$/,
   );
 });
 
@@ -118,7 +118,7 @@ test("a stalled call times out through the injected schedule", async () => {
   };
   await assert.rejects(
     fetchChecks({ baseUrl: base, fetch: fetchFn, timeoutMs: 1234, schedule }),
-    /^Error: timeout after 1234ms$/,
+    /^ApiReadError: timeout after 1234ms$/,
   );
 });
 

@@ -454,7 +454,11 @@ test("a malformed incident is logged once; the others are delivered", async () =
 
 test("a stalled api body times out, is logged, and the next poll runs", async () => {
   let calls = 0;
-  let timer: (() => void) | undefined;
+  // One timeout per feed: every feed read settles before the poll ends.
+  const timers: (() => void)[] = [];
+  const fireTimers = (): void => {
+    for (const fn of timers.splice(0)) fn();
+  };
   const stalled = fakeFetch(async () => {
     calls++;
     return new Response(new ReadableStream({ start() {} }), { status: 200 });
@@ -463,20 +467,20 @@ test("a stalled api body times out, is logged, and the next poll runs", async ()
     fetch: stalled,
     timeoutMs: 50,
     schedule: (fn) => {
-      timer = fn;
+      timers.push(fn);
       return () => {};
     },
   });
   const polling = n.tick();
   await tick();
-  timer?.();
+  fireTimers();
   await polling;
   const failed = logger.entries.find((e) => e.msg === "api poll failed");
   assert.equal(failed?.fields.error, "timeout after 50ms");
   const first = calls;
   const second = n.tick();
   await tick();
-  timer?.();
+  fireTimers();
   await second;
   assert.ok(calls > first);
 });
