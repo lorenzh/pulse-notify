@@ -1,10 +1,11 @@
 import { afterAll, test } from "bun:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger } from "../src/ledger.ts";
 import type { Notification } from "../src/types.ts";
+import { recordingFs } from "./support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-ledger-race-"));
 afterAll(() => {
@@ -73,7 +74,9 @@ test("a failed rewrite after the batch rename keeps the ledger dirty so a later 
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
+  const fs = recordingFs();
   const ledger = new Ledger(file, {
+    fs,
     schedule: () => () => {},
     hooks: {
       beforeRename: async () => {
@@ -87,12 +90,41 @@ test("a failed rewrite after the batch rename keeps the ledger dirty so a later 
   const flushed = ledger.flush();
   await isPaused;
   ledger.claim("ch", "2:opened", note("2:opened"));
-  // A directory in the way makes the rewrite after the rename fail; the rename itself succeeds.
-  mkdirSync(`${file}.tmp`);
+  // The rewrite after the rename fails at its temp file; the rename itself succeeds.
+  fs.faults.isOpenTempFailing = true;
   release();
   await assert.rejects(flushed);
-  rmSync(`${file}.tmp`, { recursive: true });
+  fs.faults.isOpenTempFailing = false;
   await ledger.flush();
+  const onDisk = new Ledger(file);
+  assert.equal(onDisk.status("ch", "2:opened"), "pending");
+  assert.equal(onDisk.status("ch", "1:opened"), "delivered");
+});
+
+test("a failed directory fsync of the batch still rewrites a claim that slipped in", async () => {
+  const file = path();
+  const gate = Promise.withResolvers<void>();
+  const pause = Promise.withResolvers<void>();
+  const fs = recordingFs();
+  const ledger = new Ledger(file, {
+    fs,
+    schedule: () => () => {},
+    hooks: {
+      beforeRename: async () => {
+        pause.resolve();
+        await gate.promise;
+      },
+    },
+  });
+  ledger.claim("ch", "1:opened", note("1:opened"));
+  ledger.settle("ch", "1:opened", "delivered");
+  const flushed = ledger.flush();
+  await pause.promise;
+  ledger.claim("ch", "2:opened", note("2:opened"));
+  // Only the batch fails: the claim above already ran its directory fsync.
+  fs.faults.isDirFsyncFailing = true;
+  gate.resolve();
+  await assert.rejects(flushed, /at sync-dir/);
   const onDisk = new Ledger(file);
   assert.equal(onDisk.status("ch", "2:opened"), "pending");
   assert.equal(onDisk.status("ch", "1:opened"), "delivered");

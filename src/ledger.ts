@@ -1,14 +1,15 @@
-import {
-  closeSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  writeSync,
-} from "node:fs";
-import { open, rename, unlink } from "node:fs/promises";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
+import {
+  AtomicWriteError,
+  type AtomicWriteFs,
+  type AtomicWriteSyncFs,
+  isRecord,
+  nodeAtomicWriteFs,
+  nodeAtomicWriteSyncFs,
+  writeFileAtomic,
+  writeFileAtomicSync,
+} from "@lorenzh/pulse-kit";
 import type { Notification, Schedule } from "./types.ts";
 
 /**
@@ -40,10 +41,6 @@ interface LedgerData {
   remindersFrom?: Record<string, number>;
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function isStatus(value: unknown): value is LedgerStatus {
   return STATUSES.some((s) => s === value);
 }
@@ -57,7 +54,7 @@ function migrateEntries(
   for (const [key, value] of Object.entries(rawEntries)) {
     if (version === 1 && isStatus(value)) {
       entries[key] = { status: value, at: loadedAt };
-    } else if (isObject(value) && isStatus(value.status) && typeof value.at === "number") {
+    } else if (isRecord(value) && isStatus(value.status) && typeof value.at === "number") {
       entries[key] = { status: value.status, at: value.at };
     } else {
       return undefined;
@@ -69,19 +66,19 @@ function migrateEntries(
 /** Trust boundary: reads the file content as far as the ledger relies on it. */
 function migrate(raw: unknown, loadedAt: number, path: string): LedgerData {
   const bad = (): Error => new Error(`ledger ${path} has an unsupported format`);
-  if (!isObject(raw) || !isObject(raw.channels)) throw bad();
+  if (!isRecord(raw) || !isRecord(raw.channels)) throw bad();
   if (raw.version !== 1 && raw.version !== LEDGER_VERSION) throw bad();
   const channels: LedgerData["channels"] = {};
   for (const [id, rawEntries] of Object.entries(raw.channels)) {
-    const entries = isObject(rawEntries)
+    const entries = isRecord(rawEntries)
       ? migrateEntries(rawEntries, raw.version, loadedAt)
       : undefined;
     if (!entries) throw bad();
     channels[id] = entries;
   }
   const data: LedgerData = { version: LEDGER_VERSION, channels };
-  if (isObject(raw.payloads)) data.payloads = raw.payloads as LedgerData["payloads"] & object;
-  if (raw.version === LEDGER_VERSION && isObject(raw.remindersFrom)) {
+  if (isRecord(raw.payloads)) data.payloads = raw.payloads as LedgerData["payloads"] & object;
+  if (raw.version === LEDGER_VERSION && isRecord(raw.remindersFrom)) {
     data.remindersFrom = raw.remindersFrom as Record<string, number>;
   }
   return data;
@@ -124,6 +121,8 @@ export interface LedgerOptions {
   onError?: (err: Error) => void;
   /** Test only: lets a test pause a batched write between its temp file and the rename. */
   hooks?: { beforeRename?: () => Promise<void> };
+  /** File operations of the atomic writes. Default: the node fs of pulse-kit. */
+  fs?: { sync?: AtomicWriteSyncFs; async?: AtomicWriteFs };
 }
 
 /**
@@ -140,6 +139,8 @@ export class Ledger {
   readonly #schedule: Schedule;
   readonly #onError: (err: Error) => void;
   readonly #beforeRename: (() => Promise<void>) | undefined;
+  readonly #syncFs: AtomicWriteSyncFs;
+  readonly #asyncFs: AtomicWriteFs;
   #data: LedgerData;
   #isDirty = false;
   #isClosed = false;
@@ -155,6 +156,8 @@ export class Ledger {
     this.#schedule = opts.schedule ?? unrefSchedule;
     this.#onError = opts.onError ?? (() => {});
     this.#beforeRename = opts.hooks?.beforeRename;
+    this.#syncFs = opts.fs?.sync ?? nodeAtomicWriteSyncFs;
+    this.#asyncFs = opts.fs?.async ?? nodeAtomicWriteFs;
     this.#data = this.#load();
   }
 
@@ -174,15 +177,7 @@ export class Ledger {
   /** Writes the whole current state to disk before it returns. */
   #writeSync(): void {
     mkdirSync(dirname(this.#path), { recursive: true });
-    const tmp = `${this.#path}.tmp`;
-    const fd = openSync(tmp, "w");
-    try {
-      writeSync(fd, JSON.stringify(this.#data));
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(tmp, this.#path);
+    writeFileAtomicSync(this.#path, JSON.stringify(this.#data), { fs: this.#syncFs });
     this.#syncWrites++;
     this.#isDirty = false;
     this.#cancelTimer?.();
@@ -222,34 +217,35 @@ export class Ledger {
     if (!this.#isDirty || this.#isClosed) return;
     const syncWrites = this.#syncWrites;
     const text = JSON.stringify(this.#data);
-    const tmp = `${this.#path}.batch.tmp`;
     try {
-      const file = await open(tmp, "w");
-      try {
-        await file.writeFile(text);
-        await file.sync();
-      } finally {
-        await file.close();
-      }
-      if (syncWrites !== this.#syncWrites || this.#isClosed) {
-        // A sync write saved a newer state meanwhile; renaming this snapshot would undo it.
-        await discard(tmp);
-        return;
-      }
-      await this.#beforeRename?.();
-      await rename(tmp, this.#path);
-      // The rename above is the only point where a sync write can slip in unseen: re-check.
-      if (syncWrites !== this.#syncWrites) {
-        if (!this.#isClosed) this.#writeSync();
-      } else {
-        this.#isDirty = this.#hasChangedSince(text);
-      }
-    } catch (err) {
-      this.#isDirty = true;
-      await discard(tmp).catch(() => {
-        // Best effort: the original error is the one to report.
+      const isPublished = await writeFileAtomic(this.#path, text, {
+        fs: this.#asyncFs,
+        beforeRename: async () => {
+          // A sync write saved a newer state meanwhile; renaming this snapshot would undo it.
+          if (syncWrites !== this.#syncWrites || this.#isClosed) return false;
+          await this.#beforeRename?.();
+          return true;
+        },
       });
+      if (isPublished) this.#recheckAfterRename(syncWrites, text);
+    } catch (err) {
+      // After a failed directory fsync the snapshot is renamed already: repair a raced sync write.
+      const isRenamed = err instanceof AtomicWriteError && err.stage === "sync-dir";
+      try {
+        if (isRenamed) this.#recheckAfterRename(syncWrites, text);
+      } finally {
+        this.#isDirty = true;
+      }
       throw err;
+    }
+  }
+
+  /** The rename is the only point where a sync write can slip in unseen: re-check. */
+  #recheckAfterRename(syncWrites: number, text: string): void {
+    if (syncWrites !== this.#syncWrites) {
+      if (!this.#isClosed) this.#writeSync();
+    } else {
+      this.#isDirty = this.#hasChangedSince(text);
     }
   }
 
@@ -499,12 +495,3 @@ const unrefSchedule: Schedule = (fn, ms) => {
   timer.unref();
   return () => clearTimeout(timer);
 };
-
-/** Removes a temp file; a missing file is fine. */
-async function discard(tmp: string): Promise<void> {
-  try {
-    await unlink(tmp);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-  }
-}

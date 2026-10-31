@@ -1,10 +1,11 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Ledger } from "../src/ledger.ts";
 import type { Notification } from "../src/types.ts";
+import { recordingFs } from "./support.ts";
 
 function note(key: string): Notification {
   return {
@@ -87,14 +88,42 @@ test("settle removes the payload; a ledger without payloads loads", async () => 
 
 test("a failed sync write leaves the state unchanged", () => {
   const path = tmpPath();
-  const ledger = new Ledger(path);
+  const fs = recordingFs();
+  const ledger = new Ledger(path, { fs });
   ledger.seed("c", []);
-  // A directory at the temp path makes the write fail.
-  mkdirSync(`${path}.tmp`);
+  fs.faults.isOpenTempFailing = true;
   assert.throws(() => ledger.claim("c", "1:opened", note("1:opened")));
   assert.equal(ledger.has("c", "1:opened"), false);
   assert.throws(() => ledger.seed("d", []));
   assert.equal(ledger.hasChannel("d"), false);
-  rmSync(`${path}.tmp`, { recursive: true });
+  fs.faults.isOpenTempFailing = false;
   assert.equal(ledger.claim("c", "1:opened", note("1:opened")), true);
+});
+
+const DURABLE_STEPS = ["fsync:file", "rename", "open:dir", "fsync:dir"];
+
+test("a claim and a flushed batch fsync the temp file, rename, then fsync the directory", async () => {
+  const path = tmpPath();
+  const fs = recordingFs();
+  const ledger = new Ledger(path, { fs, schedule: () => () => {} });
+  ledger.claim("c", "1:opened", note("1:opened"));
+  assert.deepEqual(fs.steps, DURABLE_STEPS);
+  fs.steps.length = 0;
+  ledger.settle("c", "1:opened", "delivered");
+  await ledger.flush();
+  assert.deepEqual(fs.steps, DURABLE_STEPS);
+  assert.equal(new Ledger(path).status("c", "1:opened"), "delivered");
+});
+
+test("a write interrupted before the rename keeps the old file and leaves no temp file", () => {
+  const path = tmpPath();
+  mkdirSync(dirname(path), { recursive: true });
+  const before = '{"version":2,"channels":{"c":{}}}';
+  writeFileSync(path, before);
+  const fs = recordingFs();
+  const ledger = new Ledger(path, { fs });
+  fs.faults.isTempFsyncFailing = true;
+  assert.throws(() => ledger.claim("c", "1:opened", note("1:opened")), /at write/);
+  assert.equal(readFileSync(path, "utf8"), before);
+  assert.deepEqual(readdirSync(dirname(path)), ["state.json"]);
 });

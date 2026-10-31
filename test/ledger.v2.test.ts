@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger, WRITE_BATCH_MS } from "../src/ledger.ts";
 import type { Notification, Schedule } from "../src/types.ts";
+import { recordingFs } from "./support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-ledger2-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -232,7 +233,8 @@ test("resend of a failed key without a payload is refused", () => {
 
 test("a failed seed or claim rolls back its change, including pruned reminders", async () => {
   const file = path();
-  const ledger = new Ledger(file, { schedule: fakeSchedule().schedule });
+  const fs = recordingFs();
+  const ledger = new Ledger(file, { schedule: fakeSchedule().schedule, fs });
   const reminder = (n: number): Notification => ({
     ...note(`1:reminder:${n}`),
     event: "reminder",
@@ -240,15 +242,16 @@ test("a failed seed or claim rolls back its change, including pruned reminders",
   ledger.claim("c", "1:reminder:1", reminder(1));
   ledger.settle("c", "1:reminder:1", "delivered");
   await ledger.flush();
-  const { mkdirSync } = await import("node:fs");
-  mkdirSync(`${file}.tmp`);
+  fs.faults.isOpenTempFailing = true;
   assert.throws(() => ledger.claim("c", "1:reminder:2", reminder(2)));
   assert.equal(ledger.status("c", "1:reminder:1"), "delivered");
   assert.equal(ledger.has("c", "1:reminder:2"), false);
   assert.throws(() => ledger.seed("c", ["z"], 7));
   assert.equal(ledger.has("c", "z"), false);
   assert.equal(ledger.remindersFrom("c"), undefined);
-  rmSync(`${file}.tmp`, { recursive: true });
+  fs.faults.isOpenTempFailing = false;
+  ledger.claim("c", "1:reminder:2", reminder(2));
+  assert.equal(new Ledger(file).status("c", "1:reminder:2"), "pending");
 });
 
 test("close stops batched writes", async () => {
