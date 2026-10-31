@@ -78,7 +78,8 @@ case_dotenv() {
       show_container "$name"
       fail "container exited $(docker inspect --format '{{.State.ExitCode}}' "$name")"
     fi
-    if docker exec "$name" "${health[@]}" >/dev/null 2>&1; then
+    # docker exec waits for the command, so bound each probe; the deadline check needs it to return.
+    if timeout -k 2 5 docker exec "$name" "${health[@]}" >/dev/null 2>&1; then
       break
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
@@ -87,7 +88,7 @@ case_dotenv() {
     fi
     sleep 0.5
   done
-  docker exec "$name" sh -c "test -r /app/$file && test -s /app/$file" || fail "/app/$file is missing or unreadable"
+  timeout -k 2 10 docker exec "$name" sh -c "test -r /app/$file && test -s /app/$file" || fail "/app/$file is missing or unreadable"
   if docker logs "$name" 2>&1 | grep -q "$marker"; then
     fail "logs contain the marker"
   fi
