@@ -16,5 +16,5 @@ COPY package.json ./
 COPY src ./src
 USER bun
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD ["bun", "-e", "fetch('http://127.0.0.1:9100/healthz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
-CMD ["bun", "src/index.ts"]
+  CMD ["bun", "--no-env-file", "-e", "fetch('http://127.0.0.1:9100/healthz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+CMD ["bun", "--no-env-file", "src/index.ts"]

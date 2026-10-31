@@ -11,7 +11,7 @@
   "scripts": {
     "typecheck": "bun node_modules/typescript7/bin/tsc --noEmit",
     "test": "bun test",
-    "lint": "biome check . && pulse-eslint .",
+    "lint": "biome check . && pulse-eslint . && pulse-workflows",
     "format": "biome check --write .",
     "prepare": "lefthook install || true",
     "check": "bun run lint && bun run typecheck && bun run test",
@@ -19,7 +19,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.6.3",
-    "@lorenzh/pulse-config": "github:lorenzh/pulse-config#dc69a126bebbe50d8a7339ea1325d51b2ea43d7d",
+    "@lorenzh/pulse-config": "github:lorenzh/pulse-config#04108fa0c67d9a79c0f6d1ade4dd78df3ad8a4a7",
     "@types/node": "26.6.6",
     "@types/nodemailer": "8.0.2",
     "lefthook": "2.2.2",
@@ -27,7 +27,7 @@
     "typescript7": "npm:typescript@7.0.2"
   },
   "dependencies": {
-    "@lorenzh/pulse-contract": "github:lorenzh/pulse-contract#61f7bf88c38ab4827fb47e9409e18d37b9a7ccd3",
+    "@lorenzh/pulse-contract": "github:lorenzh/pulse-contract#ebcbbb613328494185833f7133f1242910986948",
     "@lorenzh/pulse-kit": "github:lorenzh/pulse-kit#fa79ba8cd93949fc0cf87f7b41bdaf261dbe4dc6",
     "nodemailer": "10.3.1",
     "zod": "4.6.7"

@@ -35,7 +35,7 @@ bun src/index.ts failed resend --all
 bun src/index.ts failed resend --all --channel ops-hook
 ```
 
-(In Docker: `docker run --rm -v pulse-notify-data:/data -e PULSE_NOTIFY_STATE=/data/notify-state.json pulse-notify:local bun src/index.ts failed list`.)
+(In Docker: `docker run --rm -v pulse-notify-data:/data -e PULSE_NOTIFY_STATE=/data/notify-state.json pulse-notify:local bun --no-env-file src/index.ts failed list`.)
 
 - `failed list` prints one tab-separated line per failed entry: channel, key, failure time (UTC), event, and `payload` or `no payload`. With no entries it prints `no failed notifications` and exits 0.
 - `failed resend` sets the entry back to `pending` with the same key and stored notification. The service sends it at its next start through the normal pending path, with the same `idempotency-key`. Reminders go through the same stale check, so a resent reminder of a resolved incident is dropped.

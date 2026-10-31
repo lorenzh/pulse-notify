@@ -37,6 +37,8 @@ docker run --rm \
   pulse-notify:local
 ```
 
+The image starts `bun --no-env-file src/index.ts`, so a `.env` mounted into `/app` is not read. Settings come from `-e`, `docker run --env-file` (read on the host), Compose, or the files named by the `secretFile`/`urlFile` channel keys ([configuration](docs/configuration.md)).
+
 Released images are published as `ghcr.io/lorenzh/pulse-notify` for linux/amd64 and linux/arm64. Use one in place of `pulse-notify:local`, and pin it by digest in a setup:
 
 ```sh

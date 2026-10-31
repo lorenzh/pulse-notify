@@ -29,9 +29,9 @@ bun test test/<name>.test.ts             # one test file
 
 ## Lint and hooks
 
-- `bun run lint` runs Biome and SonarJS through ESLint (cognitive complexity of 15 or less per function). `bun run format` applies Biome fixes.
+- `bun run lint` runs Biome, SonarJS through ESLint (cognitive complexity of 15 or less per function), and `pulse-workflows` from pulse-config: every action in `.github/workflows` is pinned to an approved SHA, every checkout sets `persist-credentials: false`, and the `uses:` refs of pulse-config equal the `package.json` pin. `bun run format` applies Biome fixes.
 - Lefthook runs two pre-commit commands on staged files: `biome check`, and `pulse-eslint` (the same ESLint config as `bun run lint`: SonarJS plus the type-aware `no-floating-promises`, `no-misused-promises` and `switch-exhaustiveness-check` rules).
-- The shared Biome, TypeScript, Lefthook, ESLint and CI configuration lives in [pulse-config](https://github.com/lorenzh/pulse-config). Change a rule there, then update the pin here: `package.json` (with `bun.lock`) and both `uses:` refs in `.github/workflows/ci.yml` (`check.yml` and `release.yml`) carry the same SHA. CI runs the shared `check.yml` and builds the image on amd64 and arm64 (`docker` job); on a tag it also runs the `release` job (see [Releasing](#releasing)).
+- The shared Biome, TypeScript, Lefthook, ESLint and CI configuration lives in [pulse-config](https://github.com/lorenzh/pulse-config). Change a rule there, then update the pin here: `package.json` (with `bun.lock`) and both `uses:` refs in `.github/workflows/ci.yml` (`check.yml` and `release.yml`) carry the same SHA. CI runs the shared `check.yml` and builds the image on amd64 and arm64 (`docker` job). The `docker` job runs the step `Image ignores dotenv files` (`bash scripts/image-dotenv.sh pulse-notify:local`): the image must start and pass its own healthcheck with a `.env`, `.env.production` or `.env.local` mounted into `/app`, and its `Cmd` and healthcheck must use `--no-env-file`. Run it locally after `docker build --tag pulse-notify:local .`; on a tag it also runs the `release` job (see [Releasing](#releasing)).
 - The pulse-contract dependency is pinned to a commit SHA. Types are imported with `import type` only.
 
 ## Releasing
