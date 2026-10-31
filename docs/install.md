@@ -11,7 +11,7 @@ bun install --frozen-lockfile
 PULSE_NOTIFY_CONFIG=./notify.json PULSE_API_URL=http://localhost:3000 bun run start
 ```
 
-`bun run start` runs `bun src/index.ts`. The source runs unbuilt with Bun. Stop it with `SIGINT` or `SIGTERM`; it exits with code 0.
+`bun run start` runs `bun src/index.ts`. The source runs unbuilt with Bun. Stop it with `SIGINT` or `SIGTERM`; it exits with code 0 after a clean stop, or with code 1 when the stop takes longer than 5 seconds.
 
 If `PULSE_NOTIFY_CONFIG` is missing or the config is invalid, it prints `pulse-notify: <message>` to stderr and exits with code 2.
 
