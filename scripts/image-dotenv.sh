@@ -89,7 +89,10 @@ case_dotenv() {
     sleep 0.5
   done
   timeout -k 2 10 docker exec "$name" sh -c "test -r /app/$file && test -s /app/$file" || fail "/app/$file is missing or unreadable"
-  if docker logs "$name" 2>&1 | grep -q "$marker"; then
+  # Read the whole log first: grep -q in a pipe ends early and SIGPIPE under pipefail hides a match.
+  local logs
+  logs="$(timeout -k 2 10 docker logs "$name" 2>&1)" || fail "could not read container logs"
+  if grep -qF -- "$marker" <<<"$logs"; then
     fail "logs contain the marker"
   fi
   docker stop -t 10 "$name" >/dev/null
