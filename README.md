@@ -37,6 +37,14 @@ docker run --rm \
   pulse-notify:local
 ```
 
+Released images are published as `ghcr.io/lorenzh/pulse-notify` for linux/amd64 and linux/arm64. Use one in place of `pulse-notify:local`, and pin it by digest in a setup:
+
+```sh
+docker pull ghcr.io/lorenzh/pulse-notify:0.1.0
+```
+
+Tags, the release gate and provenance checks are in [Releasing](docs/development.md#releasing).
+
 ## Documentation
 
 Settings, channels, routing, reminders, secrets, signing, payload, delivery, operation and troubleshooting are in [docs/index.md](docs/index.md). A Slack example:

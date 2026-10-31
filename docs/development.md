@@ -31,5 +31,27 @@ bun test test/<name>.test.ts             # one test file
 
 - `bun run lint` runs Biome and SonarJS through ESLint (cognitive complexity of 15 or less per function). `bun run format` applies Biome fixes.
 - Lefthook runs two pre-commit commands on staged files: `biome check`, and `pulse-eslint` (the same ESLint config as `bun run lint`: SonarJS plus the type-aware `no-floating-promises`, `no-misused-promises` and `switch-exhaustiveness-check` rules).
-- The shared Biome, TypeScript, Lefthook, ESLint and CI configuration lives in [pulse-config](https://github.com/lorenzh/pulse-config). Change a rule there, then update the pin here. CI runs the shared `check.yml`.
+- The shared Biome, TypeScript, Lefthook, ESLint and CI configuration lives in [pulse-config](https://github.com/lorenzh/pulse-config). Change a rule there, then update the pin here: `package.json` (with `bun.lock`) and both `uses:` refs in `.github/workflows/ci.yml` (`check.yml` and `release.yml`) carry the same SHA. CI runs the shared `check.yml` and builds the image on amd64 and arm64 (`docker` job); on a tag it also runs the `release` job (see [Releasing](#releasing)).
 - The pulse-contract dependency is pinned to a commit SHA. Types are imported with `import type` only.
+
+## Releasing
+
+A person releases notify by pushing a SemVer tag. CI then publishes the image `ghcr.io/lorenzh/pulse-notify` for linux/amd64 and linux/arm64 with a build provenance attestation. The release job calls the shared `release.yml` of [pulse-config](https://github.com/lorenzh/pulse-config#releasing-images).
+
+```sh
+git tag vX.Y.Z <sha on main> && git push origin vX.Y.Z
+```
+
+- A tag is `vX.Y.Z` or `vX.Y.Z-<pre-release>` (for example `v0.1.0`, `v0.2.0-rc.1`). No leading zeros and no `+build` part. Any other tag fails the release before a build.
+- A stable tag must point to a commit on `main`. A pre-release tag may point anywhere.
+- Gate: the `release` job runs only on a tag, after `check` (lint, typecheck, test) and both `docker` legs (`ubuntu-24.04` and `ubuntu-24.04-arm`) passed. A failed, cancelled or skipped gate skips the release.
+- Image tags: `X.Y.Z` always. `X.Y` and `X` only when the version is the highest stable `vX.Y.*` or `vX.*.*` tag. A pre-release gets only its own tag. There is no `latest` and no `edge` tag. A push to `main` or a pull request publishes nothing.
+- Never move a release tag. The workflow refuses to publish a version that already exists; push a new version instead.
+- The release builds the image again from the tagged commit. The content matches the image the gate checked; the digest can differ.
+- Verify a release:
+
+  ```sh
+  gh attestation verify oci://ghcr.io/lorenzh/pulse-notify:<version> --owner lorenzh
+  ```
+
+- Setups pin an exact version by digest, for example `ghcr.io/lorenzh/pulse-notify:0.1.0@sha256:<digest>`.
