@@ -1,6 +1,14 @@
 import type { Incident, ManualIncident } from "@lorenzh/pulse-contract";
 import type { Logger } from "@lorenzh/pulse-kit";
-import { ApiReadError, fetchChecks, fetchIncidents, fetchManualIncidents } from "./api.ts";
+import {
+  ApiReadError,
+  fetchChecks,
+  fetchIncidents,
+  fetchManualIncidents,
+  type ManualIncidentsResult,
+  type RejectedIncident,
+} from "./api.ts";
+import { BoundedSet } from "./bounded-set.ts";
 import { createSender } from "./channels/factory.ts";
 import type { SendMail } from "./channels/mailer.ts";
 import { isManualRouted, isRouted } from "./channels/routing.ts";
@@ -64,6 +72,9 @@ export interface PollHealth {
   /** Polls in a row that failed (a feed read or detection threw); 0 after a good poll. */
   consecutiveFailedPolls: number;
 }
+
+/** Most malformed-item identities remembered, so a bad item is logged once without unbounded memory. */
+export const MALFORMED_REPORT_LIMIT = 1024;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PRUNE_EVERY_MS = 60 * 60 * 1000;
@@ -148,8 +159,11 @@ function buildArgs(...args: BuildArgs): BuildArgs {
 export class Notifier {
   readonly #opts: NotifierOptions;
   readonly #channels: ChannelState[];
-  /** Incident ids and legacy keys already reported, so a bad item is logged once. */
-  readonly #reported = new Set<string>();
+  /** Identities of malformed api items already logged (`<feed>:id:<id>` or `<feed>:index:<n>`). */
+  readonly #malformed = new BoundedSet(MALFORMED_REPORT_LIMIT);
+  /** Legacy pending keys already reported; they come from the local ledger, not the api. */
+  readonly #legacyReported = new Set<string>();
+  #isVersionAbsentReported = false;
   /** Ids of the incidents that the last poll showed as resolved. */
   #resolved = new Set<number>();
   readonly #now: () => number;
@@ -313,7 +327,7 @@ export class Notifier {
       maxBytes: this.#opts.apiMaxBytes,
       schedule: this.#opts.schedule,
       onVersionAbsent: () => this.#reportVersionAbsent(),
-      onInvalidCheck: (error: string) => this.#reportInvalidCheck(error),
+      onInvalidCheck: (index: number) => this.#reportInvalidCheck(index),
     };
     const [incidentsRead, checksRead, manualRead] = await Promise.allSettled([
       fetchIncidents(api),
@@ -325,11 +339,9 @@ export class Notifier {
     const manualResult = this.#feedValue("manual-incidents", manualRead);
     const isOk = result !== undefined && checks !== undefined && manualResult !== undefined;
     this.#opts.metrics?.pollDone(isOk ? "ok" : "error");
-    if (result) this.#reportRejected(result.rejected);
+    if (result) this.#reportRejected("incidents", result.rejected);
     if (manualResult) {
-      this.#reportRejected(
-        manualResult.rejected.map((r) => ({ ...r, id: `manual:${String(r.id)}` })),
-      );
+      this.#reportRejected("manual-incidents", manualResult.rejected);
       if (!manualResult.isAbsent) {
         this.#visibleManual = new Set(manualResult.incidents.map((i) => i.id));
       }
@@ -342,7 +354,7 @@ export class Notifier {
     }
     const nowMs = this.#now();
     for (const channel of this.#channels) {
-      this.#pollChannel(channel, incidents, manualResult?.incidents, nowMs);
+      this.#pollChannel(channel, incidents, manualResult, nowMs);
     }
     if (incidents) {
       // After the new events are queued, so a newer reminder supersedes a held one.
@@ -391,38 +403,46 @@ export class Notifier {
   }
 
   #reportVersionAbsent(): void {
-    if (this.#reported.has("wire-version-absent")) return;
-    this.#reported.add("wire-version-absent");
+    if (this.#isVersionAbsentReported) return;
+    this.#isVersionAbsentReported = true;
     this.#opts.logger.warn("api sent no wire version header; continuing");
   }
 
-  #reportInvalidCheck(error: string): void {
-    const key = `check:${error}`;
-    if (this.#reported.has(key)) return;
-    this.#reported.add(key);
-    this.#opts.logger.warn("check skipped: malformed data", { reason: error });
+  /** Counted on every poll; logged once per index. */
+  #reportInvalidCheck(index: number): void {
+    this.#opts.metrics?.itemSkipped("checks");
+    if (!this.#malformed.add(`checks:index:${index}`)) return;
+    this.#opts.logger.warn("check skipped: malformed data", {
+      feed: "checks",
+      index,
+      reason: "invalid",
+    });
   }
 
-  #reportRejected(rejected: { id: unknown; reason: string }[]): void {
-    for (const { id, reason } of rejected) {
-      const key = `incident:${String(id)}`;
-      if (this.#reported.has(key)) continue;
-      this.#reported.add(key);
+  /** Counted on every poll; logged once per identity. Only fixed texts and safe integers are logged. */
+  #reportRejected(feed: "incidents" | "manual-incidents", rejected: RejectedIncident[]): void {
+    for (const { index, id, reason } of rejected) {
+      this.#opts.metrics?.itemSkipped(feed);
+      const identity = id === undefined ? `${feed}:index:${index}` : `${feed}:id:${id}`;
+      if (!this.#malformed.add(identity)) continue;
       this.#opts.logger.error("incident skipped: malformed data", {
-        incidentId: id,
+        feed,
+        index,
         reason,
+        ...(id === undefined ? {} : { incidentId: id }),
       });
     }
   }
 
   /**
-   * `undefined` means the feed failed this poll: its detection is skipped. A new channel is
+   * `undefined` means the feed failed this poll: its detection is skipped. A 404 on manual
+   * incidents runs no manual detection and sets no manual mark. A new channel is
    * seeded only when both incident feeds answered, so a recovered feed sends no burst.
    */
   #pollChannel(
     channel: ChannelState,
     incidents: Incident[] | undefined,
-    manual: ManualIncident[] | undefined,
+    manual: ManualIncidentsResult | undefined,
     nowMs: number,
   ): void {
     const remindSeconds = channel.config.remindEverySeconds;
@@ -437,13 +457,38 @@ export class Notifier {
       this.#rebuildLegacyPending(channel, incidents, nowMs);
       this.#detectAutomatic(channel, incidents, reminders, nowMs);
     }
-    if (manual) this.#detectManual(channel, manual);
+    // After automatic detection, so a failed manual seed does not hold back automatic events.
+    if (manual && !manual.isAbsent) this.#pollManual(channel, manual.incidents, nowMs);
+  }
+
+  /** The first good manual read of a channel without `manualFrom` seeds its manual keys quietly. */
+  #pollManual(channel: ChannelState, manual: ManualIncident[], nowMs: number): void {
+    const { ledger, logger } = this.#opts;
+    const id = channel.config.id;
+    if (ledger.manualFrom(id) !== undefined) {
+      this.#detectManual(channel, manual);
+      return;
+    }
+    const routed = manual.filter((i) => isManualRouted(channel.config, i.componentIds));
+    try {
+      ledger.seed(id, seedManualKeys(routed), { manualFrom: nowMs });
+    } catch (err) {
+      logger.error("ledger seed failed, the next poll retries", {
+        channel: id,
+        ...errorFields(err),
+      });
+      return;
+    }
+    logger.info("manual incidents initialized: existing manual incidents skipped", {
+      channel: id,
+      incidents: routed.length,
+    });
   }
 
   #seedChannel(
     channel: ChannelState,
     incidents: Incident[],
-    manual: ManualIncident[],
+    manual: ManualIncidentsResult,
     reminders: ReminderPlan | undefined,
     nowMs: number,
   ): void {
@@ -454,9 +499,15 @@ export class Notifier {
         id,
         [
           ...seedKeys(incidents, reminders),
-          ...seedManualKeys(manual.filter((i) => isManualRouted(channel.config, i.componentIds))),
+          ...seedManualKeys(
+            manual.incidents.filter((i) => isManualRouted(channel.config, i.componentIds)),
+          ),
         ],
-        reminders ? nowMs : undefined,
+        {
+          ...(reminders ? { remindersFrom: nowMs } : {}),
+          // On a 404 the manual feed was not seen: its first good read seeds again.
+          ...(manual.isAbsent ? {} : { manualFrom: nowMs }),
+        },
       );
     } catch (err) {
       logger.error("ledger seed failed, the next poll retries", {
@@ -523,7 +574,7 @@ export class Notifier {
       ledger.seed(
         id,
         seedKeys(incidents, reminders).filter((key) => REMINDER_KEY.test(key)),
-        nowMs,
+        { remindersFrom: nowMs },
       );
     } catch (err) {
       logger.error("ledger seed failed, the next poll retries", {
@@ -545,9 +596,9 @@ export class Notifier {
       if (channelId !== id || notification || channel.queued.has(key)) continue;
       const found = this.#findEvent(key, incidents);
       if (!found) {
-        const reportKey = `legacy:${id}:${key}`;
-        if (this.#reported.has(reportKey)) continue;
-        this.#reported.add(reportKey);
+        const reportKey = `${id}:${key}`;
+        if (this.#legacyReported.has(reportKey)) continue;
+        this.#legacyReported.add(reportKey);
         this.#opts.logger.error("pending notification cannot be rebuilt: incident not found", {
           channel: id,
           key,

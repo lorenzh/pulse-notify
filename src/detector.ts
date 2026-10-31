@@ -1,4 +1,5 @@
-import type { Incident, ManualIncident } from "@lorenzh/pulse-contract";
+import { createHash } from "node:crypto";
+import type { Incident, ManualIncident, ManualIncidentUpdate } from "@lorenzh/pulse-contract";
 import type { NotificationEvent } from "./types.ts";
 
 export interface DetectedEvent {
@@ -99,8 +100,16 @@ export function manualKey(id: number, event: "opened" | "resolved"): string {
   return `manual:${id}:${event}`;
 }
 
-export function manualUpdateKey(id: number, n: number): string {
-  return `manual:${id}:update:${n}`;
+/**
+ * The key of an update by its content, so inserting or reordering updates sends nothing twice.
+ * The wire format has no update id: two updates with the same `(at, status, message)` share a key.
+ */
+export function manualUpdateKey(id: number, update: ManualIncidentUpdate): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify([update.at, update.status, update.message]))
+    .digest("hex")
+    .slice(0, 32);
+  return `manual:${id}:update:${digest}`;
 }
 
 /** The events of one manual incident, in order. The resolving update is `resolved`, not `update`. */
@@ -118,7 +127,7 @@ function manualEventsOf(incident: ManualIncident): DetectedManualEvent[] {
     if (n === 0) continue;
     const isResolving = n === last && incident.resolvedAt !== null;
     events.push({
-      key: isResolving ? manualKey(incident.id, "resolved") : manualUpdateKey(incident.id, n),
+      key: isResolving ? manualKey(incident.id, "resolved") : manualUpdateKey(incident.id, update),
       event: isResolving ? "resolved" : "update",
       incident,
       updateIndex: n,

@@ -69,7 +69,7 @@ Every channel can limit the checks it reports:
 
 ## Manual incidents
 
-Notify also reads `GET /manual-incidents` and announces each manual incident: one `opened` event when it is created (key `manual:<id>:opened`), one `update` event per later update (`manual:<id>:update:<n>`, `n` is the update's index) and one `resolved` event (`manual:<id>:resolved`). An update that resolves the incident gives only `resolved`. Each key is delivered once per channel, at least once, through the ledger. Deleting an incident cannot retract a message that was sent.
+Notify also reads `GET /manual-incidents` and announces each manual incident: one `opened` event when it is created (key `manual:<id>:opened`), one `update` event per later update (`manual:<id>:update:<d>`, `d` is the first 32 hex characters of SHA-256 over `JSON.stringify([at, status, message])` of the update; older versions used the index `<n>`) and one `resolved` event (`manual:<id>:resolved`). An update that resolves the incident gives only `resolved`. Each key is delivered once per channel, at least once, through the ledger. Deleting an incident cannot retract a message that was sent. Because the key depends on the update's content, inserting or reordering updates sends only the new ones. The wire format has no update id, so two updates of one incident with the same `at`, `status` and `message` count as one and are sent once; changing the message or status makes a new update.
 
 - Routing uses component ids, not check ids. `components`: include list (absent or empty means no filter). `excludeComponents`: exclude list, it wins. Unknown ids are allowed and match nothing.
 - `checks` and `excludeChecks` are ignored for manual incidents.

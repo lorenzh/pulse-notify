@@ -78,7 +78,15 @@ export interface FakeApi {
   failingPaths: Map<string, number>;
   /** Paths requested so far, in order. */
   requested: string[];
+  /** Paths that answer with this raw status, headers and body text, before any other rule. */
+  raw: Map<string, RawAnswer>;
   close(): Promise<void>;
+}
+
+export interface RawAnswer {
+  status?: number;
+  headers?: Record<string, string>;
+  body?: string;
 }
 
 export async function startFakeApi(): Promise<FakeApi> {
@@ -91,10 +99,17 @@ export async function startFakeApi(): Promise<FakeApi> {
     failingManual: false,
     failingPaths: new Map(),
     requested: [],
+    raw: new Map(),
     close: () => close(server),
   };
   const server = createServer((req, res) => {
     api.requested.push(req.url ?? "");
+    const raw = api.raw.get(req.url ?? "");
+    if (raw) {
+      res.writeHead(raw.status ?? 200, raw.headers ?? {});
+      res.end(raw.body ?? "");
+      return;
+    }
     const failStatus = api.failingPaths.get(req.url ?? "");
     if (api.failing || (api.failingManual && req.url === "/manual-incidents") || failStatus) {
       res.statusCode = failStatus ?? 500;

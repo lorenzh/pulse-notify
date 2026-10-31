@@ -10,6 +10,7 @@ import {
   validateCheck,
   validateIncident,
   validateManualIncident,
+  WIRE_VERSION,
 } from "@lorenzh/pulse-contract";
 import { redactInText } from "./redact.ts";
 import type { Schedule } from "./types.ts";
@@ -23,13 +24,29 @@ export interface ApiOptions {
   schedule?: Schedule | undefined;
   /** Called when a response has no wire version header. */
   onVersionAbsent?: () => void;
-  /** Called with the contract error for each check that is skipped. */
-  onInvalidCheck?: (error: string) => void;
+  /** Called with the array index of each check that is skipped. */
+  onInvalidCheck?: (index: number) => void;
 }
 
+/** A fixed category: no text from the api response reaches a log line. */
+export type SkipReason =
+  | "invalid"
+  | "openedAt is not a valid date"
+  | "resolvedAt is not a valid date"
+  | "time is not a valid date";
+
 export interface RejectedIncident {
-  id: unknown;
-  reason: string;
+  index: number;
+  /** The raw id, only when it is a safe integer. */
+  id: number | undefined;
+  reason: SkipReason;
+}
+
+/** Reads the raw id without converting it: only a safe integer is kept. */
+function safeId(raw: unknown): number | undefined {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  const id: unknown = Object.getOwnPropertyDescriptor(raw, "id")?.value;
+  return typeof id === "number" && Number.isSafeInteger(id) ? id : undefined;
 }
 
 export interface IncidentsResult {
@@ -84,10 +101,11 @@ function apiError(error: FetchJsonError, path: string): unknown {
     case "too-large":
       return new Error(`GET ${path} response is larger than ${error.maxBytes} bytes`);
     case "invalid-json":
+      return new Error(`GET ${path} returned invalid JSON`);
     case "validation":
-      return new Error(error.message);
+      return new Error(`GET ${path} did not return an array`);
     case "wire-mismatch":
-      return new Error(`GET ${path} wire version mismatch: ${error.message}`);
+      return new Error(`GET ${path} wire version mismatch (expected ${WIRE_VERSION})`);
     default: {
       const unreachable: never = error;
       return unreachable;
@@ -114,9 +132,13 @@ async function getArray(
   path: string,
   isAbsentTolerated = false,
 ): Promise<unknown[] | undefined> {
+  const base = opts.fetch ?? fetch;
+  // No redirect is followed, also not same-origin: PULSE_API_URL must be the final endpoint.
+  const noRedirect: FetchJsonOptions<unknown[]>["fetch"] = (input, init) =>
+    base(input, { ...init, redirect: "manual" });
   const url = new URL(path, opts.baseUrl.endsWith("/") ? opts.baseUrl : `${opts.baseUrl}/`);
   const options: FetchJsonOptions<unknown[]> = {
-    fetch: opts.fetch ?? fetch,
+    fetch: noRedirect,
     validate: validateArray(path),
     timeoutMs: opts.timeoutMs ?? 5000,
     maxBytes: opts.maxBytes ?? DEFAULT_API_MAX_BYTES,
@@ -140,9 +162,12 @@ function isDateMs(value: number): boolean {
 }
 
 /** Returns the incident, or the reason why the raw value is not one. */
-function checkIncident(raw: unknown, path: string): { incident: Incident } | { reason: string } {
+function checkIncident(
+  raw: unknown,
+  path: string,
+): { incident: Incident } | { reason: SkipReason } {
   const validated = validateIncident(raw, path);
-  if (!validated.ok) return { reason: validated.error };
+  if (!validated.ok) return { reason: "invalid" };
   const { openedAt, resolvedAt } = validated.value;
   if (!isDateMs(openedAt)) return { reason: "openedAt is not a valid date" };
   if (resolvedAt != null && !isDateMs(resolvedAt)) {
@@ -157,8 +182,7 @@ export async function fetchIncidents(opts: ApiOptions): Promise<IncidentsResult>
   for (const [i, raw] of items.entries()) {
     const checked = checkIncident(raw, `incidents[${i}]`);
     if ("reason" in checked) {
-      const id = typeof raw === "object" && raw !== null ? (raw as { id?: unknown }).id : undefined;
-      result.rejected.push({ id, reason: checked.reason });
+      result.rejected.push({ index: i, id: safeId(raw), reason: checked.reason });
     } else {
       result.incidents.push(checked.incident);
     }
@@ -175,7 +199,7 @@ export async function fetchChecks(opts: ApiOptions): Promise<Check[]> {
     if (validated.ok) {
       checks.push(validated.value);
     } else {
-      opts.onInvalidCheck?.(validated.error);
+      opts.onInvalidCheck?.(i);
     }
   }
   return checks;
@@ -201,10 +225,10 @@ export async function fetchManualIncidents(opts: ApiOptions): Promise<ManualInci
     if (validated.ok && isValid) {
       result.incidents.push(validated.value);
     } else {
-      const id = typeof raw === "object" && raw !== null ? (raw as { id?: unknown }).id : undefined;
       result.rejected.push({
-        id,
-        reason: validated.ok ? "time is not a valid date" : validated.error,
+        index: i,
+        id: safeId(raw),
+        reason: validated.ok ? "time is not a valid date" : "invalid",
       });
     }
   }

@@ -34,15 +34,27 @@ function respond(body: unknown, headers: Record<string, string> = {}): typeof fe
   return fakeFetch(async () => new Response(JSON.stringify(body), { status: 200, headers }));
 }
 
-test("an incident missing a required field is rejected with a path", async () => {
+test("an incident missing a required field is rejected with its index and a fixed reason", async () => {
   const bad = { ...incident({ id: 1 }), checkId: undefined };
   const out = await fetchIncidents({ baseUrl: base, fetch: respond([bad, incident({ id: 2 })]) });
   assert.equal(out.incidents.length, 1);
-  assert.match(out.rejected[0]?.reason ?? "", /^incidents\[0\]\.checkId: /);
+  assert.deepEqual(out.rejected, [{ index: 0, id: 1, reason: "invalid" }]);
+});
+
+test("a rejected id that is not a safe integer is left out", async () => {
+  const items = [
+    { ...incident({ id: 1 }), id: "7" },
+    { ...incident({ id: 1 }), id: 2 ** 60 },
+  ];
+  const out = await fetchIncidents({ baseUrl: base, fetch: respond(items) });
+  assert.deepEqual(out.rejected, [
+    { index: 0, id: undefined, reason: "invalid" },
+    { index: 1, id: undefined, reason: "invalid" },
+  ]);
 });
 
 test("a check missing a required field is skipped and reported", async () => {
-  const errors: string[] = [];
+  const errors: number[] = [];
   const checks = [httpCheck("a", "A"), { id: "b", name: "B" }];
   const out = await fetchChecks({
     baseUrl: base,
@@ -54,7 +66,7 @@ test("a check missing a required field is skipped and reported", async () => {
     ["a"],
   );
   assert.equal(errors.length, 1);
-  assert.match(errors[0] ?? "", /^checks\[1\]\./);
+  assert.deepEqual(errors, [1]);
 });
 
 test("a matching wire version is accepted without a report", async () => {
@@ -76,12 +88,17 @@ test("an absent wire version header is reported and the call continues", async (
 
 test("a wire version mismatch fails the call", async () => {
   const fetchFn = respond([], { [WIRE_VERSION_HEADER]: "999" });
-  await assert.rejects(fetchIncidents({ baseUrl: base, fetch: fetchFn }), /wire version mismatch/);
+  await assert.rejects(
+    fetchIncidents({ baseUrl: base, fetch: fetchFn }),
+    new RegExp(
+      `^ApiReadError: GET incidents wire version mismatch \\(expected ${WIRE_VERSION}\\)$`,
+    ),
+  );
   await assert.rejects(fetchChecks({ baseUrl: base, fetch: fetchFn }), /wire version mismatch/);
 });
 
 test("a check with an out-of-range value is skipped and reported", async () => {
-  const errors: string[] = [];
+  const errors: number[] = [];
   const out = await fetchChecks({
     baseUrl: base,
     fetch: respond([httpCheck("a", "A"), { ...httpCheck("b", "B"), retries: 11 }]),
@@ -92,7 +109,7 @@ test("a check with an out-of-range value is skipped and reported", async () => {
     ["a"],
   );
   assert.equal(errors.length, 1);
-  assert.match(errors[0] ?? "", /^checks\[1\]\./);
+  assert.deepEqual(errors, [1]);
 });
 
 test("a non-2xx status wins over a wire version mismatch", async () => {
@@ -107,7 +124,10 @@ test("a non-2xx status wins over a wire version mismatch", async () => {
 
 test("a body that is not an array fails the call", async () => {
   const fetchFn = fakeFetch(async () => new Response("{}", { status: 200 }));
-  await assert.rejects(fetchChecks({ baseUrl: base, fetch: fetchFn }), /did not return an array/);
+  await assert.rejects(
+    fetchChecks({ baseUrl: base, fetch: fetchFn }),
+    /^ApiReadError: GET checks did not return an array$/,
+  );
 });
 
 test("a stalled call times out through the injected schedule", async () => {
