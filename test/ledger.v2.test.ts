@@ -195,7 +195,7 @@ test("prune and the reminder mark are written by flush", async () => {
   const file = path();
   let clock = 0;
   const ledger = new Ledger(file, { now: () => clock, schedule: fakeSchedule().schedule });
-  ledger.seed("c", ["x"], 50);
+  ledger.seed("c", ["x"], { remindersFrom: 50 });
   assert.equal(ledger.remindersFrom("c"), 50);
   assert.equal(read(file).remindersFrom?.c, 50);
   clock = 100;
@@ -245,7 +245,7 @@ test("a failed seed or claim rolls back its change, including pruned reminders",
   assert.throws(() => ledger.claim("c", "1:reminder:2", reminder(2)));
   assert.equal(ledger.status("c", "1:reminder:1"), "delivered");
   assert.equal(ledger.has("c", "1:reminder:2"), false);
-  assert.throws(() => ledger.seed("c", ["z"], 7));
+  assert.throws(() => ledger.seed("c", ["z"], { remindersFrom: 7 }));
   assert.equal(ledger.has("c", "z"), false);
   assert.equal(ledger.remindersFrom("c"), undefined);
   rmSync(`${file}.tmp`, { recursive: true });
@@ -259,4 +259,47 @@ test("close stops batched writes", async () => {
   ledger.close();
   await ledger.flush();
   assert.equal(read(file).channels.c?.["1:opened"]?.status, "pending");
+});
+
+test("manualFrom round-trips, survives prune and drops a non-number value", async () => {
+  const file = path();
+  let clock = 0;
+  const ledger = new Ledger(file, { now: () => clock, schedule: fakeSchedule().schedule });
+  ledger.seed("c", ["manual:1:opened"], { manualFrom: 40 });
+  assert.equal(ledger.manualFrom("c"), 40);
+  clock = 100;
+  ledger.prune(10, new Set(), new Set());
+  await ledger.flush();
+  assert.equal(new Ledger(file).manualFrom("c"), 40);
+  writeFileSync(
+    file,
+    JSON.stringify({
+      version: 2,
+      channels: { a: {}, b: {}, c: {} },
+      manualFrom: { a: "40", b: null, c: 7 },
+    }),
+  );
+  const loaded = new Ledger(file);
+  assert.equal(loaded.manualFrom("a"), undefined);
+  assert.equal(loaded.manualFrom("b"), undefined);
+  assert.equal(loaded.manualFrom("c"), 7);
+});
+
+test("manualFrom of a v1 file is ignored", () => {
+  const file = path();
+  writeFileSync(file, JSON.stringify({ version: 1, channels: { c: {} }, manualFrom: { c: 5 } }));
+  assert.equal(new Ledger(file).manualFrom("c"), undefined);
+});
+
+test("a failed seed rolls back both marks", async () => {
+  const file = path();
+  const ledger = new Ledger(file, { schedule: fakeSchedule().schedule });
+  ledger.seed("c", [], { remindersFrom: 3 });
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(`${file}.tmp`);
+  assert.throws(() => ledger.seed("c", ["manual:1:opened"], { remindersFrom: 9, manualFrom: 9 }));
+  assert.equal(ledger.remindersFrom("c"), 3);
+  assert.equal(ledger.manualFrom("c"), undefined);
+  assert.equal(ledger.has("c", "manual:1:opened"), false);
+  rmSync(`${file}.tmp`, { recursive: true });
 });

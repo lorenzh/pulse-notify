@@ -43,6 +43,11 @@ test("metrics keep the names, help texts and order", () => {
       "# TYPE pulse_notify_deliveries_total counter",
       'pulse_notify_deliveries_total{channel="log",outcome="success"} 0',
       'pulse_notify_deliveries_total{channel="log",outcome="failure"} 0',
+      "# HELP pulse_notify_skipped_items_total API feed items skipped as malformed, by feed.",
+      "# TYPE pulse_notify_skipped_items_total counter",
+      'pulse_notify_skipped_items_total{feed="incidents"} 0',
+      'pulse_notify_skipped_items_total{feed="checks"} 0',
+      'pulse_notify_skipped_items_total{feed="manual-incidents"} 0',
       "# HELP pulse_notify_pending_deliveries Notifications not yet delivered or failed.",
       "# TYPE pulse_notify_pending_deliveries gauge",
       "pulse_notify_pending_deliveries 0",
@@ -65,4 +70,13 @@ test("feed reads count per feed and outcome; poll outcomes are counted apart", (
   assert.match(text, /pulse_notify_feed_polls_total\{feed="incidents",outcome="ok"\} 1\n/);
   assert.match(text, /pulse_notify_feed_polls_total\{feed="manual-incidents",outcome="ok"\} 0\n/);
   assert.match(text, /^pulse_notify_polls_total\{outcome="ok"\} 1$/m);
+});
+
+test("skipped items count per feed", () => {
+  const metrics = new Metrics([], () => 0);
+  metrics.itemSkipped("checks");
+  metrics.itemSkipped("checks");
+  const text = metrics.render();
+  assert.match(text, /^pulse_notify_skipped_items_total\{feed="checks"\} 2$/m);
+  assert.match(text, /^pulse_notify_skipped_items_total\{feed="incidents"\} 0$/m);
 });

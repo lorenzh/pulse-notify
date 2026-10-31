@@ -39,7 +39,7 @@ test("detector: keys for opened, update and resolved", () => {
   const keys = detectManualEvents([resolved], () => false).map((e) => [e.key, e.event]);
   assert.deepEqual(keys, [
     ["manual:7:opened", "opened"],
-    ["manual:7:update:1", "update"],
+    ["manual:7:update:f38505d942cc4abd5cb0367db16c6f76", "update"],
     ["manual:7:resolved", "resolved"],
   ]);
 });
@@ -61,7 +61,7 @@ test("detector: resolving by an update yields one resolved event and no update e
 test("detector: handled keys are skipped and seeding covers all keys", () => {
   assert.deepEqual(seedManualKeys([resolved]), [
     "manual:7:opened",
-    "manual:7:update:1",
+    "manual:7:update:f38505d942cc4abd5cb0367db16c6f76",
     "manual:7:resolved",
   ]);
   assert.deepEqual(
@@ -147,7 +147,7 @@ test("one delivery per key with routing, and a restart sends nothing twice", asy
 
   assert.deepEqual(
     out("all").map((e) => e.key),
-    ["manual:7:opened", "manual:7:update:1", "manual:7:resolved"],
+    ["manual:7:opened", "manual:7:update:f38505d942cc4abd5cb0367db16c6f76", "manual:7:resolved"],
   );
   assert.deepEqual(
     out("web").map((e) => e.key),

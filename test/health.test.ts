@@ -7,6 +7,7 @@ import { main, type Stoppable } from "../src/index.ts";
 import { Ledger } from "../src/ledger.ts";
 import { Metrics } from "../src/metrics.ts";
 import { Notifier } from "../src/notifier.ts";
+import type { Schedule } from "../src/types.ts";
 import { type FakeApi, httpCheck, incident, spyLogger, startFakeApi } from "./support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-health-"));
@@ -86,23 +87,25 @@ test("the metric shows the consecutive failed polls", () => {
   assert.match(new Metrics([], () => 0).render(), /^pulse_notify_consecutive_failed_polls 0$/m);
 });
 
-test("/healthz is 200, then 503 after N failed polls, then 200 after one good poll", async () => {
+test("/healthz stays 200 while polls fail; /readyz turns 503 and recovers", async () => {
   const running = main(
     {
       PULSE_NOTIFY_CONFIG: configPath,
       PULSE_NOTIFY_STATE: join(dir, "h-state.json"),
       PULSE_API_URL: api.url,
       PULSE_NOTIFY_POLL_MS: "10",
-      PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS: "3",
       PULSE_HEALTH_PORT: "0",
     },
     { write: () => {} },
   );
   const port = await running.listening;
   const url = `http://127.0.0.1:${port}`;
-  const until = async (check: (status: number, text: string) => boolean): Promise<string> => {
+  const until = async (
+    path: string,
+    check: (status: number, text: string) => boolean,
+  ): Promise<string> => {
     for (let i = 0; i < 500; i++) {
-      const res = await fetch(`${url}/healthz`);
+      const res = await fetch(`${url}${path}`);
       const text = await res.text();
       if (check(res.status, text)) return text;
       await new Promise((r) => setTimeout(r, 10));
@@ -110,14 +113,52 @@ test("/healthz is 200, then 503 after N failed polls, then 200 after one good po
     throw new Error("timed out");
   };
   try {
-    await until((status) => status === 200);
+    await until("/readyz", (status) => status === 200);
     api.failing = true;
-    const text = await until((status) => status === 503);
+    const text = await until("/readyz", (status) => status === 503);
     assert.match(text, /^polls failing \(\d+ in a row\)$/m);
     const metrics = await (await fetch(`${url}/metrics`)).text();
-    assert.match(metrics, /^pulse_notify_consecutive_failed_polls [3-9]\d*$/m);
+    assert.match(metrics, /^pulse_notify_consecutive_failed_polls ([5-9]|\d{2,})$/m);
+    assert.equal((await fetch(`${url}/healthz`)).status, 200);
+    assert.equal((await fetch(`${url}/healthz`, { method: "HEAD" })).status, 200);
     api.failing = false;
-    await until((status) => status === 200);
+    await until("/readyz", (status) => status === 200);
+    assert.equal((await fetch(`${url}/healthz`)).status, 200);
+  } finally {
+    await running.stop();
+  }
+});
+
+test("/healthz is 503 shutting down after the state lock is lost", async () => {
+  const state = join(dir, "lost-state.json");
+  const beats: (() => void)[] = [];
+  const heartbeatSchedule: Schedule = (fn) => {
+    beats.push(fn);
+    return () => {};
+  };
+  const exits: number[] = [];
+  const running = main(
+    { PULSE_NOTIFY_CONFIG: configPath, PULSE_NOTIFY_STATE: state, PULSE_HEALTH_PORT: "0" },
+    {
+      exit: (code) => exits.push(code),
+      write: () => {},
+      heartbeatSchedule,
+      lock: { now: () => 1_000_000, hostname: () => "host-a", pid: 111, token: () => "tok-1" },
+      createNotifier: (): Stoppable => ({ start() {}, async stop() {} }),
+    },
+  );
+  const port = await running.listening;
+  try {
+    assert.equal((await fetch(`http://127.0.0.1:${port}/healthz`)).status, 200);
+    writeFileSync(
+      `${state}.lock`,
+      JSON.stringify({ pid: 9, hostname: "host-b", token: "foreign", heartbeat: 1_000_000 }),
+    );
+    beats.pop()?.();
+    assert.deepEqual(exits, [2]);
+    const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+    assert.equal(res.status, 503);
+    assert.match(await res.text(), /shutting down/);
   } finally {
     await running.stop();
   }

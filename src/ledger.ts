@@ -38,6 +38,18 @@ interface LedgerData {
   payloads?: Record<string, Record<string, Notification>>;
   /** Per channel: when reminders were switched on (epoch ms). Absent while they are off. */
   remindersFrom?: Record<string, number>;
+  /** Per channel: when the manual feed was first seen and seeded (epoch ms). Never cleared. */
+  manualFrom?: Record<string, number>;
+}
+
+/** Marks are optional: an entry that is not a finite number is dropped and counts as absent. */
+function readMarks(raw: unknown): Record<string, number> | undefined {
+  if (!isObject(raw)) return undefined;
+  const marks: Record<string, number> = {};
+  for (const [id, value] of Object.entries(raw)) {
+    if (typeof value === "number" && Number.isFinite(value)) marks[id] = value;
+  }
+  return marks;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -84,6 +96,8 @@ function migrate(raw: unknown, loadedAt: number, path: string): LedgerData {
   if (raw.version === LEDGER_VERSION && isObject(raw.remindersFrom)) {
     data.remindersFrom = raw.remindersFrom as Record<string, number>;
   }
+  const manualFrom = raw.version === LEDGER_VERSION ? readMarks(raw.manualFrom) : undefined;
+  if (manualFrom) data.manualFrom = manualFrom;
   return data;
 }
 
@@ -128,6 +142,9 @@ export interface LedgerOptions {
 
 /**
  * Durable delivery ledger: one JSON file, rewritten atomically (temp file + rename).
+ *
+ * `manualFrom` marks a channel whose manual incidents were seeded on the first good manual read;
+ * a channel without it gets the manual keys seeded quietly before manual detection runs.
  *
  * `seed`, `claim` and `resend` write at once and fsync: a claim must be on disk before the first
  * send. `settle`, `prune` and `setRemindersFrom` change memory and are written in one batch after
@@ -312,11 +329,21 @@ export class Ledger {
     this.#markDirty();
   }
 
+  /** When the manual feed was first seen and seeded for the channel; `undefined` before. */
+  manualFrom(channelId: string): number | undefined {
+    const from = this.#data.manualFrom;
+    return from && Object.hasOwn(from, channelId) ? from[channelId] : undefined;
+  }
+
   /**
    * Records the keys as handled without sending; creates the channel record.
-   * `remindersFrom` sets the reminder mark in the same write.
+   * `marks` sets the reminder and manual marks in the same write; a failed write undoes both.
    */
-  seed(channelId: string, keys: string[], remindersFrom?: number): void {
+  seed(
+    channelId: string,
+    keys: string[],
+    marks: { remindersFrom?: number; manualFrom?: number } = {},
+  ): void {
     const hadChannel = this.hasChannel(channelId);
     const entries = this.#data.channels[channelId] ?? {};
     const added: string[] = [];
@@ -327,19 +354,32 @@ export class Ledger {
       added.push(key);
     }
     this.#data.channels[channelId] = entries;
-    const previousMark = this.remindersFrom(channelId);
-    if (remindersFrom !== undefined) {
-      this.#data.remindersFrom ??= {};
-      this.#data.remindersFrom[channelId] = remindersFrom;
-    }
+    const undoReminders = this.#setMark("remindersFrom", channelId, marks.remindersFrom);
+    const undoManual = this.#setMark("manualFrom", channelId, marks.manualFrom);
     this.#commit(() => {
       for (const key of added) delete entries[key];
       if (!hadChannel) delete this.#data.channels[channelId];
-      if (remindersFrom !== undefined && this.#data.remindersFrom) {
-        if (previousMark === undefined) delete this.#data.remindersFrom[channelId];
-        else this.#data.remindersFrom[channelId] = previousMark;
-      }
+      undoReminders();
+      undoManual();
     });
+  }
+
+  /** Sets a mark when `value` is given; returns the undo. */
+  #setMark(
+    field: "remindersFrom" | "manualFrom",
+    channelId: string,
+    value: number | undefined,
+  ): () => void {
+    if (value === undefined) return () => undefined;
+    const marks = this.#data[field] ?? {};
+    this.#data[field] = marks;
+    const hadMark = Object.hasOwn(marks, channelId);
+    const previous = marks[channelId];
+    marks[channelId] = value;
+    return () => {
+      if (hadMark && previous !== undefined) marks[channelId] = previous;
+      else delete marks[channelId];
+    };
   }
 
   /** Removes the settled reminder keys of the same incident that are older than `key`. */

@@ -195,14 +195,19 @@ function reminder(n: number): Notification {
 }
 
 test("incidents 500: manual updates go on, held reminders and legacy keys wait", async () => {
-  // A ledger of an older version: a pending key without a stored notification.
+  // A pending key without a stored notification, as an older version wrote it.
   writeFileSync(
     statePath(),
     JSON.stringify({
-      version: 1,
+      version: 2,
       channels: {
-        out: { "1:opened": "delivered", "manual:7:opened": "seeded", "9:opened": "pending" },
+        out: {
+          "1:opened": { status: "delivered", at: T0 },
+          "manual:7:opened": { status: "seeded", at: T0 },
+          "9:opened": { status: "pending", at: T0 },
+        },
       },
+      manualFrom: { out: T0 },
     }),
   );
   const ledger = new Ledger(statePath(), { now: () => clock });
@@ -223,7 +228,7 @@ test("incidents 500: manual updates go on, held reminders and legacy keys wait",
   ];
   await poll(n);
 
-  assert.deepEqual(keys(), ["manual:7:update:1"]);
+  assert.deepEqual(keys(), ["manual:7:update:2bffb0ddfacc85af28de2801bb32ef51"]);
   assert.equal(
     logger.entries.some((e) => e.msg.startsWith("pending notification cannot be rebuilt")),
     false,
@@ -235,7 +240,7 @@ test("incidents 500: manual updates go on, held reminders and legacy keys wait",
   api.failingPaths.clear();
   await poll(n);
   await n.stop();
-  assert.deepEqual(keys(), ["manual:7:update:1", "1:reminder:1"]);
+  assert.deepEqual(keys(), ["manual:7:update:2bffb0ddfacc85af28de2801bb32ef51", "1:reminder:1"]);
 });
 
 for (const path of ["/incidents", "/manual-incidents"]) {

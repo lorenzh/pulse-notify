@@ -38,6 +38,56 @@ jobs:
             echo "$found" >&2
             exit 1
           fi
+      - name: Check the healthcheck uses PULSE_HEALTH_PORT and ignores feed health
+        run: |
+          config="$RUNNER_TEMP/notify.json"
+          printf '%s' '{"channels":[{"id":"log","type":"file","path":"/data/incidents.jsonl"}]}' > "$config"
+          chmod 644 "$config"
+          names=""
+          cleanup() { for c in $names; do docker rm -f "$c" >/dev/null 2>&1 || true; done; }
+          trap cleanup EXIT
+          start() {
+            name="$1"; shift
+            names="$names $name"
+            # Nothing listens on the api url, so every poll fails.
+            docker run -d --name "$name" \
+              -v "$config:/config/notify.json:ro" \
+              -e PULSE_NOTIFY_CONFIG=/config/notify.json \
+              -e PULSE_API_URL=http://127.0.0.1:9 \
+              -e PULSE_NOTIFY_POLL_MS=200 \
+              --health-interval=2s --health-start-period=0s \
+              "$@" pulse-notify:local >/dev/null
+          }
+          show() {
+            docker logs "$1" >&2 || true
+            docker inspect -f '{{json .State.Health}}' "$1" >&2 || true
+          }
+          wait_healthy() {
+            for _ in $(seq 1 60); do
+              status="$(docker inspect -f '{{.State.Health.Status}}' "$1")"
+              if [ "$status" = healthy ]; then return 0; fi
+              if [ "$status" = unhealthy ]; then echo "$1 turned unhealthy" >&2; show "$1"; return 1; fi
+              sleep 1
+            done
+            echo "$1 did not turn healthy within 60 s" >&2; show "$1"; return 1
+          }
+          start notify-port -e PULSE_HEALTH_PORT=9200
+          start notify-default
+          wait_healthy notify-port
+          if ! docker exec notify-port bun -e "fetch('http://127.0.0.1:9100/healthz').then(()=>process.exit(1),()=>process.exit(0))"; then
+            echo "something listens on 9100" >&2; show notify-port; exit 1
+          fi
+          # At least 50 failed polls and more than 3 health retries.
+          sleep 15
+          status="$(docker inspect -f '{{.State.Health.Status}}' notify-port)"
+          last="$(docker inspect -f '{{range .State.Health.Log}}{{.ExitCode}} {{end}}' notify-port | awk '{print $NF}')"
+          if [ "$status" != healthy ] || [ "$last" != 0 ]; then
+            echo "notify-port is $status after failed polls (last exit $last)" >&2; show notify-port; exit 1
+          fi
+          if ! docker exec notify-port bun -e "fetch('http://127.0.0.1:9200/readyz').then((r)=>process.exit(r.status===503?0:1),()=>process.exit(1))"; then
+            echo "/readyz is not 503 while polls fail" >&2; show notify-port; exit 1
+          fi
+          wait_healthy notify-default
 
   release:
     if: github.ref_type == 'tag'

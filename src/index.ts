@@ -37,7 +37,7 @@ export const SHUTDOWN_TIMEOUT_MS = 5000;
 export interface Stoppable {
   start(): void;
   stop(): Promise<void>;
-  /** Absent in test fakes: the health check then never reports failing polls. */
+  /** Absent in test fakes: `/readyz` then never reports failing polls. `/healthz` never reads it. */
   pollHealth?(): PollHealth;
 }
 
@@ -233,6 +233,12 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
     startNotifier();
   } else {
     const { healthHost, healthPort, healthMaxFailedPolls } = settings;
+    // Liveness is the lifecycle only: a failing feed must not get a working notifier restarted.
+    const liveness = (): Readiness => {
+      if (state.isShuttingDown) return { ready: false, reason: "shutting down" };
+      if (!isStarted) return { ready: false, reason: "starting" };
+      return { ready: true };
+    };
     const readiness = (): Readiness => {
       if (state.isShuttingDown) return { ready: false, reason: "shutting down" };
       if (!isStarted) return { ready: false, reason: "starting" };
@@ -245,7 +251,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
     listening = startOpsServer({
       host: healthHost,
       port: healthPort,
-      live: readiness,
+      live: liveness,
       ready: readiness,
       metrics: () => metrics.render(),
       allowHead: true,
