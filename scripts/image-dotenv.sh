@@ -31,12 +31,18 @@ fixture_args() {
 case_control() {
   local image="$1" out code
   dir="$(make_fixture_dir)"
-  trap 'rm -rf "$dir"' EXIT
+  name="dotenv-control-$$"
+  # Detached run plus forced removal: a container that ignores SIGTERM
+  # cannot block the case or outlive it.
+  trap 'docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$dir"' EXIT
   local -a fixture
   mapfile -t fixture < <(fixture_args "$dir")
-  code=0
-  out="$(timeout 30 docker run --rm --name "dotenv-control-$$" "${fixture[@]}" \
-    -e "PULSE_LOG_LEVEL=$marker" "$image" 2>&1)" || code=$?
+  docker run -d --name "$name" "${fixture[@]}" \
+    -e "PULSE_LOG_LEVEL=$marker" "$image" >/dev/null
+  if ! code="$(timeout 30 docker wait "$name")"; then
+    fail "control run did not exit within 30 s"
+  fi
+  out="$(docker logs "$name" 2>&1)"
   if [ "$code" -ne 2 ]; then
     fail "control run exited $code, expected 2"
   fi
