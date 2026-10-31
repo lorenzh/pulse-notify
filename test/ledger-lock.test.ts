@@ -10,7 +10,7 @@ import {
   type LockDeps,
   LockLostError,
 } from "../src/ledger-lock.ts";
-import { type SpyLogger, spyLogger } from "./support.ts";
+import { recordingFs, type SpyLogger, spyLogger } from "./support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-lock-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -154,6 +154,19 @@ test("the heartbeat rewrites the file; a foreign token stops it", () => {
   assert.equal(read(state).token, "other");
   rmSync(`${state}.lock`);
   assert.throws(() => lock.heartbeat(), LockLostError);
+});
+
+test("the heartbeat fsyncs its temp file, renames, then fsyncs the directory", () => {
+  const state = statePath();
+  const fs = recordingFs();
+  const lock = acquireLock(state, deps({ fs: fs.sync }));
+  lock.heartbeat();
+  assert.deepEqual(fs.steps, ["fsync:file", "rename", "open:dir", "fsync:dir"]);
+  fs.steps.length = 0;
+  writeLock(state, { pid: 9, hostname: "host-b", token: "other", heartbeat: 1 });
+  assert.throws(() => lock.heartbeat(), LockLostError);
+  assert.deepEqual(fs.steps, []);
+  assert.equal(read(state).token, "other");
 });
 
 test("the heartbeat interval is a sixth of the lease", () => {

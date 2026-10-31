@@ -84,7 +84,7 @@ test("a slow stop does not hang: the bound forces the exit", async () => {
   assert.deepEqual(exits, []);
   fireBound();
   await flush();
-  assert.deepEqual(exits, [0]);
+  assert.deepEqual(exits, [1]);
 });
 
 test("signal handlers are registered before settings, config and ledger are read", async () => {
@@ -187,7 +187,7 @@ test("health listener: ready after start, metrics without secrets, 503 while shu
   await stopped;
 });
 
-test("a stuck stop logs a warn at the shutdown bound, then exits 0", async () => {
+test("a stuck stop logs a warn at the shutdown bound, then exits 1", async () => {
   const lines: string[] = [];
   const { handlers, exits, bound, fireBound } = await setup(() => new Promise(() => {}), {
     lines,
@@ -198,7 +198,7 @@ test("a stuck stop logs a warn at the shutdown bound, then exits 0", async () =>
   assert.equal(bound()?.ms, 5000);
   fireBound();
   await flush();
-  assert.deepEqual(exits, [0]);
+  assert.deepEqual(exits, [1]);
   const warn = lines.map((l) => JSON.parse(l)).find((e) => e.level === "warn");
   assert.ok(warn);
 });

@@ -142,7 +142,6 @@ test("loadSettings parses the new limits and rejects values below their minimum"
   assert.equal(s.smtpClientName, "pulse.example.com");
   for (const name of [
     "PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS",
-    "PULSE_NOTIFY_LOCK_LEASE_SECONDS",
     "PULSE_NOTIFY_STATE_RETENTION_DAYS",
     "PULSE_NOTIFY_API_MAX_BYTES",
   ]) {
@@ -408,3 +407,24 @@ test("every channels example in the docs loads", () => {
 function isConfigExample(json: unknown): boolean {
   return typeof json === "object" && json !== null && "channels" in json;
 }
+
+test("timer settings and the lock lease have an upper bound; byte limits do not", () => {
+  const base = { PULSE_NOTIFY_CONFIG: "c" };
+  assert.throws(() => loadSettings({ ...base, PULSE_NOTIFY_POLL_MS: "2592000000" }), {
+    message: "PULSE_NOTIFY_POLL_MS: must be an integer from 1 to 2147483647",
+  });
+  assert.throws(() => loadSettings({ ...base, PULSE_NOTIFY_TIMEOUT_MS: "2147483648" }), {
+    message: "PULSE_NOTIFY_TIMEOUT_MS: must be an integer from 1 to 2147483647",
+  });
+  assert.throws(() => loadSettings({ ...base, PULSE_NOTIFY_LOCK_LEASE_SECONDS: "12884902" }), {
+    message: "PULSE_NOTIFY_LOCK_LEASE_SECONDS: must be an integer from 30 to 12884901",
+  });
+  assert.equal(
+    loadSettings({ ...base, PULSE_NOTIFY_LOCK_LEASE_SECONDS: "12884901" }).lockLeaseSeconds,
+    12884901,
+  );
+  assert.equal(
+    loadSettings({ ...base, PULSE_NOTIFY_API_MAX_BYTES: "3000000000" }).apiMaxBytes,
+    3000000000,
+  );
+});

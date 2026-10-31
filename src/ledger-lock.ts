@@ -1,6 +1,11 @@
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { Logger } from "@lorenzh/pulse-kit";
+import {
+  type AtomicWriteSyncFs,
+  type Logger,
+  nodeAtomicWriteSyncFs,
+  writeFileAtomicSync,
+} from "@lorenzh/pulse-kit";
 import { ConfigError } from "./config.ts";
 
 /** Seconds between heartbeats for a lease. */
@@ -31,6 +36,8 @@ export interface LockDeps {
   afterHolderRead?: () => void;
   /** Test only: called after the takeover marker is taken, before the lock file is removed. */
   afterMarker?: () => void;
+  /** File operations of the heartbeat write. Default: the node fs of pulse-kit. */
+  fs?: AtomicWriteSyncFs;
 }
 
 const MARKER_STALE_MS = 10_000;
@@ -107,9 +114,9 @@ export class LedgerLock {
       throw new LockLostError(this.#path);
     }
     this.#content.heartbeat = this.#deps.now();
-    const tmp = `${this.#path}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.#content));
-    renameSync(tmp, this.#path);
+    writeFileAtomicSync(this.#path, JSON.stringify(this.#content), {
+      fs: this.#deps.fs ?? nodeAtomicWriteSyncFs,
+    });
   }
 
   owns(token: string): boolean {

@@ -6,7 +6,7 @@
       "name": "@lorenzh/pulse-notify",
       "dependencies": {
         "@lorenzh/pulse-contract": "github:lorenzh/pulse-contract#61f7bf88c38ab4827fb47e9409e18d37b9a7ccd3",
-        "@lorenzh/pulse-kit": "github:lorenzh/pulse-kit#fa79ba8cd93949fc0cf87f7b41bdaf261dbe4dc6",
+        "@lorenzh/pulse-kit": "github:lorenzh/pulse-kit#236df214f9df8658f2992dd6f7c100952c07102b",
         "nodemailer": "10.3.1",
         "zod": "4.6.7",
       },
@@ -80,7 +80,7 @@
 
     "@lorenzh/pulse-contract": ["@lorenzh/pulse-contract@github:lorenzh/pulse-contract#61f7bf8", { "dependencies": { "zod": "4.6.7" } }, "lorenzh-pulse-contract-61f7bf8", "sha512-K6vrXW9KUC2UqYeOSYrK+BA25wakhQ4ibuzDROWYhjKv7F6s6337YRWkmacn42kSjk4yqErHdKb1HMxwqF51xQ=="],
 
-    "@lorenzh/pulse-kit": ["@lorenzh/pulse-kit@github:lorenzh/pulse-kit#fa79ba8", {}, "lorenzh-pulse-kit-fa79ba8", "sha512-J/mRfT0+Qp02jLqOp7/cjdIbXeh9Qo8Prw3NTNlGw7VH9Iik2hDRXzUpjh+YdxD3Z0yHM7ySWc8hY1BQ6ff7SQ=="],
+    "@lorenzh/pulse-kit": ["@lorenzh/pulse-kit@github:lorenzh/pulse-kit#236df21", {}, "lorenzh-pulse-kit-236df21", "sha512-ys0EUPPEcW0mPgFXmVuh7FTpET4gOBZWpI/PNl78kk0SPV/HH2JTs9mFgJ095lD76U7/j3h1od+QY7qi8WvIiA=="],
 
     "@sonarsource/analyzer-commons-configurations": ["@sonarsource/analyzer-commons-configurations@2.31.0-5284", "", {}, "sha512-ruk3blMs9BE9RNSp9LPpWZAIjxJmq4Cp00E3cELIHz7Kym3WxdWGRlKOMYLRQ5tJg/de7jN5AtEElY3bGIfTcw=="],
 
