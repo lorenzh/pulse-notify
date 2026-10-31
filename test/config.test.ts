@@ -408,6 +408,17 @@ function isConfigExample(json: unknown): boolean {
   return typeof json === "object" && json !== null && "channels" in json;
 }
 
+test("retry attempts keep their range and message: no upper bound", () => {
+  const base = { PULSE_NOTIFY_CONFIG: "c" };
+  assert.equal(
+    loadSettings({ ...base, PULSE_NOTIFY_RETRY_ATTEMPTS: "3000000000" }).retryAttempts,
+    3_000_000_000,
+  );
+  assert.throws(() => loadSettings({ ...base, PULSE_NOTIFY_RETRY_ATTEMPTS: "-1" }), {
+    message: "PULSE_NOTIFY_RETRY_ATTEMPTS: must be an integer >= 0",
+  });
+});
+
 test("timer settings and the lock lease have an upper bound; byte limits do not", () => {
   const base = { PULSE_NOTIFY_CONFIG: "c" };
   assert.throws(() => loadSettings({ ...base, PULSE_NOTIFY_POLL_MS: "2592000000" }), {

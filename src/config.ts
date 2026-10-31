@@ -394,8 +394,6 @@ export function loadSettings(env: Env): Settings {
     retryAttempts: readInt(env, "PULSE_NOTIFY_RETRY_ATTEMPTS", {
       fallback: DEFAULT_RETRY_ATTEMPTS,
       min: 0,
-      // The range it had as a timer setting; kept so existing configs keep their meaning.
-      max: 2_147_483_647,
     }),
     timeoutMs,
     logLevel: readLogLevel(env),
