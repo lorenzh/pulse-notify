@@ -5,6 +5,7 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
 import { open, rename, unlink } from "node:fs/promises";
@@ -192,7 +193,8 @@ export class Ledger {
   #writeSync(): void {
     mkdirSync(dirname(this.#path), { recursive: true });
     const tmp = `${this.#path}.tmp`;
-    const fd = openSync(tmp, "w");
+    discardSync(tmp);
+    const fd = openSync(tmp, "wx");
     try {
       writeSync(fd, JSON.stringify(this.#data));
       fsyncSync(fd);
@@ -241,7 +243,8 @@ export class Ledger {
     const text = JSON.stringify(this.#data);
     const tmp = `${this.#path}.batch.tmp`;
     try {
-      const file = await open(tmp, "w");
+      await discard(tmp);
+      const file = await open(tmp, "wx");
       try {
         await file.writeFile(text);
         await file.sync();
@@ -539,6 +542,17 @@ const unrefSchedule: Schedule = (fn, ms) => {
   timer.unref();
   return () => clearTimeout(timer);
 };
+
+// Temp files are removed first and opened with "wx" (O_EXCL), so a planted symlink is never followed.
+
+/** Removes a temp file; a missing file is fine. */
+function discardSync(tmp: string): void {
+  try {
+    unlinkSync(tmp);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+}
 
 /** Removes a temp file; a missing file is fine. */
 async function discard(tmp: string): Promise<void> {

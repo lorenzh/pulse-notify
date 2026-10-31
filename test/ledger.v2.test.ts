@@ -1,6 +1,6 @@
 import { afterAll, test } from "bun:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger, WRITE_BATCH_MS } from "../src/ledger.ts";
@@ -125,6 +125,22 @@ test("the batch timer writes the file", async () => {
   ledger.settle("c", "1:opened", "delivered");
   timers.fire();
   await ledger.flush();
+  assert.equal(read(file).channels.c?.["1:opened"]?.status, "delivered");
+});
+
+test("sync and batch writes do not follow a planted temp-file symlink", async () => {
+  const file = path();
+  const victim = `${file}.victim`;
+  writeFileSync(victim, "DO_NOT_OVERWRITE");
+  symlinkSync(victim, `${file}.tmp`);
+  symlinkSync(victim, `${file}.batch.tmp`);
+  const timers = fakeSchedule();
+  const ledger = new Ledger(file, { schedule: timers.schedule });
+  ledger.claim("c", "1:opened", note("1:opened"));
+  ledger.settle("c", "1:opened", "delivered");
+  timers.fire();
+  await ledger.flush();
+  assert.equal(readFileSync(victim, "utf8"), "DO_NOT_OVERWRITE");
   assert.equal(read(file).channels.c?.["1:opened"]?.status, "delivered");
 });
 
