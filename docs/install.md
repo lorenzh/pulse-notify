@@ -27,7 +27,7 @@ docker run --rm \
   pulse-notify:local
 ```
 
-- The image runs as the non-root `bun` user and starts `bun --no-env-file src/index.ts`. It has a `HEALTHCHECK` that fetches `http://127.0.0.1:9100/healthz` every 30 seconds (5 second timeout, 10 second start period, 3 retries) and is unhealthy when the request fails or the status is not 2xx. The image sets `PULSE_HEALTH_PORT=9100`; see [operation.md](operation.md#health-and-metrics).
+- The image runs as the non-root `bun` user and starts `bun --no-env-file src/index.ts`. It has a `HEALTHCHECK` that fetches `http://127.0.0.1:$PULSE_HEALTH_PORT/healthz` (9100 when the variable is unset or empty, read at run time; a value that is not 1 to 5 digits fails the check without a request, and port 0 is not supported) every 30 seconds (5 second timeout, 10 second start period, 3 retries) and is unhealthy when the request fails or the status is not 2xx. `/healthz` reports the lifecycle only, so an unreachable pulse-api does not make the container unhealthy. The image sets `PULSE_HEALTH_PORT=9100`; see [operation.md](operation.md#health-and-metrics).
 - The service and its healthcheck run Bun with `--no-env-file`, so they read no `.env` files, also not ones mounted into `/app`. Settings come from the container environment (`-e`, `docker run --env-file` read on the host, Compose `environment:` or `env_file:`) and the files that the settings name, such as `PULSE_NOTIFY_CONFIG` and the channel `secretFile`/`urlFile` keys.
 - The image contains no config. Mount your file and point `PULSE_NOTIFY_CONFIG` at it.
 - `/data` is owned by `bun`. The image sets `PULSE_NOTIFY_STATE=/data/notify-state.json`. Mount a volume at `/data` to keep the delivery ledger across restarts. See [operation.md](operation.md).

@@ -16,6 +16,7 @@ export class Metrics {
   readonly #polls: Counter;
   readonly #feedPolls: Counter;
   readonly #deliveries: Counter;
+  readonly #skipped: Counter;
 
   /** Only channel ids are used as labels: never a URL or a path. */
   constructor(channelIds: string[], pending: () => number, failedPolls: () => number = () => 0) {
@@ -28,6 +29,10 @@ export class Metrics {
     this.#deliveries = this.#registry.counter(
       "pulse_notify_deliveries_total",
       "Finished deliveries by channel and outcome.",
+    );
+    this.#skipped = this.#registry.counter(
+      "pulse_notify_skipped_items_total",
+      "API feed items skipped as malformed, by feed.",
     );
     const pendingGauge: Gauge = this.#registry.gauge(
       "pulse_notify_pending_deliveries",
@@ -42,6 +47,7 @@ export class Metrics {
     for (const outcome of POLL_OUTCOMES) this.#polls.inc({ outcome }, 0);
     for (const feed of FEED_NAMES) {
       for (const outcome of POLL_OUTCOMES) this.#feedPolls.inc({ feed, outcome }, 0);
+      this.#skipped.inc({ feed }, 0);
     }
     for (const channel of channelIds) {
       for (const outcome of DELIVERY_OUTCOMES) this.#deliveries.inc({ channel, outcome }, 0);
@@ -58,6 +64,10 @@ export class Metrics {
 
   feedPollDone(feed: FeedName, outcome: PollOutcome): void {
     this.#feedPolls.inc({ feed, outcome });
+  }
+
+  itemSkipped(feed: FeedName): void {
+    this.#skipped.inc({ feed });
   }
 
   deliveryDone(channel: string, outcome: DeliveryOutcome): void {
