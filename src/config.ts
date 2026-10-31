@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 import {
   type Env,
+  isRecord,
   type LogLevel,
+  readInt,
   readLogLevel,
   readMs,
   readPort,
@@ -23,16 +25,14 @@ import type { ChannelConfig, Config, SmtpConfig } from "./types.ts";
 
 export const DEFAULT_LEASE_SECONDS = 60;
 export const MIN_LEASE_SECONDS = 30;
+/** The heartbeat runs every lease / 6 s, a timer of at most 2147483647 ms: floor(2147483647 * 6 / 1000). */
+export const MAX_LEASE_SECONDS = 12_884_901;
 
 export class ConfigError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "ConfigError";
   }
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Where secrets come from; injected so tests need no real environment. */
@@ -241,7 +241,7 @@ function parseChannel(
   source: SecretSource,
 ): ChannelConfig {
   const where = `channels[${index}]`;
-  if (!isObject(raw)) throw new ConfigError(`${where} must be an object`);
+  if (!isRecord(raw)) throw new ConfigError(`${where} must be an object`);
   const { id, type } = raw;
   if (typeof id !== "string" || id === "") {
     throw new ConfigError(`${where}.id must be a non-empty string`);
@@ -332,7 +332,7 @@ export interface Settings {
 
 /** An integer setting with a lower bound; the message keeps the "at least" wording. */
 function readMin(env: Env, name: string, fallback: number, min: number): number {
-  return readMs(env, name, { fallback, min, describe: `must be an integer of at least ${min}` });
+  return readInt(env, name, { fallback, min, describe: `must be an integer of at least ${min}` });
 }
 
 /** The API url must be http(s); the error never repeats it, it can hold credentials. */
@@ -356,7 +356,11 @@ function parseSmtpClientName(env: Env): string | undefined {
 }
 
 export function loadLockLeaseSeconds(env: Env): number {
-  return readMin(env, "PULSE_NOTIFY_LOCK_LEASE_SECONDS", DEFAULT_LEASE_SECONDS, MIN_LEASE_SECONDS);
+  return readInt(env, "PULSE_NOTIFY_LOCK_LEASE_SECONDS", {
+    fallback: DEFAULT_LEASE_SECONDS,
+    min: MIN_LEASE_SECONDS,
+    max: MAX_LEASE_SECONDS,
+  });
 }
 
 export function loadSettings(env: Env): Settings {
@@ -364,8 +368,8 @@ export function loadSettings(env: Env): Settings {
   if (configPath === undefined) {
     throw new StartupError("PULSE_NOTIFY_CONFIG is required", { setting: "PULSE_NOTIFY_CONFIG" });
   }
-  const pollMs = readMin(env, "PULSE_NOTIFY_POLL_MS", 5000, 1);
-  const timeoutMs = readMin(env, "PULSE_NOTIFY_TIMEOUT_MS", 5000, 1);
+  const pollMs = readMs(env, "PULSE_NOTIFY_POLL_MS", { fallback: 5000, min: 1 });
+  const timeoutMs = readMs(env, "PULSE_NOTIFY_TIMEOUT_MS", { fallback: 5000, min: 1 });
   const retryDelayMs = readMs(env, "PULSE_NOTIFY_RETRY_DELAY_MS", {
     fallback: DEFAULT_RETRY_DELAY_MS,
     min: 0,
@@ -387,7 +391,7 @@ export function loadSettings(env: Env): Settings {
     pollMs,
     retryDelayMs,
     retryMaxDelayMs,
-    retryAttempts: readMs(env, "PULSE_NOTIFY_RETRY_ATTEMPTS", {
+    retryAttempts: readInt(env, "PULSE_NOTIFY_RETRY_ATTEMPTS", {
       fallback: DEFAULT_RETRY_ATTEMPTS,
       min: 0,
     }),

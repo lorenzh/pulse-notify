@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, test } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ManualIncident } from "@lorenzh/pulse-contract";
@@ -13,6 +13,8 @@ import {
   type FakeApi,
   incident,
   manualIncident,
+  type RecordingFs,
+  recordingFs,
   type SpyLogger,
   spyLogger,
   startFakeApi,
@@ -71,11 +73,11 @@ function writeState(data: unknown): void {
   writeFileSync(statePath(), JSON.stringify(data));
 }
 
-function make(): Notifier {
+function make(fs?: RecordingFs): Notifier {
   return new Notifier({
     config: { channels: [{ id: "web", type: "file", path: outPath() }] },
     apiUrl: api.url,
-    ledger: new Ledger(statePath(), { now: () => clock }),
+    ledger: new Ledger(statePath(), { now: () => clock, ...(fs ? { fs } : {}) }),
     logger,
     now: () => clock,
     sleep: async () => {},
@@ -171,12 +173,13 @@ test("a 404 then an existing incident sends nothing", async () => {
 test("a failed seed write marks nothing and sends nothing; the next poll seeds", async () => {
   writeState(V2_LEDGER);
   api.manualIncidents = [open7([creation, updateA])];
-  const n = make();
-  mkdirSync(`${statePath()}.tmp`);
+  const fs = recordingFs();
+  const n = make(fs);
+  fs.faults.isOpenTempFailing = true;
   await poll(n);
   assert.ok(logger.entries.some((e) => e.msg === "ledger seed failed, the next poll retries"));
   assert.equal(manualFrom(), undefined);
-  rmSync(`${statePath()}.tmp`, { recursive: true });
+  fs.faults.isOpenTempFailing = false;
   await poll(n);
   await n.stop();
   assert.equal(typeof manualFrom(), "number");

@@ -1,3 +1,5 @@
+import { AtomicWriteError } from "@lorenzh/pulse-kit";
+
 /**
  * A delivery failure that a retry cannot fix (a 4xx answer, an SMTP 5xx reply).
  * `status` is the HTTP status or SMTP reply code; `code` is a system error code.
@@ -19,7 +21,8 @@ export class PermanentDeliveryError extends Error {
 
 export type ErrorFields = { error: string; code?: string; cause?: string };
 
-/** Log fields for an error: its message, the innermost `code` and the innermost cause message. */
+/** Log fields for an error: its message, the innermost `code` and the innermost cause message.
+ * The walk stops at an `AtomicWriteError`, whose cause text is never logged. */
 export function errorFields(err: unknown): ErrorFields {
   const fields: ErrorFields = { error: messageOf(err) };
   let current: unknown = err;
@@ -29,7 +32,8 @@ export function errorFields(err: unknown): ErrorFields {
     seen.add(current);
     const code = (current as { code?: unknown }).code;
     if (typeof code === "string") fields.code = code;
-    if (current.cause === undefined) break;
+    // The kit already reduced the cause to a stage and an errno; its raw text can hold paths.
+    if (current instanceof AtomicWriteError || current.cause === undefined) break;
     innermost = current.cause;
     current = current.cause;
   }

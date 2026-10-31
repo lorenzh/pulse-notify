@@ -1,7 +1,14 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Check, Incident, ManualIncident } from "@lorenzh/pulse-contract";
-import type { Logger, LogLevel } from "@lorenzh/pulse-kit";
+import {
+  type AtomicWriteFs,
+  type AtomicWriteSyncFs,
+  type Logger,
+  type LogLevel,
+  nodeAtomicWriteFs,
+  nodeAtomicWriteSyncFs,
+} from "@lorenzh/pulse-kit";
 
 export interface LogEntry {
   level: LogLevel;
@@ -244,4 +251,88 @@ type FetchCall = (input: string | URL | Request, init?: RequestInit) => Promise<
 /** Gives a fake the full `typeof fetch` shape, which Bun's types extend with `preconnect`. */
 export function fakeFetch(call: FetchCall): typeof fetch {
   return Object.assign(call, { preconnect: () => {} });
+}
+
+/** Switches that make the recording fs fail one step with an errno-like error. */
+export interface FsFaults {
+  isOpenTempFailing?: boolean;
+  isTempFsyncFailing?: boolean;
+  isDirFsyncFailing?: boolean;
+}
+
+/** Steps of an atomic write, as recorded: `fsync:file`, `rename`, `open:dir`, `fsync:dir`. */
+export interface RecordingFs {
+  steps: string[];
+  faults: FsFaults;
+  sync: AtomicWriteSyncFs;
+  async: AtomicWriteFs;
+}
+
+function fsFault(code: string): Error & { code: string } {
+  return Object.assign(new Error(code), { code });
+}
+
+/** The kit node fs, wrapped so a test sees the order of the durable steps and can inject faults. */
+export function recordingFs(): RecordingFs {
+  const steps: string[] = [];
+  const faults: FsFaults = {};
+  const dirFds = new Set<number>();
+  const beforeOpen = (flags: "wx" | "r"): void => {
+    if (flags === "wx" && faults.isOpenTempFailing === true) throw fsFault("ENOSPC");
+  };
+  const afterOpen = (fd: number, flags: "wx" | "r"): void => {
+    if (flags === "r") {
+      dirFds.add(fd);
+      steps.push("open:dir");
+    }
+  };
+  const beforeFsync = (fd: number): void => {
+    const isDir = dirFds.has(fd);
+    steps.push(isDir ? "fsync:dir" : "fsync:file");
+    if (isDir && faults.isDirFsyncFailing === true) throw fsFault("EIO");
+    if (!isDir && faults.isTempFsyncFailing === true) throw fsFault("EIO");
+  };
+  const sync: AtomicWriteSyncFs = {
+    ...nodeAtomicWriteSyncFs,
+    open: (path, flags, mode) => {
+      beforeOpen(flags);
+      const fd = nodeAtomicWriteSyncFs.open(path, flags, mode);
+      afterOpen(fd, flags);
+      return fd;
+    },
+    fsync: (fd) => {
+      beforeFsync(fd);
+      nodeAtomicWriteSyncFs.fsync(fd);
+    },
+    close: (fd) => {
+      dirFds.delete(fd);
+      nodeAtomicWriteSyncFs.close(fd);
+    },
+    rename: (from, to) => {
+      steps.push("rename");
+      nodeAtomicWriteSyncFs.rename(from, to);
+    },
+  };
+  const async: AtomicWriteFs = {
+    ...nodeAtomicWriteFs,
+    open: async (path, flags, mode) => {
+      beforeOpen(flags);
+      const fd = await nodeAtomicWriteFs.open(path, flags, mode);
+      afterOpen(fd, flags);
+      return fd;
+    },
+    fsync: async (fd) => {
+      beforeFsync(fd);
+      await nodeAtomicWriteFs.fsync(fd);
+    },
+    close: async (fd) => {
+      dirFds.delete(fd);
+      await nodeAtomicWriteFs.close(fd);
+    },
+    rename: async (from, to) => {
+      steps.push("rename");
+      await nodeAtomicWriteFs.rename(from, to);
+    },
+  };
+  return { steps, faults, sync, async };
 }

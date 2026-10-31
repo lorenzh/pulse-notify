@@ -65,7 +65,7 @@ The ledger keeps a per-channel `manualFrom` time: the first good `GET /manual-in
 - A `pending` entry written by an older version has no stored notification. The poll rebuilds it from the API incident (key `<id>:<event>`) and sends it. If the incident is no longer returned, `pending notification cannot be rebuilt: incident not found` is logged once per start and the key stays `pending`.
 - Events that failed stay `failed` and are not retried by the service (unless `PULSE_NOTIFY_RETRY_ATTEMPTS=0`). Use [`failed resend`](#failed-events-and-resend).
 - Enabling `remindEverySeconds` on an existing channel does not send a burst of reminders, see [channels.md](channels.md#reminders).
-- `SIGINT` and `SIGTERM`: polling stops, sleeps and sends in flight are aborted, unfinished keys stay `pending` (so they are resent at the next start), and batched ledger changes are written, the state lock is removed, and the process exits with 0 once the workers are done. It waits at most 5 seconds for that. A send that was in flight has an unknown result and is sent again, so a duplicate is possible.
+- `SIGINT` and `SIGTERM`: polling stops, sleeps and sends in flight are aborted, unfinished keys stay `pending` (so they are resent at the next start), and batched ledger changes are written, the state lock is removed, and the process exits with 0 once the workers are done. It waits at most 5 seconds for that; a longer stop logs a `warn` line and exits with 1. A send that was in flight has an unknown result and is sent again, so a duplicate is possible.
 - If pulse-api is down, stalls or sends malformed data, pulse-notify keeps running and polls again on the next tick. The three reads of a poll (`incidents`, `checks`, `manual-incidents`) run in parallel and settle on their own: a failing read skips only the work that needs it, see [Failing feeds](#failing-feeds). An incident with a bad `id`, `checkId`, `openedAt` or `resolvedAt` (including a timestamp outside the range of a JavaScript `Date`, ±8.64e15 ms) is skipped with an `error` log (`incident skipped: malformed data`). The same holds for a bad manual incident; a bad check is skipped with a `warn` log (`check skipped: malformed data`). Each skipped item on any of the three feeds is counted in `pulse_notify_skipped_items_total` on every poll, but logged once per identity: the integer id, or the array index when the id is not an integer. At most 1024 identities are kept; the oldest is evicted first, so it can log again. A skipped item creates no ledger entry and is checked again on every poll. Other items are still processed.
 - Ledger write errors do not stop the process. A failed `claim` means the event is not sent and the next poll tries again. A failed `settle` (or a failed batched write, logged as `ledger write failed, pending keys are resent`) leaves the key `pending` on disk, so it is sent again at the next start. A failed `seed` leaves the channel unseeded and the next poll tries again.
 
@@ -121,9 +121,9 @@ Startup errors are not JSON. They are one line on stderr: `pulse-notify: <messag
 
 | Code | Meaning                                                                               |
 | ---- | ------------------------------------------------------------------------------------- |
-| `0`  | Clean stop after `SIGINT` or `SIGTERM` (also when the 5 s bound was hit).             |
+| `0`  | Clean stop after `SIGINT` or `SIGTERM`.                                               |
 | `2`  | Configuration or startup error, the state file is in use, or the state lock was lost. |
-| `1`  | Unexpected failure while running.                                                     |
+| `1`  | Unexpected failure while running, or a stop that took longer than the 5 s bound.      |
 
 The signal handlers are registered before the settings, the config and the ledger are read. A second signal does nothing more.
 
@@ -131,7 +131,7 @@ The signal handlers are registered before the settings, the config and the ledge
 
 Set `PULSE_HEALTH_PORT` to start an HTTP listener (off by default) on `PULSE_HEALTH_HOST` (default `127.0.0.1`). It has no authentication: do not publish it. The Docker image enables it on `0.0.0.0:9100` and has a `HEALTHCHECK` on `127.0.0.1:$PULSE_HEALTH_PORT/healthz` (9100 when unset or empty, read at run time; port 0 is not supported); Compose should not publish the port.
 
-The listener binds before polling starts. If the bind fails, the service prints one line and exits 2. If a stop takes longer than 5 s on SIGINT/SIGTERM, it logs a `warn` line and exits 0.
+The listener binds before polling starts. If the bind fails, the service prints one line and exits 2. If a stop takes longer than 5 s on SIGINT/SIGTERM, it logs a `warn` line and exits 1.
 
 - `GET /healthz` (liveness, the lifecycle only): `200 ok` once the poll loop runs, `503 starting` before that, and `503 shutting down` once a stop began, also after a lost state lock. It never reads the feed health, so failing polls do not get a working notifier restarted. The Docker `HEALTHCHECK` uses it.
 - `GET /readyz` (feed health): `503` while starting and shutting down, and after `PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS` (default 5) failed polls in a row `503 polls failing (<n> in a row)`. A poll fails when any of the three feeds failed (including a body over `PULSE_NOTIFY_API_MAX_BYTES` or a redirect) or the detection threw; a 404 on `manual-incidents` and a read with rejected items are good. The feeds that answered are still used meanwhile. One good poll resets the count and `/readyz` is `200` again. Monitor `/readyz` or `pulse_notify_consecutive_failed_polls` to see a failing api. `/healthz` and `/readyz` both answer `HEAD`; a method other than `GET` and `HEAD` answers `405`.
