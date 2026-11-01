@@ -264,9 +264,25 @@ test("security: exact image healthcheck rejects invalid env ports without fetchi
   assert.ok(match?.[1]);
   const command: unknown = JSON.parse(match[1]);
   assert.ok(Array.isArray(command) && command.every((v: unknown) => typeof v === "string"));
-  const script: unknown = command[2];
+  assert.deepEqual(command.slice(0, 3), ["bun", "--no-env-file", "-e"]);
+  assert.equal(command.length, 4);
+  const script: unknown = command[3];
   assert.equal(typeof script, "string");
   if (typeof script !== "string") return;
+  const runHealthcheck = async (port: string): Promise<{ code: number; stderr: string }> => {
+    const child: Bun.Subprocess<"ignore", "pipe", "pipe"> = Bun.spawn(
+      [process.execPath, "--no-env-file", "-e", script],
+      {
+        env: { ...process.env, PULSE_HEALTH_PORT: port },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    const code = await child.exited;
+    const stderr: string = await new Response(child.stderr).text();
+    return { code, stderr };
+  };
   let hits = 0;
   const server = createServer((_req, res) => {
     hits++;
@@ -275,6 +291,11 @@ test("security: exact image healthcheck rejects invalid env ports without fetchi
   const url = await listen(server);
   const localPort = new URL(url).port;
   try {
+    // Control: the same expression passes on a valid port, so exit 1 below is validation.
+    const control = await runHealthcheck(localPort);
+    assert.equal(control.code, 0, control.stderr);
+    assert.equal(hits, 1);
+    hits = 0;
     for (const port of [
       `${localPort}@127.0.0.1:${localPort}/`,
       `${localPort}/../x`,
@@ -288,17 +309,7 @@ test("security: exact image healthcheck rejects invalid env ports without fetchi
       "１２３",
       "0x50",
     ]) {
-      const child: Bun.Subprocess<"ignore", "pipe", "pipe"> = Bun.spawn(
-        [process.execPath, "-e", script],
-        {
-          env: { ...process.env, PULSE_HEALTH_PORT: port },
-          stdin: "ignore",
-          stdout: "pipe",
-          stderr: "pipe",
-        },
-      );
-      const code = await child.exited;
-      const stderr: string = await new Response(child.stderr).text();
+      const { code, stderr } = await runHealthcheck(port);
       assert.equal(code, 1, `port ${JSON.stringify(port)}: ${stderr}`);
       assert.equal(hits, 0);
     }

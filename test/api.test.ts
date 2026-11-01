@@ -2,7 +2,7 @@ import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { WIRE_VERSION, WIRE_VERSION_HEADER } from "@lorenzh/pulse-contract";
 import { fetchChecks, fetchIncidents } from "../src/api.ts";
-import { fakeFetch, httpCheck, incident } from "./support.ts";
+import { fakeFetch, httpCheck, incident, startFakeApi } from "./support.ts";
 
 async function check(over: Record<string, unknown>) {
   const body = [{ ...incident({ id: 1 }), ...over }];
@@ -151,4 +151,27 @@ test("a network error keeps its code and loses the credentials", async () => {
   assert.ok(err instanceof Error);
   assert.equal((err as { code?: unknown }).code, "ECONNREFUSED");
   assert.ok(!err.message.includes("hunter2"));
+});
+
+test("checks with a url that is not http or https are dropped and reported", async () => {
+  const api = await startFakeApi();
+  try {
+    api.checks = [
+      httpCheck("plain", "Plain"),
+      { id: "tls", name: "TLS", url: "https://example.invalid/check", intervalMs: 1000 },
+      { id: "file", name: "File", url: "file:///tmp/dotenv-marker-556", intervalMs: 1000 },
+      // eslint-disable-next-line sonarjs/no-clear-text-protocols -- fixture URL is never requested
+      { id: "ftp", name: "FTP", url: "ftp://example.invalid/check", intervalMs: 1000 },
+    ];
+    const errors: number[] = [];
+    const out = await fetchChecks({ baseUrl: api.url, onInvalidCheck: (e) => errors.push(e) });
+    assert.deepEqual(
+      out.map((c) => c.id),
+      ["plain", "tls"],
+    );
+    assert.equal(out.length, 2);
+    assert.deepEqual(errors, [2, 3]);
+  } finally {
+    await api.close();
+  }
 });

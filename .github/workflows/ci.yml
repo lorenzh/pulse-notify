@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   check:
-    uses: lorenzh/pulse-config/.github/workflows/check.yml@dc69a126bebbe50d8a7339ea1325d51b2ea43d7d
+    uses: lorenzh/pulse-config/.github/workflows/check.yml@04108fa0c67d9a79c0f6d1ade4dd78df3ad8a4a7
 
   docker:
     strategy:
@@ -30,6 +30,8 @@ jobs:
         with:
           persist-credentials: false
       - run: docker build --tag pulse-notify:local .
+      - name: Image ignores dotenv files
+        run: bash scripts/image-dotenv.sh pulse-notify:local
       - name: Check the image has no test files
         run: |
           found="$(docker run --rm --entrypoint sh pulse-notify:local -c "find /app -type f \( -name '*.test.ts' -o -name '*.spec.ts' \) -not -path '*/node_modules/*'")"
@@ -97,4 +99,4 @@ jobs:
       packages: write
       id-token: write
       attestations: write
-    uses: lorenzh/pulse-config/.github/workflows/release.yml@dc69a126bebbe50d8a7339ea1325d51b2ea43d7d
+    uses: lorenzh/pulse-config/.github/workflows/release.yml@04108fa0c67d9a79c0f6d1ade4dd78df3ad8a4a7
