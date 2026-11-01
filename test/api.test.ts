@@ -1,6 +1,6 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { WIRE_VERSION, WIRE_VERSION_HEADER } from "@lorenzh/pulse-contract";
+import { validateCheck, WIRE_VERSION, WIRE_VERSION_HEADER } from "@lorenzh/pulse-contract";
 import { fetchChecks, fetchIncidents } from "../src/api.ts";
 import { fakeFetch, httpCheck, incident, startFakeApi } from "./support.ts";
 
@@ -171,6 +171,28 @@ test("checks with a url that is not http or https are dropped and reported", asy
     );
     assert.equal(out.length, 2);
     assert.deepEqual(errors, [2, 3]);
+  } finally {
+    await api.close();
+  }
+});
+
+test("a check with a username or password in its url is dropped without leaking it", async () => {
+  const api = await startFakeApi();
+  try {
+    const raw = { id: "u", name: "U", url: "https://qz9u:qz9p@x.test/", intervalMs: 1000 };
+    api.checks = [raw, httpCheck("plain", "Plain")];
+    const errors: number[] = [];
+    const out = await fetchChecks({ baseUrl: api.url, onInvalidCheck: (e) => errors.push(e) });
+    assert.deepEqual(
+      out.map((c) => c.id),
+      ["plain"],
+    );
+    assert.deepEqual(errors, [0]);
+    const result = validateCheck(raw, "checks[0]");
+    assert.equal(result.ok, false);
+    const text = result.ok ? "" : result.error;
+    assert.equal(text, "checks[0].url: must not contain a username or password");
+    assert.ok(!text.includes("qz9") && !text.includes("x.test"));
   } finally {
     await api.close();
   }
