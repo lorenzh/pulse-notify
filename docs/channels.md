@@ -66,6 +66,9 @@ Every channel can limit the checks it reports:
 - An entry is an exact check id, or a glob where `*` matches any characters: `api-*` matches `api-eu` and `api-us`. An entry without `*` matches exactly, so old configs behave the same.
 - Routing applies to all channel types and to reminders.
 - There are no tags: pulse-contract has no tags on checks, so route by id or by pattern.
+- Changing the filters sends no burst. The ledger stores each channel's filters (`checks` and `excludeChecks`; `components` and `excludeComponents` for manual incidents), sorted and without duplicates, so order, duplicates and an empty list against an absent one do not count as a change. When the filters differ from the stored ones at a poll, the incidents that the API shows and that only the new filters route are recorded as `seeded`, together with their due reminder. Nothing is sent for them; the log says `routing changed: history of newly routed checks skipped` (or `... manual incidents skipped`). Their later events (`resolved`, a manual update, a reminder of a later interval) are sent. Incidents that both filters route are not touched, so events that happened while notify was stopped are still sent. Narrowing a filter only stores the new filters.
+- The check filters are compared only when `/incidents` answered, and the component filters only when `/manual-incidents` answered (not on a 404). If the write fails, the channel's detection for that feed is skipped for that poll and the next poll tries again.
+- Known limit: a ledger without stored filters (a JSON ledger migrated at upgrade, or a channel from an older version) takes the current filters as they are and seeds nothing. A filter widening made in the same restart as the upgrade can therefore send old history once. Upgrade first, then change the filters in a later restart.
 
 ## Manual incidents
 

@@ -11,7 +11,14 @@ import {
 import { BoundedSet } from "./bounded-set.ts";
 import { createSender } from "./channels/factory.ts";
 import type { SendMail } from "./channels/mailer.ts";
-import { isManualRouted, isRouted } from "./channels/routing.ts";
+import {
+  checkRouting,
+  componentRouting,
+  isManualRouted,
+  isRouted,
+  parseCheckRouting,
+  parseComponentRouting,
+} from "./channels/routing.ts";
 import { ChannelDelivery } from "./delivery.ts";
 import {
   type DetectedManualEvent,
@@ -459,7 +466,7 @@ export class Notifier {
       if (incidents && manual) this.#seedChannel(channel, incidents, manual, reminders, nowMs);
       return;
     }
-    if (incidents) {
+    if (incidents && this.#syncCheckRouting(channel, incidents, reminders)) {
       if (!this.#syncReminderMark(channel.config.id, incidents, reminders, nowMs)) return;
       this.#rebuildLegacyPending(channel, incidents, nowMs);
       this.#detectAutomatic(channel, incidents, reminders, nowMs);
@@ -473,12 +480,15 @@ export class Notifier {
     const { ledger, logger } = this.#opts;
     const id = channel.config.id;
     if (ledger.manualFrom(id) !== undefined) {
-      this.#detectManual(channel, manual);
+      if (this.#syncComponentRouting(channel, manual)) this.#detectManual(channel, manual);
       return;
     }
     const routed = manual.filter((i) => isManualRouted(channel.config, i.componentIds));
     try {
-      ledger.seed(id, seedManualKeys(routed), { manualFrom: nowMs });
+      ledger.seed(id, seedManualKeys(routed), {
+        manualFrom: nowMs,
+        componentRouting: componentRouting(channel.config),
+      });
     } catch (err) {
       logger.error("ledger seed failed, the next poll retries", {
         channel: id,
@@ -512,8 +522,11 @@ export class Notifier {
         ],
         {
           ...(reminders ? { remindersFrom: nowMs } : {}),
+          checkRouting: checkRouting(channel.config),
           // On a 404 the manual feed was not seen: its first good read seeds again.
-          ...(manual.isAbsent ? {} : { manualFrom: nowMs }),
+          ...(manual.isAbsent
+            ? {}
+            : { manualFrom: nowMs, componentRouting: componentRouting(channel.config) }),
         },
       );
     } catch (err) {
@@ -558,6 +571,82 @@ export class Notifier {
     for (const detected of detectManualEvents(relevantManual, isHandled)) {
       this.#enqueue(channel, detected.key, () => buildManualNotification(detected));
     }
+  }
+
+  /**
+   * Check filters changed since the stored baseline: the history of newly routed checks is
+   * seeded, so widening a filter sends no burst. False if the ledger could not be written.
+   */
+  #syncCheckRouting(
+    channel: ChannelState,
+    incidents: Incident[],
+    reminders: ReminderPlan | undefined,
+  ): boolean {
+    const { config } = channel;
+    const stored = this.#opts.ledger.checkRouting(config.id);
+    const old = stored === undefined ? undefined : parseCheckRouting(stored);
+    const newly =
+      old === undefined
+        ? []
+        : incidents.filter((i) => isRouted(config, i.checkId) && !isRouted(old, i.checkId));
+    return this.#writeRouting(channel, stored, {
+      current: checkRouting(config),
+      mark: "checkRouting",
+      keys: () => seedKeys(newly, reminders),
+      count: newly.length,
+      message: "routing changed: history of newly routed checks skipped",
+    });
+  }
+
+  /** Like `#syncCheckRouting`, for the component filters of manual incidents. */
+  #syncComponentRouting(channel: ChannelState, manual: ManualIncident[]): boolean {
+    const { config } = channel;
+    const stored = this.#opts.ledger.componentRouting(config.id);
+    const old = stored === undefined ? undefined : parseComponentRouting(stored);
+    const newly =
+      old === undefined
+        ? []
+        : manual.filter(
+            (i) => isManualRouted(config, i.componentIds) && !isManualRouted(old, i.componentIds),
+          );
+    return this.#writeRouting(channel, stored, {
+      current: componentRouting(config),
+      mark: "componentRouting",
+      keys: () => seedManualKeys(newly),
+      count: newly.length,
+      message: "routing changed: history of newly routed manual incidents skipped",
+    });
+  }
+
+  /**
+   * Equal fingerprints write nothing. A missing one (an older ledger) becomes the baseline
+   * without seeding; a changed one seeds `keys` with the new baseline in one transaction.
+   */
+  #writeRouting(
+    channel: ChannelState,
+    stored: string | undefined,
+    change: {
+      current: string;
+      mark: "checkRouting" | "componentRouting";
+      keys: () => string[];
+      count: number;
+      message: string;
+    },
+  ): boolean {
+    const { ledger, logger } = this.#opts;
+    const id = channel.config.id;
+    if (stored === change.current) return true;
+    try {
+      ledger.seed(id, stored === undefined ? [] : change.keys(), { [change.mark]: change.current });
+    } catch (err) {
+      logger.error("ledger seed failed, the next poll retries", {
+        channel: id,
+        ...errorFields(err),
+      });
+      return false;
+    }
+    if (stored !== undefined) logger.info(change.message, { channel: id, incidents: change.count });
+    return true;
   }
 
   /**

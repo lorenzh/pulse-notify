@@ -85,32 +85,34 @@ A good `checks` read replaces the known names: a check that is no longer listed 
 
 Logs are JSON lines on stderr. Each line has `time` (ISO 8601 UTC), `level` (`debug`, `info`, `warn` or `error`), `msg` and extra fields.
 
-| Level   | `msg`                                                             | Fields                                                                                                          |
-| ------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `info`  | `pulse-notify started`                                            | `channels` (ids), `apiUrl` (without user info, query and fragment)                                              |
-| `info`  | `channel seeded with existing incidents`                          | `channel`, `incidents`                                                                                          |
-| `info`  | `resending pending notifications`                                 | `channel`, `count`                                                                                              |
-| `info`  | `notification delivered`                                          | `channel`, `key`, `attempts`                                                                                    |
-| `warn`  | `delivery attempt failed`                                         | `channel`, `key`, `attempt`, `error`, `code`, `cause`                                                           |
-| `warn`  | `delivery attempt partly refused`                                 | `channel`, `key`, `attempt`, `delivered`, `refused`, `remaining` (counts), `codes` (sorted reply codes)         |
-| `error` | `ledger recipient write failed`                                   | `channel`, `key`, `error`, `code`, `cause`                                                                      |
-| `error` | `notification delivery failed`                                    | `channel`, `key`, `attempts`, `error`, `code`, `cause`; for a permanent error also `permanent: true` and `note` |
-| `info`  | `old ledger entries pruned`                                       | `count`                                                                                                         |
-| `info`  | `ledger migrated`                                                 | `from`, `entries`, `backup`                                                                                     |
-| `error` | `ledger prune failed, the next prune retries`                     | `error`                                                                                                         |
-| `info`  | `reminders enabled: due reminders of open incidents skipped`      | `channel`                                                                                                       |
-| `warn`  | `taking over a stale state lock`                                  | `path`, `holderHostname`, `holderPid`                                                                           |
-| `error` | `state lock lost, stopping`                                       | `error`                                                                                                         |
-| `error` | `notification cannot be built, the next poll retries`             | `channel`, `key`, `error`, `code`, `cause`                                                                      |
-| `error` | `api poll failed`                                                 | `feed`, `error`, `code`, `cause`; logged once per feed and failure kind while the feed keeps failing            |
-| `info`  | `api feed recovered`                                              | `feed`, after a logged failure of that feed                                                                     |
-| `info`  | `manual incidents initialized: existing manual incidents skipped` | `channel`, `incidents`                                                                                          |
-| `error` | `incident skipped: malformed data`                                | `feed` (`incidents` or `manual-incidents`), `index`, `reason`, and `incidentId` only when the id is an integer  |
-| `warn`  | `check skipped: malformed data`                                   | `feed` (`checks`), `index`, `reason` (`invalid`)                                                                |
-| `error` | `pending notification cannot be rebuilt: incident not found`      | `channel`, `key`                                                                                                |
-| `error` | `ledger claim failed, the next poll retries`                      | `channel`, `key`, `error`                                                                                       |
-| `error` | `ledger settle failed, the key stays pending`                     | `channel`, `key`, `error`                                                                                       |
-| `error` | `ledger seed failed, the next poll retries`                       | `channel`, `error`                                                                                              |
+| Level   | `msg`                                                               | Fields                                                                                                          |
+| ------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `info`  | `pulse-notify started`                                              | `channels` (ids), `apiUrl` (without user info, query and fragment)                                              |
+| `info`  | `channel seeded with existing incidents`                            | `channel`, `incidents`                                                                                          |
+| `info`  | `resending pending notifications`                                   | `channel`, `count`                                                                                              |
+| `info`  | `notification delivered`                                            | `channel`, `key`, `attempts`                                                                                    |
+| `warn`  | `delivery attempt failed`                                           | `channel`, `key`, `attempt`, `error`, `code`, `cause`                                                           |
+| `warn`  | `delivery attempt partly refused`                                   | `channel`, `key`, `attempt`, `delivered`, `refused`, `remaining` (counts), `codes` (sorted reply codes)         |
+| `error` | `ledger recipient write failed`                                     | `channel`, `key`, `error`, `code`, `cause`                                                                      |
+| `error` | `notification delivery failed`                                      | `channel`, `key`, `attempts`, `error`, `code`, `cause`; for a permanent error also `permanent: true` and `note` |
+| `info`  | `old ledger entries pruned`                                         | `count`                                                                                                         |
+| `info`  | `ledger migrated`                                                   | `from`, `entries`, `backup`                                                                                     |
+| `error` | `ledger prune failed, the next prune retries`                       | `error`                                                                                                         |
+| `info`  | `reminders enabled: due reminders of open incidents skipped`        | `channel`                                                                                                       |
+| `info`  | `routing changed: history of newly routed checks skipped`           | `channel`, `incidents` (count of newly routed incidents)                                                        |
+| `info`  | `routing changed: history of newly routed manual incidents skipped` | `channel`, `incidents` (count of newly routed manual incidents)                                                 |
+| `warn`  | `taking over a stale state lock`                                    | `path`, `holderHostname`, `holderPid`                                                                           |
+| `error` | `state lock lost, stopping`                                         | `error`                                                                                                         |
+| `error` | `notification cannot be built, the next poll retries`               | `channel`, `key`, `error`, `code`, `cause`                                                                      |
+| `error` | `api poll failed`                                                   | `feed`, `error`, `code`, `cause`; logged once per feed and failure kind while the feed keeps failing            |
+| `info`  | `api feed recovered`                                                | `feed`, after a logged failure of that feed                                                                     |
+| `info`  | `manual incidents initialized: existing manual incidents skipped`   | `channel`, `incidents`                                                                                          |
+| `error` | `incident skipped: malformed data`                                  | `feed` (`incidents` or `manual-incidents`), `index`, `reason`, and `incidentId` only when the id is an integer  |
+| `warn`  | `check skipped: malformed data`                                     | `feed` (`checks`), `index`, `reason` (`invalid`)                                                                |
+| `error` | `pending notification cannot be rebuilt: incident not found`        | `channel`, `key`                                                                                                |
+| `error` | `ledger claim failed, the next poll retries`                        | `channel`, `key`, `error`                                                                                       |
+| `error` | `ledger settle failed, the key stays pending`                       | `channel`, `key`, `error`                                                                                       |
+| `error` | `ledger seed failed, the next poll retries`                         | `channel`, `error`                                                                                              |
 
 `feed` is `incidents`, `checks` or `manual-incidents`. A failure kind is the kind of `fetchJson` failure (`timeout`, `network`, `too-large`, ...); an HTTP failure includes its status, so `500` and then `503` log twice. When the feed answers again, the next failure logs again. An unreachable api therefore logs three lines (one per feed) once, not one line per poll; the metrics still count every failed read.
 
@@ -174,5 +176,6 @@ From a version without `manualFrom` in the ledger:
 From a version with a JSON state file (format 1 or 2):
 
 - The first start migrates the file to SQLite format 3 and keeps the original as `<state>.v<N>.bak` (logged as `ledger migrated`). Statuses, times, payloads and marks are kept. A later start does not migrate again.
+- Routing filters are stored from the first poll after the upgrade on. A filter widening made in the same restart as the upgrade sends the history of the newly routed checks once. Upgrade first, then change filters in a later restart, see [channels.md](channels.md#routing).
 - Backup now needs a stopped service, see [State: the delivery ledger](#state-the-delivery-ledger).
 - Downgrade to a JSON version: stop, restore `<state>.v2.bak` to `<state>`, remove `<state>-wal` and `<state>-shm`. Events settled after the migration may then be sent again.
