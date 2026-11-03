@@ -44,11 +44,11 @@ for (const isMigration of [true, false]) {
         refused: [],
       });
       const files = [path, `${path}-wal`, `${path}-shm`];
-      const modes = files.map((file) => (statSync(file).mode & 0o777).toString(8));
+      if (isMigration)
+        assert.equal(statSync(`${path}.v2.bak`).mode & 0o077, 0, "backup must be private");
       const hasPrivatePayload = files.some((file) =>
         readFileSync(file).includes(Buffer.from("PRIVATE_NOTIFICATION_MARKER")),
       );
-      console.log(JSON.stringify({ isMigration, modes, hasPrivatePayload }));
       assert.equal(hasPrivatePayload, true);
       for (const file of files) {
         assert.equal(statSync(file).mode & 0o077, 0, `${file} must not be group/world readable`);

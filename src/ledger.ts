@@ -383,6 +383,9 @@ function publish(
   beforeRename?: () => void,
 ): void {
   const building = `${path}.migrating`;
+  // SQLite creates a new file with the default mode and gives its journal, WAL and shm files
+  // the mode of the database file. Creating it first keeps all of them private.
+  closeSync(openSync(building, "wx", 0o600));
   const db = new Database(building, { create: true, readwrite: true });
   try {
     db.run(SCHEMA);
