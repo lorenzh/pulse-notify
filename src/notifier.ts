@@ -31,6 +31,7 @@ import type {
   Config,
   Notification,
   NotificationEvent,
+  RecipientProgress,
   Schedule,
   Sleep,
 } from "./types.ts";
@@ -100,7 +101,7 @@ interface ChannelState {
   /** Keys enqueued but not yet recorded in the ledger. */
   queued: Set<string>;
   /** Pending reminders from the ledger, held until the first successful poll. */
-  held: Notification[];
+  held: { notification: Notification; recipients: RecipientProgress | undefined }[];
 }
 
 const REMINDER_KEY = /^(\d+):reminder:(\d+)$/;
@@ -270,16 +271,16 @@ export class Notifier {
 
   #resendPending(): void {
     const counts = new Map<string, number>();
-    for (const { channelId, key, notification } of this.#opts.ledger.pending()) {
+    for (const { channelId, key, notification, recipients } of this.#opts.ledger.pending()) {
       const channel = this.#channels.find((c) => c.config.id === channelId);
       if (!channel || !notification) continue;
       if (notification.event === "reminder") {
         // Held until a poll shows which incidents are resolved.
-        channel.held.push(notification);
+        channel.held.push({ notification, recipients });
         continue;
       }
       channel.queued.add(key);
-      channel.delivery.enqueue(notification);
+      channel.delivery.enqueue(notification, recipients);
       counts.set(channelId, (counts.get(channelId) ?? 0) + 1);
     }
     for (const [channel, count] of counts) {
@@ -401,9 +402,9 @@ export class Notifier {
   #releaseHeld(): void {
     for (const channel of this.#channels) {
       const held = channel.held.splice(0);
-      for (const notification of held) {
+      for (const { notification, recipients } of held) {
         channel.queued.add(notification.key);
-        channel.delivery.enqueue(notification);
+        channel.delivery.enqueue(notification, recipients);
       }
     }
   }

@@ -92,6 +92,8 @@ Logs are JSON lines on stderr. Each line has `time` (ISO 8601 UTC), `level` (`de
 | `info`  | `resending pending notifications`                                 | `channel`, `count`                                                                                              |
 | `info`  | `notification delivered`                                          | `channel`, `key`, `attempts`                                                                                    |
 | `warn`  | `delivery attempt failed`                                         | `channel`, `key`, `attempt`, `error`, `code`, `cause`                                                           |
+| `warn`  | `delivery attempt partly refused`                                 | `channel`, `key`, `attempt`, `delivered`, `refused`, `remaining` (counts), `codes` (sorted reply codes)         |
+| `error` | `ledger recipient write failed`                                   | `channel`, `key`, `error`, `code`, `cause`                                                                      |
 | `error` | `notification delivery failed`                                    | `channel`, `key`, `attempts`, `error`, `code`, `cause`; for a permanent error also `permanent: true` and `note` |
 | `info`  | `old ledger entries pruned`                                       | `count`                                                                                                         |
 | `info`  | `ledger migrated`                                                 | `from`, `entries`, `backup`                                                                                     |

@@ -4,11 +4,11 @@ import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { MailMessage, SendMail, SmtpOptions } from "../src/channels/mailer.ts";
+import type { MailMessage, SendMail, SendMailResult, SmtpOptions } from "../src/channels/mailer.ts";
 import { Ledger } from "../src/ledger.ts";
 import { Metrics } from "../src/metrics.ts";
 import { Notifier } from "../src/notifier.ts";
-import type { ChannelConfig } from "../src/types.ts";
+import type { ChannelConfig, EmailChannelConfig, Notification } from "../src/types.ts";
 import {
   asRecord,
   type FakeApi,
@@ -47,6 +47,7 @@ beforeEach(async () => {
   failMail = undefined;
   mailCalls = 0;
   mailHook = undefined;
+  mailResult = undefined;
   api.checks = [httpCheck("example", "Example site"), httpCheck("other", "Other")];
 });
 
@@ -57,6 +58,7 @@ afterEach(async () => {
 });
 
 let mailHook: (() => void) | undefined;
+let mailResult: ((message: MailMessage) => SendMailResult) | undefined;
 let mailCalls = 0;
 
 const sendMail: SendMail = async (smtp, message) => {
@@ -64,6 +66,7 @@ const sendMail: SendMail = async (smtp, message) => {
   mailHook?.();
   if (failMail) throw failMail;
   mails.push({ smtp, message });
+  return mailResult ? mailResult(message) : { accepted: [...message.envelopeTo], refused: [] };
 };
 
 function make(channels: ChannelConfig[], retryAttempts = 3, metrics?: Metrics): Notifier {
@@ -323,3 +326,95 @@ function savedStatus(path: string, channelId: string, key: string): string | und
     ledger.close();
   }
 }
+
+const OPENED = Date.UTC(2026, 0, 1, 12, 0, 0);
+
+function mailChannel(to: string[]): EmailChannelConfig {
+  return {
+    id: "m",
+    type: "email",
+    smtp: { host: "127.0.0.1", port: 2525, tls: "none" },
+    from: "pulse@example.com",
+    to,
+    remindEverySeconds: 20,
+  };
+}
+
+function pendingNote(key: string, event: "opened" | "reminder"): Notification {
+  return {
+    key,
+    event,
+    incidentId: 1,
+    checkId: "example",
+    checkName: "Example site",
+    reason: null,
+    time: new Date(OPENED).toISOString(),
+    timeMs: OPENED,
+    openedMs: OPENED,
+  };
+}
+
+test("pending recovery and held reminders send only to the recipients still needing the message", async () => {
+  const path = join(dir, "state.json");
+  const seeded = new Ledger(path);
+  seeded.seed("m", []);
+  seeded.claim("m", "1:opened", pendingNote("1:opened", "opened"));
+  seeded.setRecipients("m", "1:opened", { delivered: ["a@example.com"], refused: [] });
+  seeded.claim("m", "1:reminder:1", pendingNote("1:reminder:1", "reminder"));
+  seeded.setRecipients("m", "1:reminder:1", {
+    delivered: ["b@example.com"],
+    refused: ["a@example.com"],
+  });
+  seeded.close();
+  api.incidents = [incident({ id: 1, openedAt: OPENED })];
+  const n = make([mailChannel(["a@example.com", "b@example.com"])]);
+  n.start();
+  await n.idle();
+  assert.deepEqual(
+    mails.map((m) => m.message.envelopeTo),
+    [["b@example.com"]],
+  );
+  // The held reminder is released by the first poll; a is refused, b has it: no connection.
+  await n.tick();
+  await n.idle();
+  await n.stop();
+  assert.equal(mails.length, 1);
+  assert.equal(current?.status("m", "1:opened"), "delivered");
+  assert.equal(current?.status("m", "1:reminder:1"), "failed");
+});
+
+test("a partly refused email logs counts and codes, and metrics count one outcome", async () => {
+  const metrics = new Metrics(["m"], () => 0);
+  mailResult = (message) =>
+    message.envelopeTo.length > 1
+      ? {
+          accepted: ["ops@example.com"],
+          refused: [{ recipient: "dev@example.com", responseCode: 451 }],
+        }
+      : { accepted: [...message.envelopeTo], refused: [] };
+  const n = make([{ ...mailChannel(["ops@example.com", "dev@example.com"]) }], 3, metrics);
+  await openIncident(n);
+  assert.deepEqual(
+    mails.map((m) => m.message.envelopeTo),
+    [["ops@example.com", "dev@example.com"], ["dev@example.com"]],
+  );
+  const partly = logger.entries.filter((e) => e.msg === "delivery attempt partly refused");
+  assert.deepEqual(
+    partly.map((e) => e.fields),
+    [
+      {
+        channel: "m",
+        key: "1:opened",
+        attempt: 1,
+        delivered: 1,
+        refused: 0,
+        remaining: 1,
+        codes: [451],
+      },
+    ],
+  );
+  assert.equal(JSON.stringify(logger.entries).includes("@example.com"), false);
+  const rendered = metrics.render();
+  assert.ok(rendered.includes('pulse_notify_deliveries_total{channel="m",outcome="success"} 1\n'));
+  assert.ok(rendered.includes('pulse_notify_deliveries_total{channel="m",outcome="failure"} 0\n'));
+});

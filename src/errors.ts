@@ -1,4 +1,5 @@
 import { AtomicWriteError } from "@lorenzh/pulse-kit";
+import type { RecipientProgress } from "./types.ts";
 
 /**
  * A delivery failure that a retry cannot fix (a 4xx answer, an SMTP 5xx reply).
@@ -16,6 +17,37 @@ export class PermanentDeliveryError extends Error {
     this.name = "PermanentDeliveryError";
     this.status = fields.status;
     this.code = fields.code;
+  }
+}
+
+/**
+ * An email attempt that did not reach every recipient. `progress` is cumulative, including this
+ * attempt; `isPermanent` is true when no recipient is left to try. The message holds counts and
+ * reply codes only, never an address or server text.
+ */
+export class PartialDeliveryError extends Error {
+  readonly progress: RecipientProgress;
+  readonly isPermanent: boolean;
+  /** Recipients still to try after this attempt. */
+  readonly remaining: number;
+  /** Distinct numeric reply codes of this attempt's refusals, sorted. */
+  readonly codes: number[];
+
+  constructor(fields: {
+    progress: RecipientProgress;
+    remaining: number;
+    refusedNow: number;
+    attempted: number;
+    codes: number[];
+  }) {
+    const codes = [...new Set(fields.codes)].sort((a, b) => a - b);
+    const suffix = codes.length > 0 ? `: ${codes.join(", ")}` : "";
+    super(`SMTP refused ${fields.refusedNow} of ${fields.attempted} recipients${suffix}`);
+    this.name = "PartialDeliveryError";
+    this.progress = fields.progress;
+    this.remaining = fields.remaining;
+    this.isPermanent = fields.remaining === 0;
+    this.codes = codes;
   }
 }
 

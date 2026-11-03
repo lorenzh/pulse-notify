@@ -4,8 +4,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChannelDelivery } from "../src/delivery.ts";
+import { PartialDeliveryError } from "../src/errors.ts";
 import { Ledger } from "../src/ledger.ts";
-import type { Notification } from "../src/types.ts";
+import type { Notification, RecipientProgress } from "../src/types.ts";
 import { spyLogger } from "./support.ts";
 
 function note(key: string): Notification {
@@ -28,8 +29,12 @@ afterAll(() => {
 });
 
 function setup(
-  send: (n: Notification, signal?: AbortSignal) => Promise<void>,
-  extra: { retryMaxDelayMs?: number; retryAttempts?: number } = {},
+  send: (n: Notification, signal?: AbortSignal, progress?: RecipientProgress) => Promise<void>,
+  extra: {
+    retryMaxDelayMs?: number;
+    retryAttempts?: number;
+    onOutcome?: (o: "delivered" | "failed") => void;
+  } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), "notify-del-"));
   dirs.push(dir);
@@ -410,4 +415,93 @@ test("never re-sends a key that is already recorded", async () => {
   delivery.enqueue(note("1:opened"));
   await delivery.idle();
   assert.equal(calls, 0);
+});
+
+function partial(delivered: string[], refused: string[], remaining: number): PartialDeliveryError {
+  return new PartialDeliveryError({
+    progress: { delivered, refused },
+    remaining,
+    refusedNow: 1,
+    attempted: 2,
+    codes: [451],
+  });
+}
+
+test("a partly refused attempt stores its progress and passes it to the next attempt", async () => {
+  const seen: (RecipientProgress | undefined)[] = [];
+  const outcomes: string[] = [];
+  const { ledger, logger, delivery } = setup(
+    async (_n, _s, progress) => {
+      seen.push(progress && { delivered: [...progress.delivered], refused: [...progress.refused] });
+      if (seen.length === 1) throw partial(["a@example.test"], [], 1);
+    },
+    { onOutcome: (o) => outcomes.push(o) },
+  );
+  delivery.enqueue(note("1:opened"));
+  await delivery.idle();
+  assert.deepEqual(seen, [
+    { delivered: [], refused: [] },
+    { delivered: ["a@example.test"], refused: [] },
+  ]);
+  assert.equal(ledger.status("ch", "1:opened"), "delivered");
+  assert.deepEqual(outcomes, ["delivered"]);
+  assert.equal(logger.entries.filter((e) => e.msg === "delivery attempt failed").length, 0);
+  assert.equal(logger.entries.filter((e) => e.msg === "delivery attempt partly refused").length, 1);
+});
+
+test("the stored progress of a failed partial event survives in the ledger", async () => {
+  const outcomes: string[] = [];
+  const { ledger, delivery } = setup(
+    async () => {
+      throw partial(["a@example.test"], ["c@example.test"], 0);
+    },
+    { onOutcome: (o) => outcomes.push(o) },
+  );
+  delivery.enqueue(note("1:opened"));
+  await delivery.idle();
+  assert.equal(ledger.status("ch", "1:opened"), "failed");
+  assert.deepEqual(ledger.failed()[0]?.recipients, {
+    delivered: ["a@example.test"],
+    refused: ["c@example.test"],
+  });
+  assert.deepEqual(outcomes, ["failed"]);
+});
+
+test("with limit 0 a partial event retries until nothing is left", async () => {
+  let calls = 0;
+  const { ledger, delivery } = setup(
+    async () => {
+      calls++;
+      if (calls < 20) throw partial([], [], 2);
+    },
+    { retryAttempts: 0 },
+  );
+  delivery.enqueue(note("1:opened"));
+  await delivery.idle();
+  assert.equal(calls, 20);
+  assert.equal(ledger.status("ch", "1:opened"), "delivered");
+});
+
+test("the progress given to enqueue reaches the first attempt; jobs keep their own", async () => {
+  const seen = new Map<string, RecipientProgress[]>();
+  const { delivery } = setup(async (n, _s, progress) => {
+    const list = seen.get(n.key) ?? [];
+    list.push({
+      delivered: [...(progress?.delivered ?? [])],
+      refused: [...(progress?.refused ?? [])],
+    });
+    seen.set(n.key, list);
+    if (list.length === 1) throw partial([...(progress?.delivered ?? []), n.key], [], 1);
+  });
+  delivery.enqueue(note("1:opened"), { delivered: ["a@example.test"], refused: [] });
+  delivery.enqueue(note("2:opened"));
+  await delivery.idle();
+  assert.deepEqual(seen.get("1:opened"), [
+    { delivered: ["a@example.test"], refused: [] },
+    { delivered: ["a@example.test", "1:opened"], refused: [] },
+  ]);
+  assert.deepEqual(seen.get("2:opened"), [
+    { delivered: [], refused: [] },
+    { delivered: ["2:opened"], refused: [] },
+  ]);
 });

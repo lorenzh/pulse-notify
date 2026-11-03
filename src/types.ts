@@ -106,7 +106,12 @@ export interface RecipientProgress {
   refused: string[];
 }
 
-export type Sender = (notification: Notification, signal?: AbortSignal) => Promise<void>;
+/** Sends one notification. Only the email sender reads `progress`; the others ignore it. */
+export type Sender = (
+  notification: Notification,
+  signal?: AbortSignal,
+  progress?: RecipientProgress,
+) => Promise<void>;
 
 /** Resolves after `ms`, or early when `signal` aborts. */
 export type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;

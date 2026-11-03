@@ -6,8 +6,11 @@ import { defaultSchedule } from "../timeout.ts";
 import { isLoopbackHost } from "./loopback.ts";
 import {
   DEFAULT_CLIENT_NAME,
+  envelopeAddress,
   type MailMessage,
+  type RefusedRecipient,
   type SendMail,
+  type SendMailResult,
   type SmtpOptions,
 } from "./mailer.ts";
 
@@ -42,7 +45,8 @@ class CancellableSocket extends Socket {
 }
 
 function assertSafe(smtp: SmtpOptions, message: MailMessage): void {
-  for (const value of [smtp.host, message.from, message.subject, ...message.to]) {
+  const values = [smtp.host, message.from, message.subject, ...message.to, ...message.envelopeTo];
+  for (const value of values) {
     if (/[\r\n]/.test(value)) throw new SmtpError("SMTP address or subject contains a line break");
   }
   if (smtp.username !== undefined && smtp.tls === "none" && !isLoopbackHost(smtp.host)) {
@@ -117,15 +121,44 @@ function classify(err: unknown): Error {
   return new SmtpError(`SMTP failed: ${suffix === "" ? (code ?? "error") : String(status)}`, code);
 }
 
-/** Nodemailer sends when only some recipients were refused. A notification must reach all of them. */
-function assertAllAccepted(info: SentMessageInfo): void {
-  const errors: unknown = field(info, "rejectedErrors");
-  const first: unknown = Array.isArray(errors) ? errors[0] : undefined;
-  const rejected: unknown = field(info, "rejected");
-  if (first !== undefined) throw classify(first);
-  if (Array.isArray(rejected) && rejected.length > 0) {
-    throw new SmtpError("SMTP recipient rejected");
-  }
+/** A reply code of 100 to 599, or `undefined`. */
+function replyCode(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599
+    ? value
+    : undefined;
+}
+
+/** Nodemailer's refused recipients, narrowed: only the address and the numeric code are kept. */
+function refusedOf(source: unknown): RefusedRecipient[] {
+  const errors: unknown = field(source, "rejectedErrors");
+  if (!Array.isArray(errors)) return [];
+  return errors.flatMap((e: unknown) => {
+    const recipient = field(e, "recipient");
+    if (typeof recipient !== "string") return [];
+    return [{ recipient, responseCode: replyCode(field(e, "responseCode")) }];
+  });
+}
+
+/** The trusted part of nodemailer's result: accepted addresses and refused recipients. */
+function resultOf(info: unknown): SendMailResult {
+  const accepted: unknown = field(info, "accepted");
+  return {
+    accepted: Array.isArray(accepted)
+      ? accepted.filter((a: unknown): a is string => typeof a === "string")
+      : [],
+    refused: refusedOf(info),
+  };
+}
+
+/**
+ * All recipients refused at `RCPT`. With at least one 5xx the refusals are a result, so the
+ * caller can record them; with only 4xx or no codes this stays today's retryable error.
+ */
+function envelopeResult(err: unknown): SendMailResult | undefined {
+  if (codeOf(err) !== "EENVELOPE") return undefined;
+  const refused = refusedOf(err);
+  const isAnyPermanent = refused.some((r) => (r.responseCode ?? 0) >= 500);
+  return isAnyPermanent ? { accepted: [], refused } : undefined;
 }
 
 function isBadAddress(err: unknown): boolean {
@@ -159,10 +192,12 @@ function refuseHeloFallback(socket: Socket, fail: (err: Error) => void): void {
 }
 
 /**
- * Sends one message with nodemailer. `timeoutMs` covers the whole attempt. A 5xx reply rejects
- * with a `PermanentDeliveryError`; timeout, abort and network errors are retryable.
+ * Sends one message with nodemailer to `envelopeTo`. `timeoutMs` covers the whole attempt. It
+ * resolves with the accepted and refused recipients, also when the server refused them all with at
+ * least one 5xx. Any other 5xx reply rejects with a `PermanentDeliveryError`; timeout, abort and
+ * network errors are retryable.
  */
-export const sendMail: SendMail = async (smtp, message) => {
+export const sendMail: SendMail = async (smtp, message): Promise<SendMailResult> => {
   assertSafe(smtp, message);
   if (smtp.signal?.aborted) throw new SmtpError("SMTP send aborted");
   const socket = new CancellableSocket();
@@ -194,6 +229,7 @@ export const sendMail: SendMail = async (smtp, message) => {
   const sending: Promise<SentMessageInfo> = transporter.sendMail({
     from: message.from,
     to: message.to,
+    envelope: { from: envelopeAddress(message.from), to: message.envelopeTo },
     subject: message.subject,
     text: message.text,
     date: message.date,
@@ -202,9 +238,11 @@ export const sendMail: SendMail = async (smtp, message) => {
   // If the limit wins, the late result of the send is of no interest.
   sending.catch(() => {});
   try {
-    assertAllAccepted(await Promise.race([sending, limit]));
+    return resultOf(await Promise.race([sending, limit]));
   } catch (err) {
     if (err instanceof SmtpError || err instanceof PermanentDeliveryError) throw err;
+    const refused = envelopeResult(err);
+    if (refused) return refused;
     if (isBadAddress(err)) {
       throw new PermanentDeliveryError("SMTP address is not valid", { code: "EENVELOPE" });
     }
