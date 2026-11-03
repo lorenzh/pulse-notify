@@ -218,7 +218,7 @@ test("stops retrying after a success", async () => {
   assert.equal(ledger.status("ch", "1:opened"), "delivered");
 });
 
-test("sends in FIFO order and continues after a failed event", async () => {
+test("a failing event retries behind later events and still ends failed", async () => {
   const order: string[] = [];
   const { ledger, delivery } = setup(async (n) => {
     order.push(n.key);
@@ -227,9 +227,178 @@ test("sends in FIFO order and continues after a failed event", async () => {
   delivery.enqueue(note("1:opened"));
   delivery.enqueue(note("1:resolved"));
   await delivery.idle();
-  assert.equal(order.at(-1), "1:resolved");
+  assert.deepEqual(order.slice(0, 2), ["1:opened", "1:resolved"]);
   assert.equal(order.filter((k) => k === "1:opened").length, 12);
   assert.equal(ledger.status("ch", "1:resolved"), "delivered");
+  assert.equal(ledger.status("ch", "1:opened"), "failed");
+});
+
+/** A delivery whose retry timers are held until the test releases them. */
+function heldSetup(
+  send: (n: Notification) => Promise<void>,
+  extra: { retryAttempts?: number; isStale?: (n: Notification) => boolean } = {},
+) {
+  const dir = mkdtempSync(join(tmpdir(), "notify-del-"));
+  dirs.push(dir);
+  const ledger = new Ledger(join(dir, "s.json"));
+  const timers: Array<() => void> = [];
+  const released: string[] = [];
+  const delivery = new ChannelDelivery({
+    channelId: "ch",
+    send,
+    ledger,
+    sleep: () => new Promise<void>((resolve) => timers.push(resolve)),
+    retryDelayMs: 250,
+    ...extra,
+    logger: spyLogger(),
+    release: (key) => released.push(key),
+  });
+  return { ledger, timers, released, delivery };
+}
+
+async function until(cond: () => boolean): Promise<void> {
+  for (let i = 0; i < 1000 && !cond(); i++) await new Promise((r) => setImmediate(r));
+  assert.ok(cond(), "condition not reached");
+}
+
+for (const retryAttempts of [12, 0]) {
+  test(`a waiting retry does not block the channel (retryAttempts ${retryAttempts})`, async () => {
+    const sent: string[] = [];
+    const { ledger, timers, delivery } = heldSetup(
+      async (n) => {
+        sent.push(n.key);
+        if (n.key === "A" && sent.filter((k) => k === "A").length === 1) throw new Error("503");
+      },
+      { retryAttempts },
+    );
+    delivery.enqueue(note("A"));
+    await until(() => timers.length === 1);
+    delivery.enqueue(note("B"));
+    await until(() => ledger.status("ch", "B") === "delivered");
+    assert.deepEqual(sent, ["A", "B"]);
+    assert.equal(ledger.status("ch", "A"), "pending");
+    timers[0]?.();
+    await delivery.idle();
+    assert.deepEqual(sent, ["A", "B", "A"]);
+    assert.equal(ledger.status("ch", "A"), "delivered");
+  });
+}
+
+test("two failing events count their attempts independently", async () => {
+  const counts: Record<string, number> = {};
+  const { ledger, timers, delivery } = heldSetup(
+    async (n) => {
+      counts[n.key] = (counts[n.key] ?? 0) + 1;
+      throw new Error("down");
+    },
+    { retryAttempts: 3 },
+  );
+  delivery.enqueue(note("A"));
+  delivery.enqueue(note("B"));
+  const isDone = () =>
+    ledger.status("ch", "A") === "failed" && ledger.status("ch", "B") === "failed";
+  let fired = 0;
+  while (!isDone()) {
+    await until(() => timers.length > fired || isDone());
+    while (fired < timers.length) timers[fired++]?.();
+  }
+  await delivery.idle();
+  assert.deepEqual(counts, { A: 3, B: 3 });
+  assert.equal(ledger.status("ch", "A"), "failed");
+  assert.equal(ledger.status("ch", "B"), "failed");
+});
+
+test("a duplicate enqueue of a waiting key sends nothing extra", async () => {
+  let calls = 0;
+  const { timers, released, delivery } = heldSetup(async () => {
+    if (++calls === 1) throw new Error("down");
+  });
+  delivery.enqueue(note("A"));
+  await until(() => timers.length === 1);
+  delivery.enqueue(note("A"));
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(calls, 1);
+  timers[0]?.();
+  await delivery.idle();
+  assert.equal(calls, 2);
+  assert.deepEqual(released, ["A"]);
+});
+
+test("a due retry goes behind jobs that are already ready", async () => {
+  const sent: string[] = [];
+  let finishB: () => void = () => {};
+  const { timers, delivery } = heldSetup(async (n) => {
+    sent.push(n.key);
+    if (n.key === "A" && sent.length === 1) throw new Error("down");
+    if (n.key === "B") await new Promise<void>((r) => (finishB = r));
+  });
+  delivery.enqueue(note("A"));
+  await until(() => timers.length === 1);
+  delivery.enqueue(note("B"));
+  delivery.enqueue(note("C"));
+  await until(() => sent.length === 2);
+  timers[0]?.();
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(sent, ["A", "B"]);
+  finishB();
+  await delivery.idle();
+  assert.deepEqual(sent, ["A", "B", "C", "A"]);
+});
+
+test("one send at a time per channel", async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let calls = 0;
+  const { timers, delivery } = heldSetup(async () => {
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((r) => setImmediate(r));
+    inFlight--;
+    if (++calls <= 2) throw new Error("down");
+  });
+  for (const k of ["A", "B", "C"]) delivery.enqueue(note(k));
+  await until(() => timers.length === 2);
+  timers[0]?.();
+  timers[1]?.();
+  await delivery.idle();
+  assert.equal(calls, 5);
+  assert.equal(maxInFlight, 1);
+});
+
+test("a reminder that goes stale while waiting is dropped with 1 send", async () => {
+  let calls = 0;
+  let isResolved = false;
+  const { ledger, timers, delivery } = heldSetup(
+    async () => {
+      calls++;
+      throw new Error("down");
+    },
+    { isStale: () => isResolved },
+  );
+  delivery.enqueue(note("1:reminder:1"));
+  await until(() => timers.length === 1);
+  isResolved = true;
+  timers[0]?.();
+  await delivery.idle();
+  assert.equal(calls, 1);
+  assert.equal(ledger.status("ch", "1:reminder:1"), "dropped");
+});
+
+test("stop with two waiting jobs resolves idle without their timers", async () => {
+  const { ledger, timers, released, delivery } = heldSetup(async () => {
+    throw new Error("down");
+  });
+  delivery.enqueue(note("A"));
+  delivery.enqueue(note("B"));
+  await until(() => timers.length === 2);
+  delivery.stop();
+  await delivery.idle();
+  assert.equal(ledger.status("ch", "A"), "pending");
+  assert.equal(ledger.status("ch", "B"), "pending");
+  assert.deepEqual(
+    released.toSorted((a, b) => a.localeCompare(b)),
+    ["A", "B"],
+  );
 });
 
 test("never re-sends a key that is already recorded", async () => {

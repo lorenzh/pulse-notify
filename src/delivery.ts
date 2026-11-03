@@ -48,13 +48,20 @@ function failureOf(err: unknown, attempt: number, limit: number): Outcome | unde
   return { kind: "failed", attempts: attempt, error: err, isPermanent };
 }
 
-/** One FIFO queue and worker for a channel. */
+/**
+ * The scheduler of one channel. Each event is a job that is `ready` (FIFO), `sending` (at most one
+ * per channel), or `waiting` for its own retry timer. A waiting job does not block the channel; when
+ * its timer ends it goes to the end of the ready queue.
+ */
 export class ChannelDelivery {
   readonly #opts: ChannelDeliveryOptions;
-  readonly #queue: Notification[] = [];
+  /** Turn grants of the ready jobs, in FIFO order. */
+  readonly #ready: Array<(isGranted: boolean) => void> = [];
+  /** The running job of each key, from enqueue until it ends. */
+  readonly #jobs = new Map<string, Promise<void>>();
   readonly #abort = new AbortController();
   readonly #aborted: Promise<void>;
-  #running: Promise<void> | undefined;
+  #isSending = false;
   #stopped = false;
 
   constructor(opts: ChannelDeliveryOptions) {
@@ -64,50 +71,71 @@ export class ChannelDelivery {
     });
   }
 
+  /** Adds a job. A key that already has a job is ignored. */
   enqueue(notification: Notification): void {
-    if (this.#stopped) return;
-    this.#queue.push(notification);
-    this.#running ??= this.#drain().finally(() => {
-      this.#running = undefined;
+    if (this.#stopped || this.#jobs.has(notification.key)) return;
+    const key = notification.key;
+    const job = this.#run(notification).finally(() => {
+      this.#jobs.delete(key);
+      this.#opts.release?.(key);
     });
+    this.#jobs.set(key, job);
   }
 
-  /** Resolves when the queue is empty and nothing is being sent. */
+  /** Resolves when no job is ready, sending or waiting. */
   async idle(): Promise<void> {
-    while (this.#running) await this.#running;
+    while (this.#jobs.size > 0) await Promise.all(this.#jobs.values());
   }
 
-  /** Drops the queue and aborts the sleep and the send in flight. Await `idle()` for the end. */
+  /** Drops the ready jobs and aborts the send in flight and every retry timer. */
   stop(): void {
     this.#stopped = true;
-    this.#queue.length = 0;
+    for (const grant of this.#ready.splice(0)) grant(false);
     this.#abort.abort();
   }
 
-  async #drain(): Promise<void> {
-    while (!this.#stopped) {
-      const next = this.#queue.shift();
-      if (!next) return;
+  /**
+   * Takes the channel when it is free and nothing is ready. This runs synchronously, so a first
+   * claim happens within `enqueue`, as the ledger write order expects.
+   */
+  #takeTurn(): boolean {
+    if (this.#stopped || this.#isSending || this.#ready.length > 0) return false;
+    this.#isSending = true;
+    return true;
+  }
+
+  /** Waits at the end of the ready queue; false when the channel stopped first. */
+  #waitTurn(): Promise<boolean> {
+    if (this.#stopped) return Promise.resolve(false);
+    return new Promise((resolve) => this.#ready.push(resolve));
+  }
+
+  #endTurn(): void {
+    const next = this.#ready.shift();
+    this.#isSending = next !== undefined;
+    next?.(true);
+  }
+
+  async #run(notification: Notification): Promise<void> {
+    try {
+      if (!this.#takeTurn() && !(await this.#waitTurn())) return;
+      let isClaimed = false;
       try {
-        await this.#deliver(next);
-      } catch (err) {
-        this.#opts.logger.error("delivery failed unexpectedly", {
-          channel: this.#opts.channelId,
-          key: next.key,
-          ...errorFields(err),
-        });
+        isClaimed = this.#claim(notification);
       } finally {
-        this.#opts.release?.(next.key);
+        if (!isClaimed) this.#endTurn();
       }
+      if (!isClaimed) return;
+      const outcome = await this.#attempts(notification);
+      if (outcome.kind !== "stopped") this.#settle(notification, outcome);
+    } catch (err) {
+      this.#opts.logger.error("delivery failed unexpectedly", {
+        channel: this.#opts.channelId,
+        key: notification.key,
+        ...errorFields(err),
+      });
     }
   }
-
-  async #deliver(notification: Notification): Promise<void> {
-    if (!this.#claim(notification)) return;
-    const outcome = await this.#attempts(notification);
-    if (outcome.kind !== "stopped") this.#settle(notification, outcome);
-  }
-
   /** A key that is already pending is a resend after a restart. */
   #claim(notification: Notification): boolean {
     const { channelId, ledger, logger } = this.#opts;
@@ -126,33 +154,48 @@ export class ChannelDelivery {
     }
   }
 
+  /** Runs the attempts of a job. It holds the turn on entry and gives it up after each send. */
   async #attempts(notification: Notification): Promise<Outcome> {
-    const { channelId, send, sleep, logger } = this.#opts;
+    const { channelId, logger } = this.#opts;
     const initial = this.#opts.retryDelayMs;
     const max = Math.max(this.#opts.retryMaxDelayMs ?? DEFAULT_RETRY_MAX_DELAY_MS, initial);
     const limit = this.#opts.retryAttempts ?? DEFAULT_RETRY_ATTEMPTS;
     for (let attempt = 1; ; attempt++) {
-      if (this.#stopped) return { kind: "stopped" };
-      if (this.#opts.isStale?.(notification)) return { kind: "dropped" };
-      try {
-        await send(notification, this.#abort.signal);
-        return { kind: "delivered", attempts: attempt };
-      } catch (err) {
-        if (this.#stopped) return { kind: "stopped" };
-        const failed = failureOf(err, attempt, limit);
-        if (failed) return failed;
-        logger.warn("delivery attempt failed", {
-          channel: channelId,
-          key: notification.key,
-          attempt,
-          ...errorFields(err),
-        });
-        await Promise.race([
-          sleep(retryDelay(attempt, initial, max), this.#abort.signal),
-          this.#aborted,
-        ]);
-      }
+      const result = await this.#attempt(notification, attempt, limit);
+      if (result.outcome) return result.outcome;
+      logger.warn("delivery attempt failed", {
+        channel: channelId,
+        key: notification.key,
+        attempt,
+        ...errorFields(result.error),
+      });
+      await this.#wait(retryDelay(attempt, initial, max));
+      if (!this.#takeTurn() && !(await this.#waitTurn())) return { kind: "stopped" };
     }
+  }
+
+  /** One attempt within the turn; the turn ends before it returns. */
+  async #attempt(
+    notification: Notification,
+    attempt: number,
+    limit: number,
+  ): Promise<{ outcome: Outcome; error?: never } | { outcome?: never; error: unknown }> {
+    try {
+      if (this.#stopped) return { outcome: { kind: "stopped" } };
+      if (this.#opts.isStale?.(notification)) return { outcome: { kind: "dropped" } };
+      await this.#opts.send(notification, this.#abort.signal);
+      return { outcome: { kind: "delivered", attempts: attempt } };
+    } catch (err) {
+      if (this.#stopped) return { outcome: { kind: "stopped" } };
+      const failed = failureOf(err, attempt, limit);
+      return failed ? { outcome: failed } : { error: err };
+    } finally {
+      this.#endTurn();
+    }
+  }
+
+  async #wait(ms: number): Promise<void> {
+    await Promise.race([this.#opts.sleep(ms, this.#abort.signal), this.#aborted]);
   }
 
   #settle(notification: Notification, outcome: Exclude<Outcome, { kind: "stopped" }>): void {
