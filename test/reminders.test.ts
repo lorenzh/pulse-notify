@@ -277,6 +277,11 @@ test("after failed intervals only the latest reminder is delivered", async () =>
     await n.tick();
     if (i === 1) await logger.waitFor((e) => e.msg === "delivery attempt failed");
   }
+  // Sends run one at a time in turn order, so once reminder 4 has failed no
+  // older reminder is still in flight when the receiver comes back.
+  await logger.waitFor(
+    (e) => e.msg === "delivery attempt failed" && e.fields.key === "1:reminder:4",
+  );
   rx.up = true;
   release();
   await n.idle();
