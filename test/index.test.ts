@@ -311,6 +311,8 @@ test("an occupied health port rejects with one startup error and no started log 
   );
   assert.equal(starts, 0);
   assert.deepEqual(lines, []);
+  // Stop it so its lock heartbeat does not outlive the test directory and exit the run.
+  await running.stop();
 });
 
 test("entry point: occupied health port prints one line and exits 2", async () => {
