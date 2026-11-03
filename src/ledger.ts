@@ -242,12 +242,20 @@ function readRecipients(raw: unknown): RecipientProgress | undefined {
   return { delivered: [...value.delivered], refused: [...value.refused] };
 }
 
-/** A routing fingerprint is a JSON object of string lists. */
-function isFingerprint(raw: unknown): raw is string | null {
+/** A routing fingerprint is NULL or a JSON object with exactly the two named string lists. */
+function isFingerprint(raw: unknown, names: readonly [string, string]): raw is string | null {
   if (raw === null) return true;
   const value = parseJsonText(raw);
-  return isRecord(value) && Object.values(value).every(isStringList);
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  return (
+    keys.length === names.length &&
+    names.every((n) => Object.hasOwn(value, n) && isStringList(value[n]))
+  );
 }
+
+const CHECK_LISTS = ["checks", "excludeChecks"] as const;
+const COMPONENT_LISTS = ["components", "excludeComponents"] as const;
 
 function isOptionalInteger(raw: unknown): raw is number | null {
   return raw === null || (typeof raw === "number" && Number.isSafeInteger(raw));
@@ -257,7 +265,8 @@ function readChannelRow(row: Record<string, unknown>): [string, ChannelMarks] | 
   const { id, reminders_from, manual_from, check_routing, component_routing } = row;
   if (typeof id !== "string") return undefined;
   if (!isOptionalInteger(reminders_from) || !isOptionalInteger(manual_from)) return undefined;
-  if (!isFingerprint(check_routing) || !isFingerprint(component_routing)) return undefined;
+  if (!isFingerprint(check_routing, CHECK_LISTS)) return undefined;
+  if (!isFingerprint(component_routing, COMPONENT_LISTS)) return undefined;
   return [
     id,
     {
@@ -440,23 +449,34 @@ export class Ledger {
   }
 
   #open(): { db: Database; channels: Map<string, ChannelState> } {
+    const channels = this.#validate();
     const db = new Database(this.#path, { create: false, readwrite: true });
     try {
-      // Read the version before any pragma that writes, so a refused file stays unchanged.
-      const row = db.query("PRAGMA user_version").get();
-      if (!isRecord(row) || row.user_version !== LEDGER_VERSION) throw unsupported(this.#path);
-      let channels: Map<string, ChannelState>;
-      try {
-        channels = loadRows(db, this.#path);
-      } catch (err) {
-        throw unsupported(this.#path, { cause: err });
-      }
       db.run("PRAGMA journal_mode = WAL");
       db.run("PRAGMA synchronous = FULL");
       return { db, channels };
     } catch (err) {
       db.close();
       throw err;
+    }
+  }
+
+  /**
+   * Reads and validates every row on a read-only connection. A read/write connection would
+   * checkpoint a committed WAL on close and so change a refused file.
+   */
+  #validate(): Map<string, ChannelState> {
+    const db = new Database(this.#path, { readonly: true });
+    try {
+      const row = db.query("PRAGMA user_version").get();
+      if (!isRecord(row) || row.user_version !== LEDGER_VERSION) throw unsupported(this.#path);
+      try {
+        return loadRows(db, this.#path);
+      } catch (err) {
+        throw unsupported(this.#path, { cause: err });
+      }
+    } finally {
+      db.close();
     }
   }
 

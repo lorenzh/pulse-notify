@@ -237,6 +237,56 @@ test("hostile SQLite files are refused without a change", () => {
   }
 });
 
+test("bad rows are refused without a change, also from a committed WAL", () => {
+  const entry = (recipients: string) =>
+    `INSERT INTO entries VALUES ('c', 'k', 'failed', 1, NULL, '${recipients}');`;
+  const channel = (check: string, component: string) =>
+    `UPDATE channels SET check_routing = '${check}', component_routing = '${component}';`;
+  const okCheck = '{"checks":[],"excludeChecks":[]}';
+  const okComponent = '{"components":[],"excludeComponents":[]}';
+  const cases: [string, string][] = [
+    ["malformed recipients", entry('{"delivered":"x"}')],
+    ["check routing {}", channel("{}", okComponent)],
+    ["component routing {}", channel(okCheck, "{}")],
+    ["check routing without excludeChecks", channel('{"checks":[]}', okComponent)],
+    [
+      "check routing with an extra list",
+      channel('{"checks":[],"excludeChecks":[],"x":[]}', okComponent),
+    ],
+    ["check routing with component lists", channel(okComponent, okComponent)],
+    ["check routing list of numbers", channel('{"checks":[1],"excludeChecks":[]}', okComponent)],
+  ];
+  for (const [name, sql] of cases) {
+    const source = path();
+    const writer = new Database(source, { create: true });
+    writer.run("PRAGMA journal_mode = WAL");
+    writer.run("PRAGMA wal_autocheckpoint = 0");
+    writer.run(`${SCHEMA_V3} ${sql}`);
+    const file = path();
+    // Copy while the writer is open, so the rows sit only in the copied WAL.
+    writeFileSync(file, readFileSync(source));
+    writeFileSync(`${file}-wal`, readFileSync(`${source}-wal`));
+    writer.close();
+    const bytes = readFileSync(file);
+    const wal = readFileSync(`${file}-wal`);
+    assert.ok(wal.length > 0, name);
+    assert.throws(() => new Ledger(file), /unsupported format/, name);
+    assert.deepEqual(readFileSync(file), bytes, name);
+    assert.deepEqual(readFileSync(`${file}-wal`), wal, name);
+  }
+});
+
+test("a well-formed routing fingerprint opens", () => {
+  const { file } = sqliteFixture((db) =>
+    db.run(
+      `${SCHEMA_V3} UPDATE channels SET check_routing = '{"checks":["a"],"excludeChecks":[]}', component_routing = '{"components":[],"excludeComponents":["b"]}';`,
+    ),
+  );
+  const ledger = ledgerAt(file);
+  assert.equal(ledger.checkRouting("c"), '{"checks":["a"],"excludeChecks":[]}');
+  assert.equal(ledger.componentRouting("c"), '{"components":[],"excludeComponents":["b"]}');
+});
+
 test("each mutation is on disk when it returns, with no flush", () => {
   const file = path();
   let clock = 1234;
