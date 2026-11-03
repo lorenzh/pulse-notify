@@ -1,6 +1,6 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -319,14 +319,15 @@ test("security: exact image healthcheck rejects invalid env ports without fetchi
   console.log("security healthcheck: 11 invalid port values exit 1 with zero requests");
 });
 
-test("security: manual upgrade seed must not follow a pre-existing temporary-file symlink", async () => {
+test("security: migration and manual seed must not follow a planted .migrating symlink", async () => {
   const dir = mkdtempSync(join(tmpdir(), "notify-security-symlink-"));
   const state = join(dir, "state.json");
   const victim = join(dir, "unrelated-file.txt");
   writeFileSync(state, JSON.stringify({ version: 2, channels: { web: {} } }));
   writeFileSync(victim, "DO_NOT_OVERWRITE");
-  symlinkSync(victim, `${state}.tmp`);
-  const ledger = new Ledger(state, { now: () => 1000, schedule: () => () => {} });
+  symlinkSync(victim, `${state}.migrating`);
+  const ledger = new Ledger(state, { now: () => 1000 });
+  assert.equal(existsSync(`${state}.migrating`), false);
   const api = await startFakeApi();
   api.manualIncidents = [manualIncident({ id: 7 })];
   const n = new Notifier({

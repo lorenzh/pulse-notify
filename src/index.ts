@@ -139,7 +139,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
     lock?: LedgerLock | undefined;
     isShuttingDown: boolean;
   } = { isShuttingDown: false };
-  // Stops the notifier, writes batched ledger changes, then frees the state lock.
+  // Stops the notifier, checkpoints and closes the ledger, then frees the state lock.
   let finishing: Promise<void> | undefined;
   const finish = (): Promise<void> => {
     finishing ??= (async () => {
@@ -149,6 +149,8 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
           error: errorReason(err),
         });
       });
+      state.ledger?.close();
+      state.ledger = undefined;
       state.lock?.release();
     })();
     return finishing;
@@ -170,17 +172,13 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
   state.lock = lock;
   let ledger: Ledger;
   try {
-    ledger = openLedger(settings.statePath, {
-      onError: (err) =>
-        logger.error("ledger write failed, pending keys are resent", {
-          error: errorReason(err),
-        }),
-    });
+    ledger = openLedger(settings.statePath, {});
   } catch (err) {
     lock.release();
     throw err;
   }
   state.ledger = ledger;
+  if (ledger.migration) logger.info("ledger migrated", { ...ledger.migration });
   const notifierRef: { current?: Stoppable } = {};
   const metrics = new Metrics(
     config.channels.map((c) => c.id),
@@ -343,9 +341,10 @@ export async function runCli(
   const writeError = deps.writeError ?? ((line: string) => process.stderr.write(line));
   const statePath = readString(env, "PULSE_NOTIFY_STATE") ?? "./notify-state.json";
   let lock: LedgerLock | undefined;
+  let ledger: Ledger | undefined;
   try {
     lock = acquireLock(statePath, lockDeps(deps.lock, loadLockLeaseSeconds(env)));
-    const ledger = openLedger(statePath, deps.now ? { now: deps.now } : {});
+    ledger = openLedger(statePath, deps.now ? { now: deps.now } : {});
     const result = runFailed(args, ledger);
     await ledger.flush();
     for (const line of result.lines) write(`${line}\n`);
@@ -355,6 +354,7 @@ export async function runCli(
     writeError(`pulse-notify: ${err.message}\n`);
     return 2;
   } finally {
+    ledger?.close();
     lock?.release();
   }
 }

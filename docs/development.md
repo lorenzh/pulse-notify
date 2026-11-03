@@ -22,7 +22,7 @@ bun test test/<name>.test.ts             # one test file
 - `src/notifier.ts`: poll loop; wires channels.
 - `src/detector.ts`: which events are new.
 - `src/delivery.ts`: per-channel queue, retries.
-- `src/ledger.ts`: the state file.
+- `src/ledger.ts`: the state file, a SQLite database (format 3), and the migration of JSON ledgers.
 - `src/channels/webhook.ts`, `src/channels/file.ts`: senders.
 - `src/api.ts`, `src/timeout.ts`, `src/metrics.ts`, `src/types.ts`.
 - Logging, the health and metrics listener, shutdown, env readers and `formatDuration` come from `@lorenzh/pulse-kit`, not from local copies.

@@ -13,8 +13,6 @@ import {
   type FakeApi,
   incident,
   manualIncident,
-  type RecordingFs,
-  recordingFs,
   type SpyLogger,
   spyLogger,
   startFakeApi,
@@ -73,11 +71,19 @@ function writeState(data: unknown): void {
   writeFileSync(statePath(), JSON.stringify(data));
 }
 
-function make(fs?: RecordingFs): Notifier {
+/** Makes every ledger transaction fail while `isFailing` is set. */
+interface Fault {
+  isFailing: boolean;
+}
+
+function make(fault?: Fault): Notifier {
+  const beforeCommit = (): void => {
+    if (fault?.isFailing) throw new Error("injected commit failure");
+  };
   return new Notifier({
     config: { channels: [{ id: "web", type: "file", path: outPath() }] },
     apiUrl: api.url,
-    ledger: new Ledger(statePath(), { now: () => clock, ...(fs ? { fs } : {}) }),
+    ledger: new Ledger(statePath(), { now: () => clock, hooks: { beforeCommit } }),
     logger,
     now: () => clock,
     sleep: async () => {},
@@ -102,17 +108,22 @@ function sent(): string[] {
   }
 }
 
-function stateFile(): Record<string, unknown> {
-  return asRecord(JSON.parse(readFileSync(statePath(), "utf8")));
+/** Reads the saved state through a second ledger on the same file. */
+function saved<T>(read: (ledger: Ledger) => T): T {
+  const ledger = new Ledger(statePath());
+  try {
+    return read(ledger);
+  } finally {
+    ledger.close();
+  }
 }
 
 function manualFrom(): unknown {
-  const marks = stateFile().manualFrom;
-  return marks === undefined ? undefined : asRecord(marks).web;
+  return saved((l) => l.manualFrom("web"));
 }
 
 function entry(key: string): unknown {
-  return asRecord(asRecord(stateFile().channels).web)[key];
+  return saved((l) => ({ status: l.status("web", key) }));
 }
 
 for (const [name, data] of [
@@ -173,13 +184,13 @@ test("a 404 then an existing incident sends nothing", async () => {
 test("a failed seed write marks nothing and sends nothing; the next poll seeds", async () => {
   writeState(V2_LEDGER);
   api.manualIncidents = [open7([creation, updateA])];
-  const fs = recordingFs();
-  const n = make(fs);
-  fs.faults.isOpenTempFailing = true;
+  const fault = { isFailing: false };
+  const n = make(fault);
+  fault.isFailing = true;
   await poll(n);
   assert.ok(logger.entries.some((e) => e.msg === "ledger seed failed, the next poll retries"));
   assert.equal(manualFrom(), undefined);
-  fs.faults.isOpenTempFailing = false;
+  fault.isFailing = false;
   await poll(n);
   await n.stop();
   assert.equal(typeof manualFrom(), "number");
@@ -252,7 +263,10 @@ test("seeding leaves reminder state and automatic deliveries alone", async () =>
   await poll(n);
   await n.stop();
   assert.deepEqual(sent(), ["5:opened"]);
-  assert.equal(stateFile().remindersFrom, undefined);
+  assert.equal(
+    saved((l) => l.remindersFrom("web")),
+    undefined,
+  );
 });
 
 test("an inserted update sends only itself; equal-time updates are told apart", async () => {

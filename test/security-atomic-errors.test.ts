@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createLogger, nodeAtomicWriteSyncFs } from "@lorenzh/pulse-kit";
+import { AtomicWriteError, createLogger } from "@lorenzh/pulse-kit";
 import { ChannelDelivery } from "../src/delivery.ts";
 import { Ledger } from "../src/ledger.ts";
 import type { Notification } from "../src/types.ts";
@@ -27,21 +27,12 @@ for (const stage of ["write", "rename", "sync-dir"] as const) {
     const fault = Object.assign(new Error("secret-sentinel: private filesystem text"), {
       code: "EIO",
     });
+    // A failure inside the claim transaction, carrying a raw cause with private text.
     const ledger = new Ledger(join(dir, "state.json"), {
       now: () => 0,
-      schedule: () => () => {},
-      fs: {
-        sync: {
-          ...nodeAtomicWriteSyncFs,
-          open: (path, flags, mode) => {
-            if (stage === "write" && flags === "wx") throw fault;
-            if (stage === "sync-dir" && flags === "r") throw fault;
-            return nodeAtomicWriteSyncFs.open(path, flags, mode);
-          },
-          rename: (from, to) => {
-            if (stage === "rename") throw fault;
-            nodeAtomicWriteSyncFs.rename(from, to);
-          },
+      hooks: {
+        beforeCommit: () => {
+          throw new AtomicWriteError(stage, fault);
         },
       },
     });

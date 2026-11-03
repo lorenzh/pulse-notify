@@ -22,7 +22,7 @@ let api: FakeApi;
 let rx: Receiver;
 let dir: string;
 let logger: SpyLogger;
-let ledger: Ledger;
+let ledger: Ledger | undefined;
 let sleeps: number[];
 
 beforeEach(async () => {
@@ -34,7 +34,16 @@ beforeEach(async () => {
   api.checks = [httpCheck("example", "Example site")];
 });
 
+/** Closes the previous ledger before its file goes, so its WAL cannot touch the next one. */
+function resetState(): void {
+  ledger?.close();
+  for (const suffix of ["", "-wal", "-shm"]) {
+    rmSync(join(dir, `state.json${suffix}`), { force: true });
+  }
+}
+
 afterEach(async () => {
+  ledger?.close();
   await api.close();
   await rx.close();
   rmSync(dir, { recursive: true, force: true });
@@ -80,7 +89,7 @@ test("a 404 or 410 fails at once: one attempt, no sleep, logged as permanent", a
     sleeps.length = 0;
     logger.entries.length = 0;
     api.incidents = [];
-    rmSync(join(dir, "state.json"), { force: true });
+    resetState();
     rx.status = status;
     const n = make(channel, 5);
     await n.tick();
@@ -91,7 +100,7 @@ test("a 404 or 410 fails at once: one attempt, no sleep, logged as permanent", a
     assert.equal(entry?.fields.permanent, true);
     assert.match(JSON.stringify(entry?.fields), /permanent/);
     assert.equal(entry?.fields.attempts, 1);
-    assert.equal(ledger.status(channel.id, "1:opened"), "failed");
+    assert.equal(ledger?.status(channel.id, "1:opened"), "failed");
   }
 });
 
@@ -104,8 +113,8 @@ test("the next event of the channel is sent at once after a permanent error", as
   await openIncident(n, 2);
   assert.deepEqual(sleeps, []);
   assert.equal(rx.accepted().length, 1);
-  assert.equal(ledger.status("hook", "2:opened"), "delivered");
-  assert.equal(ledger.status("hook", "1:opened"), "failed");
+  assert.equal(ledger?.status("hook", "2:opened"), "delivered");
+  assert.equal(ledger?.status("hook", "1:opened"), "failed");
 });
 
 test("a permanent error also ends the event when retries are unlimited (0)", async () => {
@@ -114,7 +123,7 @@ test("a permanent error also ends the event when retries are unlimited (0)", asy
   rx.status = 404;
   await openIncident(n, 1);
   assert.equal(rx.requests.length, 1);
-  assert.equal(ledger.status("hook", "1:opened"), "failed");
+  assert.equal(ledger?.status("hook", "1:opened"), "failed");
 });
 
 test("500, 408 and 429 are still retried up to the limit", async () => {
@@ -122,7 +131,7 @@ test("500, 408 and 429 are still retried up to the limit", async () => {
     rx.requests.length = 0;
     sleeps.length = 0;
     api.incidents = [];
-    rmSync(join(dir, "state.json"), { force: true });
+    resetState();
     rx.status = status;
     const n = make(hook(), 3);
     await n.tick();
@@ -149,21 +158,21 @@ test("an SMTP 550 fails at once, a 451 is retried", async () => {
     await openIncident(n, 1);
     assert.deepEqual(sleeps, []);
     assert.equal(permanent.commands.filter((c) => c.startsWith("MAIL FROM")).length, 1);
-    assert.equal(ledger.status("mail", "1:opened"), "failed");
+    assert.equal(ledger?.status("mail", "1:opened"), "failed");
     assert.equal(failedLog()[0]?.fields.permanent, true);
   } finally {
     await permanent.close();
   }
 
   api.incidents = [];
-  rmSync(join(dir, "state.json"), { force: true });
+  resetState();
   const transient = await startSmtpStub({ replies: { "RCPT TO": "451 try later" } });
   try {
     const n = make(email(transient.port), 5);
     await n.tick();
     await openIncident(n, 1);
     assert.equal(sleeps.length, 1);
-    assert.equal(ledger.status("mail", "1:opened"), "delivered");
+    assert.equal(ledger?.status("mail", "1:opened"), "delivered");
   } finally {
     await transient.close();
   }
@@ -179,7 +188,7 @@ test("the email EHLO name: channel key, then global setting, then the host name"
     for (const [clientName, global, expected] of cases) {
       stub.commands.length = 0;
       api.incidents = [];
-      rmSync(join(dir, "state.json"), { force: true });
+      resetState();
       const base = email(stub.port);
       const channel: ChannelConfig =
         base.type === "email"

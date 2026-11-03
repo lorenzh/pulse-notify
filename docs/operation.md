@@ -4,10 +4,10 @@
 
 pulse-notify keeps one state file, the delivery ledger. Its path is `PULSE_NOTIFY_STATE` (default `./notify-state.json`; `/data/notify-state.json` in the Docker image).
 
-- One JSON object, format version 2: `{ "version": 2, "channels": { "<channel id>": { "<key>": { "status": "<status>", "at": <epoch ms> } } }, "payloads": { "<channel id>": { "<key>": <notification> } }, "remindersFrom": { "<channel id>": <epoch ms> } }`. `at` is the time of the last status change. `payloads` holds the notification of each `pending` and `failed` key, so a failed event can be resent. `remindersFrom` is set only for channels with `remindEverySeconds`.
-- A version 1 file (a plain status string per key) loads and is migrated in memory: each entry gets the load time as `at`. Every write is version 2. A file with a newer version, or no `channels` object, stops the process, see [troubleshooting.md](troubleshooting.md).
+- A SQLite database (`bun:sqlite`), format 3 (`PRAGMA user_version = 3`), in WAL mode with `synchronous = FULL`. The name keeps `.json` so existing settings and volumes work. SQLite keeps `<state>-wal` and `<state>-shm` beside it. Table `channels` holds per channel `reminders_from`, `manual_from` and the routing fingerprints; table `entries` holds `channel_id`, `key`, `status`, `at` (epoch ms of the last status change), `payload` (the notification of a `pending` or `failed` key, so it can be resent) and `recipients` (email recipient progress, or NULL).
+- A JSON ledger of format 1 or 2 is migrated at start: the database is built at `<state>.migrating`, the original is copied byte for byte to `<state>.v<N>.bak`, stale `<state>-wal`, `-shm` and `-journal` files are removed, and the database is renamed over the path. The service logs `ledger migrated` (`from`, `entries`, `backup`). An interruption before the rename leaves the JSON in place and the next start migrates again. `failed list|resend` migrates too. A SQLite file with another `user_version` or a row that breaks the format, and a JSON file with a newer version, stop the process without a change, see [troubleshooting.md](troubleshooting.md).
 - Status is `seeded`, `pending`, `delivered`, `failed` or `dropped`.
-- Durability: `seed`, `claim` (before the first send) and `resend` are written at once, flushed to disk, then renamed over the ledger. `settle` (delivered, failed, dropped) and pruning are batched: the change is kept in memory and written about 100 ms later in one write (temporary file, flush, rename), and at shutdown. A crash can lose a settle; the key is then still `pending` and is sent again at the next start (at-least-once). The parent directory is created if missing.
+- Durability: every change (`seed`, `claim` before the first send, `settle`, `resend`, recipient progress, the reminder mark, pruning) is one transaction that writes only the rows it changes and is on disk before it returns. A failed write rolls back and leaves memory unchanged. Nothing is batched. A crash between a send and its settle leaves the key `pending`, so it is sent again at the next start (at-least-once). Shutdown checkpoints the WAL (`<state>-wal` is then empty) and closes the database. The parent directory is created if missing. Do not put the state on a network file system: WAL needs shared memory.
 - The ledger is read once at start. Do not edit it while pulse-notify runs.
 - Retention: at the first poll and then once per hour, entries with status `delivered`, `dropped`, `failed` or `seeded` that are older than `PULSE_NOTIFY_STATE_RETENTION_DAYS` (default 30) are removed with their payloads. `pending` entries are never pruned. A key of an incident that the last successful poll still lists is kept, however old, because without it the event would look unhandled and be sent again. This means pulse-api must keep an incident at least as long as the retention, or the key of an incident that is still listed could be pruned: the guard covers that case, but keep the two settings in line. Before the first successful poll no incident key is pruned.
 
@@ -48,7 +48,7 @@ bun src/index.ts failed resend --all --channel ops-hook
 | `1`       | Unknown key, no payload, skipped entries with `--all`, or bad usage |
 | `2`       | State file in use by a live process, or the state file is unusable  |
 
-Backup: copy the file. It is replaced atomically, so a copy is always a whole file. Restoring is putting the file back with pulse-notify stopped. This was not tested as a procedure beyond that.
+Backup: stop pulse-notify, then copy `<state>`. A clean stop checkpoints, so `<state>-wal` is empty. A copy of the live file is not safe. Restore: stop pulse-notify, remove `<state>-wal` and `<state>-shm`, put the file back, start.
 
 If you delete the ledger, every channel counts as new on the next start. It records the current incidents as `seeded` and sends nothing for them. If you remove a channel id and add it back later, it is not seeded again: the ledger keeps the channel. The re-added channel receives the incidents from the time it was removed.
 
@@ -65,9 +65,9 @@ The ledger keeps a per-channel `manualFrom` time: the first good `GET /manual-in
 - A `pending` entry written by an older version has no stored notification. The poll rebuilds it from the API incident (key `<id>:<event>`) and sends it. If the incident is no longer returned, `pending notification cannot be rebuilt: incident not found` is logged once per start and the key stays `pending`.
 - Events that failed stay `failed` and are not retried by the service (unless `PULSE_NOTIFY_RETRY_ATTEMPTS=0`). Use [`failed resend`](#failed-events-and-resend).
 - Enabling `remindEverySeconds` on an existing channel does not send a burst of reminders, see [channels.md](channels.md#reminders).
-- `SIGINT` and `SIGTERM`: polling stops, sleeps and sends in flight are aborted, unfinished keys stay `pending` (so they are resent at the next start), and batched ledger changes are written, the state lock is removed, and the process exits with 0 once the workers are done. It waits at most 5 seconds for that; a longer stop logs a `warn` line and exits with 1. A send that was in flight has an unknown result and is sent again, so a duplicate is possible.
+- `SIGINT` and `SIGTERM`: polling stops, sleeps and sends in flight are aborted, unfinished keys stay `pending` (so they are resent at the next start), the ledger is checkpointed and closed, the state lock is removed, and the process exits with 0 once the workers are done. It waits at most 5 seconds for that; a longer stop logs a `warn` line and exits with 1. A send that was in flight has an unknown result and is sent again, so a duplicate is possible.
 - If pulse-api is down, stalls or sends malformed data, pulse-notify keeps running and polls again on the next tick. The three reads of a poll (`incidents`, `checks`, `manual-incidents`) run in parallel and settle on their own: a failing read skips only the work that needs it, see [Failing feeds](#failing-feeds). An incident with a bad `id`, `checkId`, `openedAt` or `resolvedAt` (including a timestamp outside the range of a JavaScript `Date`, ±8.64e15 ms) is skipped with an `error` log (`incident skipped: malformed data`). The same holds for a bad manual incident; a bad check is skipped with a `warn` log (`check skipped: malformed data`). Each skipped item on any of the three feeds is counted in `pulse_notify_skipped_items_total` on every poll, but logged once per identity: the integer id, or the array index when the id is not an integer. At most 1024 identities are kept; the oldest is evicted first, so it can log again. A skipped item creates no ledger entry and is checked again on every poll. Other items are still processed.
-- Ledger write errors do not stop the process. A failed `claim` means the event is not sent and the next poll tries again. A failed `settle` (or a failed batched write, logged as `ledger write failed, pending keys are resent`) leaves the key `pending` on disk, so it is sent again at the next start. A failed `seed` leaves the channel unseeded and the next poll tries again.
+- Ledger write errors do not stop the process. A failed `claim` means the event is not sent and the next poll tries again. A failed `settle` leaves the key `pending` on disk, so it is sent again at the next start. A failed `seed` leaves the channel unseeded and the next poll tries again. A failed prune is logged and retried at the next prune.
 
 ## Failing feeds
 
@@ -85,29 +85,34 @@ A good `checks` read replaces the known names: a check that is no longer listed 
 
 Logs are JSON lines on stderr. Each line has `time` (ISO 8601 UTC), `level` (`debug`, `info`, `warn` or `error`), `msg` and extra fields.
 
-| Level   | `msg`                                                             | Fields                                                                                                          |
-| ------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `info`  | `pulse-notify started`                                            | `channels` (ids), `apiUrl` (without user info, query and fragment)                                              |
-| `info`  | `channel seeded with existing incidents`                          | `channel`, `incidents`                                                                                          |
-| `info`  | `resending pending notifications`                                 | `channel`, `count`                                                                                              |
-| `info`  | `notification delivered`                                          | `channel`, `key`, `attempts`                                                                                    |
-| `warn`  | `delivery attempt failed`                                         | `channel`, `key`, `attempt`, `error`, `code`, `cause`                                                           |
-| `error` | `notification delivery failed`                                    | `channel`, `key`, `attempts`, `error`, `code`, `cause`; for a permanent error also `permanent: true` and `note` |
-| `info`  | `old ledger entries pruned`                                       | `count`                                                                                                         |
-| `info`  | `reminders enabled: due reminders of open incidents skipped`      | `channel`                                                                                                       |
-| `warn`  | `taking over a stale state lock`                                  | `path`, `holderHostname`, `holderPid`                                                                           |
-| `error` | `state lock lost, stopping`                                       | `error`                                                                                                         |
-| `error` | `ledger write failed, pending keys are resent`                    | `error`                                                                                                         |
-| `error` | `notification cannot be built, the next poll retries`             | `channel`, `key`, `error`, `code`, `cause`                                                                      |
-| `error` | `api poll failed`                                                 | `feed`, `error`, `code`, `cause`; logged once per feed and failure kind while the feed keeps failing            |
-| `info`  | `api feed recovered`                                              | `feed`, after a logged failure of that feed                                                                     |
-| `info`  | `manual incidents initialized: existing manual incidents skipped` | `channel`, `incidents`                                                                                          |
-| `error` | `incident skipped: malformed data`                                | `feed` (`incidents` or `manual-incidents`), `index`, `reason`, and `incidentId` only when the id is an integer  |
-| `warn`  | `check skipped: malformed data`                                   | `feed` (`checks`), `index`, `reason` (`invalid`)                                                                |
-| `error` | `pending notification cannot be rebuilt: incident not found`      | `channel`, `key`                                                                                                |
-| `error` | `ledger claim failed, the next poll retries`                      | `channel`, `key`, `error`                                                                                       |
-| `error` | `ledger settle failed, the key stays pending`                     | `channel`, `key`, `error`                                                                                       |
-| `error` | `ledger seed failed, the next poll retries`                       | `channel`, `error`                                                                                              |
+| Level   | `msg`                                                               | Fields                                                                                                          |
+| ------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `info`  | `pulse-notify started`                                              | `channels` (ids), `apiUrl` (without user info, query and fragment)                                              |
+| `info`  | `channel seeded with existing incidents`                            | `channel`, `incidents`                                                                                          |
+| `info`  | `resending pending notifications`                                   | `channel`, `count`                                                                                              |
+| `info`  | `notification delivered`                                            | `channel`, `key`, `attempts`                                                                                    |
+| `warn`  | `delivery attempt failed`                                           | `channel`, `key`, `attempt`, `error`, `code`, `cause`                                                           |
+| `warn`  | `delivery attempt partly refused`                                   | `channel`, `key`, `attempt`, `delivered`, `refused`, `remaining` (counts), `codes` (sorted reply codes)         |
+| `error` | `ledger recipient write failed`                                     | `channel`, `key`, `error`, `code`, `cause`                                                                      |
+| `error` | `notification delivery failed`                                      | `channel`, `key`, `attempts`, `error`, `code`, `cause`; for a permanent error also `permanent: true` and `note` |
+| `info`  | `old ledger entries pruned`                                         | `count`                                                                                                         |
+| `info`  | `ledger migrated`                                                   | `from`, `entries`, `backup`                                                                                     |
+| `error` | `ledger prune failed, the next prune retries`                       | `error`                                                                                                         |
+| `info`  | `reminders enabled: due reminders of open incidents skipped`        | `channel`                                                                                                       |
+| `info`  | `routing changed: history of newly routed checks skipped`           | `channel`, `incidents` (count of newly routed incidents)                                                        |
+| `info`  | `routing changed: history of newly routed manual incidents skipped` | `channel`, `incidents` (count of newly routed manual incidents)                                                 |
+| `warn`  | `taking over a stale state lock`                                    | `path`, `holderHostname`, `holderPid`                                                                           |
+| `error` | `state lock lost, stopping`                                         | `error`                                                                                                         |
+| `error` | `notification cannot be built, the next poll retries`               | `channel`, `key`, `error`, `code`, `cause`                                                                      |
+| `error` | `api poll failed`                                                   | `feed`, `error`, `code`, `cause`; logged once per feed and failure kind while the feed keeps failing            |
+| `info`  | `api feed recovered`                                                | `feed`, after a logged failure of that feed                                                                     |
+| `info`  | `manual incidents initialized: existing manual incidents skipped`   | `channel`, `incidents`                                                                                          |
+| `error` | `incident skipped: malformed data`                                  | `feed` (`incidents` or `manual-incidents`), `index`, `reason`, and `incidentId` only when the id is an integer  |
+| `warn`  | `check skipped: malformed data`                                     | `feed` (`checks`), `index`, `reason` (`invalid`)                                                                |
+| `error` | `pending notification cannot be rebuilt: incident not found`        | `channel`, `key`                                                                                                |
+| `error` | `ledger claim failed, the next poll retries`                        | `channel`, `key`, `error`                                                                                       |
+| `error` | `ledger settle failed, the key stays pending`                       | `channel`, `key`, `error`                                                                                       |
+| `error` | `ledger seed failed, the next poll retries`                         | `channel`, `error`                                                                                              |
 
 `feed` is `incidents`, `checks` or `manual-incidents`. A failure kind is the kind of `fetchJson` failure (`timeout`, `network`, `too-large`, ...); an HTTP failure includes its status, so `500` and then `503` log twice. When the feed answers again, the next failure logs again. An unreachable api therefore logs three lines (one per feed) once, not one line per poll; the metrics still count every failed read.
 
@@ -167,3 +172,10 @@ From a version without `manualFrom` in the ledger:
 - Update keys change from `manual:<id>:update:<n>` to `manual:<id>:update:<32 hex>`. Old positional entries stay until pruned. Pending and failed ones are still resent.
 - A downgrade after this upgrade resends the manual updates of known channels once.
 - `/healthz` no longer reflects feed health; monitor `/readyz` or `pulse_notify_consecutive_failed_polls`.
+
+From a version with a JSON state file (format 1 or 2):
+
+- The first start migrates the file to SQLite format 3 and keeps the original as `<state>.v<N>.bak` (logged as `ledger migrated`). Statuses, times, payloads and marks are kept. A later start does not migrate again.
+- Routing filters are stored from the first poll after the upgrade on. A filter widening made in the same restart as the upgrade sends the history of the newly routed checks once. Upgrade first, then change filters in a later restart, see [channels.md](channels.md#routing).
+- Backup now needs a stopped service, see [State: the delivery ledger](#state-the-delivery-ledger).
+- Downgrade to a JSON version: stop, restore `<state>.v2.bak` to `<state>`, remove `<state>-wal` and `<state>-shm`. Events settled after the migration may then be sent again.

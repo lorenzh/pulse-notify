@@ -100,7 +100,18 @@ export interface Config {
 }
 
 /** Sends one notification; rejects on failure. */
-export type Sender = (notification: Notification, signal?: AbortSignal) => Promise<void>;
+/** Recipient ids of one email event: `delivered` got the message, `refused` got a 5xx at RCPT. */
+export interface RecipientProgress {
+  delivered: string[];
+  refused: string[];
+}
+
+/** Sends one notification. Only the email sender reads `progress`; the others ignore it. */
+export type Sender = (
+  notification: Notification,
+  signal?: AbortSignal,
+  progress?: RecipientProgress,
+) => Promise<void>;
 
 /** Resolves after `ms`, or early when `signal` aborts. */
 export type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;

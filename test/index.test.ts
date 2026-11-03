@@ -1,7 +1,8 @@
+import { Database } from "bun:sqlite";
 import { afterAll, test } from "bun:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -139,6 +140,75 @@ test("a bad state file is a one-line configuration error", () => {
   );
 });
 
+test("a start on a v2 state file logs ledger migrated and keeps a backup", async () => {
+  const configPath = join(dir, "c3.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({ channels: [{ id: "log", type: "file", path: join(dir, "o.jsonl") }] }),
+  );
+  const state = join(dir, "v2-state.json");
+  const v2 = JSON.stringify({
+    version: 2,
+    channels: {
+      log: { "1:opened": { status: "delivered", at: 1 }, "2:opened": { status: "seeded", at: 2 } },
+    },
+  });
+  writeFileSync(state, v2);
+  const lines: string[] = [];
+  const running = main(
+    { PULSE_NOTIFY_CONFIG: configPath, PULSE_NOTIFY_STATE: state },
+    {
+      write: (line) => lines.push(line),
+      createNotifier: (): Stoppable => ({ start() {}, async stop() {} }),
+    },
+  );
+  await running.stop();
+  const migrated = lines.map((l) => JSON.parse(l)).find((l) => l.msg === "ledger migrated");
+  assert.equal(migrated?.from, 2);
+  assert.equal(migrated?.entries, 2);
+  assert.equal(migrated?.backup, `${state}.v2.bak`);
+  assert.equal(readFileSync(`${state}.v2.bak`, "utf8"), v2);
+  assert.equal(statSync(`${state}-wal`, { throwIfNoEntry: false })?.size ?? 0, 0);
+});
+
+test("a hostile SQLite state file stops startup and keeps its bytes", () => {
+  const configPath = join(dir, "c4.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({ channels: [{ id: "log", type: "file", path: join(dir, "o.jsonl") }] }),
+  );
+  const schema = `CREATE TABLE channels (id TEXT PRIMARY KEY, reminders_from INTEGER,
+    manual_from INTEGER, check_routing TEXT, component_routing TEXT) STRICT;
+    CREATE TABLE entries (channel_id TEXT NOT NULL, key TEXT NOT NULL, status TEXT NOT NULL,
+    at INTEGER NOT NULL, payload TEXT, recipients TEXT, PRIMARY KEY (channel_id, key)) STRICT;
+    PRAGMA user_version = 3; INSERT INTO channels (id) VALUES ('log');`;
+  const row = (status: string, payload: string, recipients: string): string =>
+    `${schema} INSERT INTO entries VALUES ('log', 'k', '${status}', 1, ${payload}, ${recipients});`;
+  const cases = [
+    `${schema} PRAGMA user_version = 4;`,
+    "CREATE TABLE channels (id TEXT) STRICT; PRAGMA user_version = 3;",
+    row("sent", "NULL", "NULL"),
+    row("failed", "'[1]'", "NULL"),
+    row("failed", "NULL", `'{"delivered":"x"}'`),
+  ];
+  cases.forEach((sql, i) => {
+    const state = join(dir, `hostile-${i}.json`);
+    const db = new Database(state, { create: true });
+    db.run(sql);
+    db.close();
+    const bytes = readFileSync(state);
+    assert.throws(
+      () =>
+        main(
+          { PULSE_NOTIFY_CONFIG: configPath, PULSE_NOTIFY_STATE: state },
+          { createNotifier: (): Stoppable => ({ start() {}, async stop() {} }) },
+        ),
+      (err) => err instanceof ConfigError && err.message.startsWith("cannot use state file"),
+    );
+    assert.deepEqual(readFileSync(state), bytes);
+  });
+});
+
 test("health listener: ready after start, metrics without secrets, 503 while shutting down", async () => {
   const configPath = join(dir, "c3.json");
   writeFileSync(
@@ -241,6 +311,8 @@ test("an occupied health port rejects with one startup error and no started log 
   );
   assert.equal(starts, 0);
   assert.deepEqual(lines, []);
+  // Stop it so its lock heartbeat does not outlive the test directory and exit the run.
+  await running.stop();
 });
 
 test("entry point: occupied health port prints one line and exits 2", async () => {

@@ -1,7 +1,7 @@
 import type { Logger } from "@lorenzh/pulse-kit";
-import { errorFields, PermanentDeliveryError } from "./errors.ts";
+import { errorFields, PartialDeliveryError, PermanentDeliveryError } from "./errors.ts";
 import type { Ledger } from "./ledger.ts";
-import type { Notification, Sender, Sleep } from "./types.ts";
+import type { Notification, RecipientProgress, Sender, Sleep } from "./types.ts";
 
 export const DEFAULT_RETRY_DELAY_MS = 1000;
 export const DEFAULT_RETRY_MAX_DELAY_MS = 60000;
@@ -33,6 +33,10 @@ type Outcome =
   | { kind: "dropped" }
   | { kind: "stopped" };
 
+type AttemptResult =
+  | { outcome: Outcome; error?: never; progress?: RecipientProgress | undefined }
+  | { outcome?: never; error: unknown; progress?: RecipientProgress | undefined };
+
 /** Delay before retry `n` (1, 2, ...): `min(initial * 2^(n-1), max)`. */
 export function retryDelay(n: number, initialMs: number, maxMs: number): number {
   return Math.min(initialMs * 2 ** (n - 1), maxMs);
@@ -43,18 +47,27 @@ export function retryDelay(n: number, initialMs: number, maxMs: number): number 
  * ends the event at once, whatever the attempt limit is; a limit of 0 never ends a retryable one.
  */
 function failureOf(err: unknown, attempt: number, limit: number): Outcome | undefined {
-  const isPermanent = err instanceof PermanentDeliveryError;
+  const isPermanent =
+    err instanceof PermanentDeliveryError ||
+    (err instanceof PartialDeliveryError && err.isPermanent);
   if (!isPermanent && (limit === 0 || attempt < limit)) return undefined;
   return { kind: "failed", attempts: attempt, error: err, isPermanent };
 }
 
-/** One FIFO queue and worker for a channel. */
+/**
+ * The scheduler of one channel. Each event is a job that is `ready` (FIFO), `sending` (at most one
+ * per channel), or `waiting` for its own retry timer. A waiting job does not block the channel; when
+ * its timer ends it goes to the end of the ready queue. Each job keeps its own recipient progress.
+ */
 export class ChannelDelivery {
   readonly #opts: ChannelDeliveryOptions;
-  readonly #queue: Notification[] = [];
+  /** Turn grants of the ready jobs, in FIFO order. */
+  readonly #ready: Array<(isGranted: boolean) => void> = [];
+  /** The running job of each key, from enqueue until it ends. */
+  readonly #jobs = new Map<string, Promise<void>>();
   readonly #abort = new AbortController();
   readonly #aborted: Promise<void>;
-  #running: Promise<void> | undefined;
+  #isSending = false;
   #stopped = false;
 
   constructor(opts: ChannelDeliveryOptions) {
@@ -64,50 +77,78 @@ export class ChannelDelivery {
     });
   }
 
-  enqueue(notification: Notification): void {
-    if (this.#stopped) return;
-    this.#queue.push(notification);
-    this.#running ??= this.#drain().finally(() => {
-      this.#running = undefined;
+  /**
+   * Adds a job, with the recipient progress stored for a recovered pending key. A key that already
+   * has a job is ignored.
+   */
+  enqueue(notification: Notification, progress?: RecipientProgress): void {
+    if (this.#stopped || this.#jobs.has(notification.key)) return;
+    const key = notification.key;
+    const start = {
+      delivered: [...(progress?.delivered ?? [])],
+      refused: [...(progress?.refused ?? [])],
+    };
+    const job = this.#run(notification, start).finally(() => {
+      this.#jobs.delete(key);
+      this.#opts.release?.(key);
     });
+    this.#jobs.set(key, job);
   }
 
-  /** Resolves when the queue is empty and nothing is being sent. */
+  /** Resolves when no job is ready, sending or waiting. */
   async idle(): Promise<void> {
-    while (this.#running) await this.#running;
+    while (this.#jobs.size > 0) await Promise.all(this.#jobs.values());
   }
 
-  /** Drops the queue and aborts the sleep and the send in flight. Await `idle()` for the end. */
+  /** Drops the ready jobs and aborts the send in flight and every retry timer. */
   stop(): void {
     this.#stopped = true;
-    this.#queue.length = 0;
+    for (const grant of this.#ready.splice(0)) grant(false);
     this.#abort.abort();
   }
 
-  async #drain(): Promise<void> {
-    while (!this.#stopped) {
-      const next = this.#queue.shift();
-      if (!next) return;
+  /**
+   * Takes the channel when it is free and nothing is ready. This runs synchronously, so a first
+   * claim happens within `enqueue`, as the ledger write order expects.
+   */
+  #takeTurn(): boolean {
+    if (this.#stopped || this.#isSending || this.#ready.length > 0) return false;
+    this.#isSending = true;
+    return true;
+  }
+
+  /** Waits at the end of the ready queue; false when the channel stopped first. */
+  #waitTurn(): Promise<boolean> {
+    if (this.#stopped) return Promise.resolve(false);
+    return new Promise((resolve) => this.#ready.push(resolve));
+  }
+
+  #endTurn(): void {
+    const next = this.#ready.shift();
+    this.#isSending = next !== undefined;
+    next?.(true);
+  }
+
+  async #run(notification: Notification, progress: RecipientProgress): Promise<void> {
+    try {
+      if (!this.#takeTurn() && !(await this.#waitTurn())) return;
+      let isClaimed = false;
       try {
-        await this.#deliver(next);
-      } catch (err) {
-        this.#opts.logger.error("delivery failed unexpectedly", {
-          channel: this.#opts.channelId,
-          key: next.key,
-          ...errorFields(err),
-        });
+        isClaimed = this.#claim(notification);
       } finally {
-        this.#opts.release?.(next.key);
+        if (!isClaimed) this.#endTurn();
       }
+      if (!isClaimed) return;
+      const outcome = await this.#attempts(notification, progress);
+      if (outcome.kind !== "stopped") this.#settle(notification, outcome);
+    } catch (err) {
+      this.#opts.logger.error("delivery failed unexpectedly", {
+        channel: this.#opts.channelId,
+        key: notification.key,
+        ...errorFields(err),
+      });
     }
   }
-
-  async #deliver(notification: Notification): Promise<void> {
-    if (!this.#claim(notification)) return;
-    const outcome = await this.#attempts(notification);
-    if (outcome.kind !== "stopped") this.#settle(notification, outcome);
-  }
-
   /** A key that is already pending is a resend after a restart. */
   #claim(notification: Notification): boolean {
     const { channelId, ledger, logger } = this.#opts;
@@ -126,33 +167,92 @@ export class ChannelDelivery {
     }
   }
 
-  async #attempts(notification: Notification): Promise<Outcome> {
-    const { channelId, send, sleep, logger } = this.#opts;
+  /** Runs the attempts of a job. It holds the turn on entry and gives it up after each send. */
+  async #attempts(notification: Notification, start: RecipientProgress): Promise<Outcome> {
+    const { channelId, logger } = this.#opts;
     const initial = this.#opts.retryDelayMs;
     const max = Math.max(this.#opts.retryMaxDelayMs ?? DEFAULT_RETRY_MAX_DELAY_MS, initial);
     const limit = this.#opts.retryAttempts ?? DEFAULT_RETRY_ATTEMPTS;
+    let progress = start;
     for (let attempt = 1; ; attempt++) {
-      if (this.#stopped) return { kind: "stopped" };
-      if (this.#opts.isStale?.(notification)) return { kind: "dropped" };
-      try {
-        await send(notification, this.#abort.signal);
-        return { kind: "delivered", attempts: attempt };
-      } catch (err) {
-        if (this.#stopped) return { kind: "stopped" };
-        const failed = failureOf(err, attempt, limit);
-        if (failed) return failed;
+      const result = await this.#attempt(notification, progress, attempt, limit);
+      if (result.progress) progress = result.progress;
+      if (result.outcome) return result.outcome;
+      if (!(result.error instanceof PartialDeliveryError)) {
         logger.warn("delivery attempt failed", {
           channel: channelId,
           key: notification.key,
           attempt,
-          ...errorFields(err),
+          ...errorFields(result.error),
         });
-        await Promise.race([
-          sleep(retryDelay(attempt, initial, max), this.#abort.signal),
-          this.#aborted,
-        ]);
       }
+      await this.#wait(retryDelay(attempt, initial, max));
+      if (!this.#takeTurn() && !(await this.#waitTurn())) return { kind: "stopped" };
     }
+  }
+
+  /** One attempt within the turn; the turn ends before it returns. */
+  async #attempt(
+    notification: Notification,
+    progress: RecipientProgress,
+    attempt: number,
+    limit: number,
+  ): Promise<AttemptResult> {
+    try {
+      if (this.#stopped) return { outcome: { kind: "stopped" } };
+      if (this.#opts.isStale?.(notification)) return { outcome: { kind: "dropped" } };
+      await this.#opts.send(notification, this.#abort.signal, progress);
+      return { outcome: { kind: "delivered", attempts: attempt } };
+    } catch (err) {
+      if (this.#stopped) return { outcome: { kind: "stopped" } };
+      const partial =
+        err instanceof PartialDeliveryError
+          ? this.#recordPartial(notification, err, attempt)
+          : undefined;
+      const failed = failureOf(err, attempt, limit);
+      return failed ? { outcome: failed, progress: partial } : { error: err, progress: partial };
+    } finally {
+      this.#endTurn();
+    }
+  }
+
+  /**
+   * Logs a partly refused attempt and stores its progress. A failed write keeps the progress in
+   * memory, so the next attempt in this process still skips the delivered recipients.
+   */
+  #recordPartial(
+    notification: Notification,
+    err: PartialDeliveryError,
+    attempt: number,
+  ): RecipientProgress {
+    const { channelId, ledger, logger } = this.#opts;
+    const progress = {
+      delivered: [...err.progress.delivered],
+      refused: [...err.progress.refused],
+    };
+    logger.warn("delivery attempt partly refused", {
+      channel: channelId,
+      key: notification.key,
+      attempt,
+      delivered: progress.delivered.length,
+      refused: progress.refused.length,
+      remaining: err.remaining,
+      codes: err.codes,
+    });
+    try {
+      ledger.setRecipients(channelId, notification.key, progress);
+    } catch (err) {
+      logger.error("ledger recipient write failed", {
+        channel: channelId,
+        key: notification.key,
+        ...errorFields(err),
+      });
+    }
+    return progress;
+  }
+
+  async #wait(ms: number): Promise<void> {
+    await Promise.race([this.#opts.sleep(ms, this.#abort.signal), this.#aborted]);
   }
 
   #settle(notification: Notification, outcome: Exclude<Outcome, { kind: "stopped" }>): void {

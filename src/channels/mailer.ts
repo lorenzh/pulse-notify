@@ -37,6 +37,13 @@ export function envelopeAddress(value: string): string {
   return (match?.[1] ?? value).trim();
 }
 
+/** A recipient's id: its envelope address with the domain (after the last `@`) in lower case. */
+export function recipientId(value: string): string {
+  const address = envelopeAddress(value);
+  const at = address.lastIndexOf("@");
+  return at < 0 ? address : `${address.slice(0, at)}${address.slice(at).toLowerCase()}`;
+}
+
 export interface SmtpOptions extends SmtpConfig {
   timeoutMs: number;
   schedule?: Schedule | undefined;
@@ -48,8 +55,10 @@ export interface SmtpOptions extends SmtpConfig {
 export interface MailMessage {
   /** Sender, plain or `Name <addr>`. */
   from: string;
-  /** Recipients, plain or `Name <addr>`. */
+  /** Recipients for the `To` header, plain or `Name <addr>`. */
   to: string[];
+  /** Envelope recipients (`RCPT TO`) of this attempt: the ids that still need the message. */
+  envelopeTo: string[];
   subject: string;
   /** Plain text body. */
   text: string;
@@ -58,4 +67,16 @@ export interface MailMessage {
   messageId: string;
 }
 
-export type SendMail = (smtp: SmtpOptions, message: MailMessage) => Promise<void>;
+/** A recipient refused at `RCPT`, with its numeric reply code if the server gave one. */
+export interface RefusedRecipient {
+  recipient: string;
+  responseCode: number | undefined;
+}
+
+/** What the server confirmed: accepted addresses got the message, refused ones did not. */
+export interface SendMailResult {
+  accepted: string[];
+  refused: RefusedRecipient[];
+}
+
+export type SendMail = (smtp: SmtpOptions, message: MailMessage) => Promise<SendMailResult>;

@@ -11,7 +11,14 @@ import {
 import { BoundedSet } from "./bounded-set.ts";
 import { createSender } from "./channels/factory.ts";
 import type { SendMail } from "./channels/mailer.ts";
-import { isManualRouted, isRouted } from "./channels/routing.ts";
+import {
+  checkRouting,
+  componentRouting,
+  isManualRouted,
+  isRouted,
+  parseCheckRouting,
+  parseComponentRouting,
+} from "./channels/routing.ts";
 import { ChannelDelivery } from "./delivery.ts";
 import {
   type DetectedManualEvent,
@@ -31,6 +38,7 @@ import type {
   Config,
   Notification,
   NotificationEvent,
+  RecipientProgress,
   Schedule,
   Sleep,
 } from "./types.ts";
@@ -100,7 +108,7 @@ interface ChannelState {
   /** Keys enqueued but not yet recorded in the ledger. */
   queued: Set<string>;
   /** Pending reminders from the ledger, held until the first successful poll. */
-  held: Notification[];
+  held: { notification: Notification; recipients: RecipientProgress | undefined }[];
 }
 
 const REMINDER_KEY = /^(\d+):reminder:(\d+)$/;
@@ -270,16 +278,16 @@ export class Notifier {
 
   #resendPending(): void {
     const counts = new Map<string, number>();
-    for (const { channelId, key, notification } of this.#opts.ledger.pending()) {
+    for (const { channelId, key, notification, recipients } of this.#opts.ledger.pending()) {
       const channel = this.#channels.find((c) => c.config.id === channelId);
       if (!channel || !notification) continue;
       if (notification.event === "reminder") {
         // Held until a poll shows which incidents are resolved.
-        channel.held.push(notification);
+        channel.held.push({ notification, recipients });
         continue;
       }
       channel.queued.add(key);
-      channel.delivery.enqueue(notification);
+      channel.delivery.enqueue(notification, recipients);
       counts.set(channelId, (counts.get(channelId) ?? 0) + 1);
     }
     for (const [channel, count] of counts) {
@@ -388,16 +396,22 @@ export class Notifier {
     if (this.#lastPruneMs !== undefined && nowMs - this.#lastPruneMs < PRUNE_EVERY_MS) return;
     this.#lastPruneMs = nowMs;
     const days = this.#opts.stateRetentionDays ?? 30;
-    const count = this.#opts.ledger.prune(days * DAY_MS, this.#visible, this.#visibleManual);
+    let count: number;
+    try {
+      count = this.#opts.ledger.prune(days * DAY_MS, this.#visible, this.#visibleManual);
+    } catch (err) {
+      this.#opts.logger.error("ledger prune failed, the next prune retries", errorFields(err));
+      return;
+    }
     if (count > 0) this.#opts.logger.info("old ledger entries pruned", { count });
   }
 
   #releaseHeld(): void {
     for (const channel of this.#channels) {
       const held = channel.held.splice(0);
-      for (const notification of held) {
+      for (const { notification, recipients } of held) {
         channel.queued.add(notification.key);
-        channel.delivery.enqueue(notification);
+        channel.delivery.enqueue(notification, recipients);
       }
     }
   }
@@ -452,7 +466,7 @@ export class Notifier {
       if (incidents && manual) this.#seedChannel(channel, incidents, manual, reminders, nowMs);
       return;
     }
-    if (incidents) {
+    if (incidents && this.#syncCheckRouting(channel, incidents, reminders)) {
       if (!this.#syncReminderMark(channel.config.id, incidents, reminders, nowMs)) return;
       this.#rebuildLegacyPending(channel, incidents, nowMs);
       this.#detectAutomatic(channel, incidents, reminders, nowMs);
@@ -466,12 +480,15 @@ export class Notifier {
     const { ledger, logger } = this.#opts;
     const id = channel.config.id;
     if (ledger.manualFrom(id) !== undefined) {
-      this.#detectManual(channel, manual);
+      if (this.#syncComponentRouting(channel, manual)) this.#detectManual(channel, manual);
       return;
     }
     const routed = manual.filter((i) => isManualRouted(channel.config, i.componentIds));
     try {
-      ledger.seed(id, seedManualKeys(routed), { manualFrom: nowMs });
+      ledger.seed(id, seedManualKeys(routed), {
+        manualFrom: nowMs,
+        componentRouting: componentRouting(channel.config),
+      });
     } catch (err) {
       logger.error("ledger seed failed, the next poll retries", {
         channel: id,
@@ -505,8 +522,11 @@ export class Notifier {
         ],
         {
           ...(reminders ? { remindersFrom: nowMs } : {}),
+          checkRouting: checkRouting(channel.config),
           // On a 404 the manual feed was not seen: its first good read seeds again.
-          ...(manual.isAbsent ? {} : { manualFrom: nowMs }),
+          ...(manual.isAbsent
+            ? {}
+            : { manualFrom: nowMs, componentRouting: componentRouting(channel.config) }),
         },
       );
     } catch (err) {
@@ -554,6 +574,82 @@ export class Notifier {
   }
 
   /**
+   * Check filters changed since the stored baseline: the history of newly routed checks is
+   * seeded, so widening a filter sends no burst. False if the ledger could not be written.
+   */
+  #syncCheckRouting(
+    channel: ChannelState,
+    incidents: Incident[],
+    reminders: ReminderPlan | undefined,
+  ): boolean {
+    const { config } = channel;
+    const stored = this.#opts.ledger.checkRouting(config.id);
+    const old = stored === undefined ? undefined : parseCheckRouting(stored);
+    const newly =
+      old === undefined
+        ? []
+        : incidents.filter((i) => isRouted(config, i.checkId) && !isRouted(old, i.checkId));
+    return this.#writeRouting(channel, stored, {
+      current: checkRouting(config),
+      mark: "checkRouting",
+      keys: () => seedKeys(newly, reminders),
+      count: newly.length,
+      message: "routing changed: history of newly routed checks skipped",
+    });
+  }
+
+  /** Like `#syncCheckRouting`, for the component filters of manual incidents. */
+  #syncComponentRouting(channel: ChannelState, manual: ManualIncident[]): boolean {
+    const { config } = channel;
+    const stored = this.#opts.ledger.componentRouting(config.id);
+    const old = stored === undefined ? undefined : parseComponentRouting(stored);
+    const newly =
+      old === undefined
+        ? []
+        : manual.filter(
+            (i) => isManualRouted(config, i.componentIds) && !isManualRouted(old, i.componentIds),
+          );
+    return this.#writeRouting(channel, stored, {
+      current: componentRouting(config),
+      mark: "componentRouting",
+      keys: () => seedManualKeys(newly),
+      count: newly.length,
+      message: "routing changed: history of newly routed manual incidents skipped",
+    });
+  }
+
+  /**
+   * Equal fingerprints write nothing. A missing one (an older ledger) becomes the baseline
+   * without seeding; a changed one seeds `keys` with the new baseline in one transaction.
+   */
+  #writeRouting(
+    channel: ChannelState,
+    stored: string | undefined,
+    change: {
+      current: string;
+      mark: "checkRouting" | "componentRouting";
+      keys: () => string[];
+      count: number;
+      message: string;
+    },
+  ): boolean {
+    const { ledger, logger } = this.#opts;
+    const id = channel.config.id;
+    if (stored === change.current) return true;
+    try {
+      ledger.seed(id, stored === undefined ? [] : change.keys(), { [change.mark]: change.current });
+    } catch (err) {
+      logger.error("ledger seed failed, the next poll retries", {
+        channel: id,
+        ...errorFields(err),
+      });
+      return false;
+    }
+    if (stored !== undefined) logger.info(change.message, { channel: id, incidents: change.count });
+    return true;
+  }
+
+  /**
    * Reminders switched on for a channel that has none yet: the due reminder of every open
    * incident counts as handled, so enabling them does not send a burst. Switched off: the mark
    * goes, so enabling them again seeds again. False if the ledger could not be written.
@@ -566,7 +662,15 @@ export class Notifier {
   ): boolean {
     const { ledger, logger } = this.#opts;
     if (!reminders) {
-      ledger.setRemindersFrom(id, undefined);
+      try {
+        ledger.setRemindersFrom(id, undefined);
+      } catch (err) {
+        logger.error("ledger seed failed, the next poll retries", {
+          channel: id,
+          ...errorFields(err),
+        });
+        return false;
+      }
       return true;
     }
     if (ledger.remindersFrom(id) !== undefined) return true;

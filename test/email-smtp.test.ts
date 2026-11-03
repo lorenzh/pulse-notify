@@ -1,31 +1,54 @@
-import { beforeAll, test } from "bun:test";
+import { afterAll, beforeAll, test } from "bun:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createEmailSender } from "../src/channels/email.ts";
 import {
   ehloNameFrom,
   isEhloName,
   type MailMessage,
+  recipientId,
+  type SendMail,
+  type SendMailResult,
   type SmtpOptions,
 } from "../src/channels/mailer.ts";
-import { sendMail } from "../src/channels/smtp-send.ts";
-import { errorFields, PermanentDeliveryError } from "../src/errors.ts";
+import { SmtpError, sendMail } from "../src/channels/smtp-send.ts";
+import { ChannelDelivery } from "../src/delivery.ts";
+import { errorFields, PartialDeliveryError, PermanentDeliveryError } from "../src/errors.ts";
+import { Ledger, type LedgerOptions } from "../src/ledger.ts";
+import type { Notification, RecipientProgress } from "../src/types.ts";
 import { decodeHeader, decodeMail } from "./mail-decode.ts";
-import { makeCert, startSmtpStub, startTlsSmtpStub, type TestCert } from "./smtp-stub.ts";
+import {
+  makeCert,
+  type SmtpStub,
+  startSmtpStub,
+  startTlsSmtpStub,
+  type TestCert,
+} from "./smtp-stub.ts";
+import { spyLogger } from "./support.ts";
 
 let cert: TestCert;
 beforeAll(() => {
   cert = makeCert();
 });
 
+const dirs: string[] = [];
+afterAll(() => {
+  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+});
+
 const message: MailMessage = {
   from: "pulse@example.com",
   to: ["a@example.com", "b@example.com"],
+  envelopeTo: ["a@example.com", "b@example.com"],
   subject: "hi",
   text: ".dot line\nplain\n",
   date: new Date(Date.UTC(2026, 0, 1, 12, 0, 0)),
   messageId: "<abc@example.com>",
 };
 /** One recipient, so a refused RCPT leaves nobody to deliver to. */
-const single: MailMessage = { ...message, to: ["a@example.com"] };
+const single: MailMessage = { ...message, to: ["a@example.com"], envelopeTo: ["a@example.com"] };
 
 function options(port: number, over: Partial<SmtpOptions> = {}): SmtpOptions {
   return {
@@ -172,14 +195,38 @@ test("implicit TLS delivers a message", async () => {
   }
 });
 
-test("a 4xx and a 5xx reply reject", async () => {
-  for (const reply of ["451 try later", "550 no such user"]) {
-    const stub = await startSmtpStub({ replies: { "RCPT TO:<a@": reply } });
+test("a recipient refused at RCPT is reported in the result while the others get the message", async () => {
+  for (const code of [451, 550]) {
+    const stub = await startSmtpStub({ replies: { "RCPT TO:<a@": `${code} nope` } });
     try {
-      await assert.rejects(sendMail(options(stub.port), message), new RegExp(reply.slice(0, 3)));
+      const result = await sendMail(options(stub.port), message);
+      assert.deepEqual(result, {
+        accepted: ["b@example.com"],
+        refused: [{ recipient: "a@example.com", responseCode: code }],
+      });
+      assert.equal(stub.messages.length, 1);
     } finally {
       await stub.close();
     }
+  }
+});
+
+test("only the envelope recipients get RCPT TO; the To header keeps every recipient", async () => {
+  const stub = await startSmtpStub();
+  try {
+    const result = await sendMail(options(stub.port), {
+      ...message,
+      envelopeTo: ["b@example.com"],
+    });
+    assert.deepEqual(result, { accepted: ["b@example.com"], refused: [] });
+    assert.deepEqual(
+      stub.commands.filter((c) => c.startsWith("RCPT")),
+      ["RCPT TO:<b@example.com>"],
+    );
+    const mail = decodeMail(stub.messages[0] ?? "");
+    assert.equal(mail.headers.to, "a@example.com, b@example.com");
+  } finally {
+    await stub.close();
   }
 });
 
@@ -230,10 +277,10 @@ test("a line break in the subject is rejected", async () => {
 });
 
 test("a line break in an address is rejected", async () => {
-  await assert.rejects(
-    sendMail(options(1), { ...message, to: ["a@example.com\r\nRCPT TO:<x@y>"] }),
-    /line break/,
-  );
+  const bad = ["a@example.com\r\nRCPT TO:<x@y>"];
+  for (const over of [{ to: bad }, { envelopeTo: bad }]) {
+    await assert.rejects(sendMail(options(1), { ...message, ...over }), /line break/);
+  }
 });
 
 test("an AUTH failure reports the code only, not the reply text", async () => {
@@ -304,7 +351,6 @@ test("no server text reaches the error chain or its log fields", async () => {
     { EHLO: `550 ${echo}` },
     { EHLO: `451 ${echo}` },
     { "MAIL FROM": `550 ${echo}` },
-    { "RCPT TO": `550 ${echo}` },
     { DATA: `554 ${echo}` },
   ];
   for (const replies of cases) {
@@ -322,6 +368,17 @@ test("no server text reaches the error chain or its log fields", async () => {
     } finally {
       await stub.close();
     }
+  }
+  // A refusal at RCPT is a result: it carries the address and the numeric code only.
+  const stub = await startSmtpStub({ replies: { "RCPT TO": `550 ${echo}` } });
+  try {
+    const result = await sendMail(options(stub.port), single);
+    assert.deepEqual(result, {
+      accepted: [],
+      refused: [{ recipient: "a@example.com", responseCode: 550 }],
+    });
+  } finally {
+    await stub.close();
   }
 });
 
@@ -379,8 +436,8 @@ test("a timeout closes the connection to the server", async () => {
   }
 });
 
-test("a 5xx reply is a permanent error at every stage, a 4xx is not", async () => {
-  for (const verb of ["EHLO", "MAIL FROM", "RCPT TO", "DATA"]) {
+test("a 5xx reply is a permanent error at every stage but RCPT, a 4xx is not", async () => {
+  for (const verb of ["EHLO", "MAIL FROM", "DATA"]) {
     for (const code of [550, 451]) {
       const stub = await startSmtpStub({ replies: { [verb]: `${code} nope` } });
       try {
@@ -393,6 +450,37 @@ test("a 5xx reply is a permanent error at every stage, a 4xx is not", async () =
         await stub.close();
       }
     }
+  }
+});
+
+test("all recipients refused: with a 5xx a result, with only 4xx today's retryable error", async () => {
+  const hard = await startSmtpStub({
+    replies: { "RCPT TO:<a@": "550 no", "RCPT TO:<b@": "451 later" },
+  });
+  try {
+    const result = await sendMail(options(hard.port), message);
+    assert.deepEqual(result, {
+      accepted: [],
+      refused: [
+        { recipient: "a@example.com", responseCode: 550 },
+        { recipient: "b@example.com", responseCode: 451 },
+      ],
+    });
+    assert.equal(hard.messages.length, 0);
+  } finally {
+    await hard.close();
+  }
+  const soft = await startSmtpStub({
+    replies: { "RCPT TO:<a@": "451 no", "RCPT TO:<b@": "452 later" },
+  });
+  try {
+    await assert.rejects(sendMail(options(soft.port), message), (err: unknown) => {
+      assert.equal(err instanceof SmtpError, true);
+      assert.equal((err as Error).message, "SMTP rejected the message: 451");
+      return true;
+    });
+  } finally {
+    await soft.close();
   }
 });
 
@@ -565,5 +653,476 @@ test("a signal that is already aborted rejects before any connection", async () 
     assert.equal(stub.messages.length, 0);
   } finally {
     await stub.close();
+  }
+});
+
+// Partial refusal: retries go only to the recipients that still need the message.
+
+const A = "a@example.test";
+const B = "b@example.test";
+const C = "c@example.test";
+
+function note(key: string): Notification {
+  return {
+    key,
+    event: "opened",
+    incidentId: 1,
+    checkId: "c",
+    checkName: "C",
+    reason: null,
+    time: "2026-01-01T00:00:00.000Z",
+    timeMs: 0,
+    openedMs: 0,
+  };
+}
+
+function statePath(): string {
+  const dir = mkdtempSync(join(tmpdir(), "notify-partial-"));
+  dirs.push(dir);
+  return join(dir, "state.json");
+}
+
+interface Chain {
+  ledger: Ledger;
+  delivery: ChannelDelivery;
+  logger: ReturnType<typeof spyLogger>;
+  attempts: () => number;
+}
+
+/** Email sender plus `ChannelDelivery` with a ledger, a fake sleep and the real `sendMail`. */
+function chain(
+  port: number,
+  to: string[],
+  path: string,
+  over: {
+    retryAttempts?: number;
+    hooks?: LedgerOptions["hooks"];
+    send?: SendMail;
+    sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  } = {},
+): Chain {
+  const logger = spyLogger();
+  const ledger = new Ledger(path, over.hooks ? { hooks: over.hooks } : {});
+  const sender = createEmailSender(
+    {
+      id: "mail",
+      type: "email",
+      smtp: { host: "127.0.0.1", port, tls: "none" },
+      from: "pulse@example.test",
+      to,
+    },
+    { sendMail: over.send ?? sendMail, schedule: () => () => {}, now: () => 0 },
+  );
+  let count = 0;
+  const delivery = new ChannelDelivery({
+    channelId: "mail",
+    send: async (n, signal, progress) => {
+      count++;
+      await sender(n, signal, progress);
+    },
+    ledger,
+    sleep: over.sleep ?? (async () => {}),
+    retryDelayMs: 1,
+    retryAttempts: over.retryAttempts ?? 5,
+    logger,
+  });
+  return { ledger, delivery, logger, attempts: () => count };
+}
+
+/** The RCPT TO lines of each transaction, split at MAIL FROM. */
+function transactions(stub: SmtpStub): string[][] {
+  const result: string[][] = [];
+  for (const command of stub.commands) {
+    if (command.startsWith("MAIL FROM")) result.push([]);
+    else if (command.startsWith("RCPT TO")) result.at(-1)?.push(command);
+  }
+  return result;
+}
+
+function storedFailed(path: string, key: string): RecipientProgress | undefined {
+  const ledger = new Ledger(path);
+  try {
+    return ledger.failed().find((e) => e.key === key)?.recipients;
+  } finally {
+    ledger.close();
+  }
+}
+
+test("a 4xx-refused recipient is retried alone; the delivered one gets no second copy", async () => {
+  const stub = await startSmtpStub({ replies: { [`RCPT TO:<${B}`]: "451 4.2.0 try later" } });
+  const path = statePath();
+  const c = chain(stub.port, [A, B], path);
+  try {
+    c.delivery.enqueue(note("1:opened"));
+    await c.delivery.idle();
+    assert.deepEqual(transactions(stub), [
+      [`RCPT TO:<${A}>`, `RCPT TO:<${B}>`],
+      [`RCPT TO:<${B}>`],
+    ]);
+    assert.equal(stub.messages.length, 2);
+    const [first, second] = stub.messages.map((m) => decodeMail(m).headers);
+    assert.equal(first?.["message-id"], second?.["message-id"]);
+    assert.equal(first?.to, `${A}, ${B}`);
+    assert.equal(second?.to, `${A}, ${B}`);
+    assert.equal(c.ledger.status("mail", "1:opened"), "delivered");
+    assert.equal(c.attempts(), 2);
+    const partly = c.logger.entries.find((e) => e.msg === "delivery attempt partly refused");
+    assert.deepEqual(partly?.fields, {
+      channel: "mail",
+      key: "1:opened",
+      attempt: 1,
+      delivered: 1,
+      refused: 0,
+      remaining: 1,
+      codes: [451],
+    });
+  } finally {
+    c.ledger.close();
+    await stub.close();
+  }
+});
+
+test("2xx, 4xx and 5xx: only the 4xx one is retried and the event fails with c refused", async () => {
+  const stub = await startSmtpStub({
+    replies: { [`RCPT TO:<${B}`]: "451 later", [`RCPT TO:<${C}`]: "550 no such user" },
+  });
+  const path = statePath();
+  const c = chain(stub.port, [A, B, C], path);
+  try {
+    c.delivery.enqueue(note("1:opened"));
+    await c.delivery.idle();
+    assert.deepEqual(transactions(stub), [
+      [`RCPT TO:<${A}>`, `RCPT TO:<${B}>`, `RCPT TO:<${C}>`],
+      [`RCPT TO:<${B}>`],
+    ]);
+    assert.equal(c.ledger.status("mail", "1:opened"), "failed");
+    const failed = c.logger.entries.find((e) => e.msg === "notification delivery failed");
+    assert.equal(failed?.fields.attempts, 2);
+    assert.equal(failed?.fields.permanent, true);
+    assert.equal(failed?.fields.error, "SMTP refused 1 of 3 recipients");
+  } finally {
+    c.ledger.close();
+    await stub.close();
+  }
+  assert.deepEqual(storedFailed(path, "1:opened"), { delivered: [A, B], refused: [C] });
+});
+
+test("all recipients refused with 4xx: retryable, progress unchanged", async () => {
+  const stub = await startSmtpStub({
+    replies: { [`RCPT TO:<${A}`]: "451 later", [`RCPT TO:<${B}`]: "452 later" },
+  });
+  const c = chain(stub.port, [A, B], statePath());
+  try {
+    c.delivery.enqueue(note("1:opened"));
+    await c.delivery.idle();
+    assert.deepEqual(transactions(stub), [
+      [`RCPT TO:<${A}>`, `RCPT TO:<${B}>`],
+      [`RCPT TO:<${A}>`, `RCPT TO:<${B}>`],
+    ]);
+    assert.equal(c.ledger.status("mail", "1:opened"), "delivered");
+    const warn = c.logger.entries.find((e) => e.msg === "delivery attempt failed");
+    assert.equal(warn?.fields.error, "SMTP rejected the message: 451");
+    assert.equal(
+      c.logger.entries.filter((e) => e.msg === "delivery attempt partly refused").length,
+      0,
+    );
+  } finally {
+    c.ledger.close();
+    await stub.close();
+  }
+});
+
+test("all recipients refused with 5xx: failed after 1 attempt", async () => {
+  const stub = await startSmtpStub({
+    replies: { [`RCPT TO:<${A}`]: "550 no", [`RCPT TO:<${B}`]: "551 no" },
+  });
+  const path = statePath();
+  const c = chain(stub.port, [A, B], path);
+  try {
+    c.delivery.enqueue(note("1:opened"));
+    await c.delivery.idle();
+    assert.equal(c.attempts(), 1);
+    assert.equal(stub.messages.length, 0);
+    assert.equal(c.ledger.status("mail", "1:opened"), "failed");
+  } finally {
+    c.ledger.close();
+    await stub.close();
+  }
+  assert.deepEqual(storedFailed(path, "1:opened"), { delivered: [], refused: [A, B] });
+});
+
+test("an end-of-data 451 delivers nobody: the next transaction has both recipients", async () => {
+  const stub = await startSmtpStub({ endOfDataReply: "451 later" });
+  const c = chain(stub.port, [A, B], statePath(), { retryAttempts: 2 });
+  try {
+    c.delivery.enqueue(note("1:opened"));
+    await c.delivery.idle();
+    assert.deepEqual(transactions(stub), [
+      [`RCPT TO:<${A}>`, `RCPT TO:<${B}>`],
+      [`RCPT TO:<${A}>`, `RCPT TO:<${B}>`],
+    ]);
+    assert.equal(c.ledger.status("mail", "1:opened"), "failed");
+    assert.equal(c.ledger.failed()[0]?.recipients, undefined);
+  } finally {
+    c.ledger.close();
+    await stub.close();
+  }
+});
+
+test("two events on one channel keep separate progress", async () => {
+  // The first RCPT of b (event 1) and the first RCPT of a (event 2) are refused once.
+  const stub = await startSmtpStub({ replies: { [`RCPT TO:<${B}`]: "451 later" } });
+  const c = chain(stub.port, [A, B], statePath());
+  try {
+    c.delivery.enqueue(note("1:opened"));
+    c.delivery.enqueue(note("2:opened"));
+    await c.delivery.idle();
+    // Event 1 sends to a and b (b refused); event 2 to a and b; event 1 retries b only.
+    assert.deepEqual(transactions(stub), [
+      [`RCPT TO:<${A}>`, `RCPT TO:<${B}>`],
+      [`RCPT TO:<${A}>`, `RCPT TO:<${B}>`],
+      [`RCPT TO:<${B}>`],
+    ]);
+    assert.equal(c.ledger.status("mail", "1:opened"), "delivered");
+    assert.equal(c.ledger.status("mail", "2:opened"), "delivered");
+  } finally {
+    c.ledger.close();
+    await stub.close();
+  }
+});
+
+test("restart: a reopened ledger's pending progress sends only to b", async () => {
+  const stub = await startSmtpStub({ replies: { [`RCPT TO:<${B}`]: "451 later" } });
+  const path = statePath();
+  let isWaiting: () => void = () => {};
+  const waiting = new Promise<void>((resolve) => {
+    isWaiting = resolve;
+  });
+  // The retry timer never ends: the process stops while the event is pending.
+  const first = chain(stub.port, [A, B], path, {
+    sleep: (_ms, signal) => {
+      isWaiting();
+      return new Promise((resolve) => signal?.addEventListener("abort", () => resolve()));
+    },
+  });
+  first.delivery.enqueue(note("1:opened"));
+  await waiting;
+  first.delivery.stop();
+  await first.delivery.idle();
+  first.ledger.close();
+  const second = chain(stub.port, [A, B], path);
+  try {
+    const pending = second.ledger.pending();
+    assert.deepEqual(pending[0]?.recipients, { delivered: [A], refused: [] });
+    for (const entry of pending) {
+      if (entry.notification) second.delivery.enqueue(entry.notification, entry.recipients);
+    }
+    await second.delivery.idle();
+    assert.deepEqual(transactions(stub), [
+      [`RCPT TO:<${A}>`, `RCPT TO:<${B}>`],
+      [`RCPT TO:<${B}>`],
+    ]);
+    assert.equal(second.ledger.status("mail", "1:opened"), "delivered");
+  } finally {
+    second.ledger.close();
+    await stub.close();
+  }
+});
+
+test("failed resend of the 2xx/4xx/5xx event sends only to c", async () => {
+  const stub = await startSmtpStub({
+    replies: { [`RCPT TO:<${B}`]: "451 later", [`RCPT TO:<${C}`]: "550 no" },
+  });
+  const path = statePath();
+  const first = chain(stub.port, [A, B, C], path);
+  first.delivery.enqueue(note("1:opened"));
+  await first.delivery.idle();
+  assert.equal(first.ledger.resend("mail", "1:opened"), "resent");
+  first.ledger.close();
+  const second = chain(stub.port, [A, B, C], path);
+  try {
+    const [entry] = second.ledger.pending();
+    assert.deepEqual(entry?.recipients, { delivered: [A, B], refused: [] });
+    if (entry?.notification) second.delivery.enqueue(entry.notification, entry.recipients);
+    await second.delivery.idle();
+    assert.deepEqual(transactions(stub).at(-1), [`RCPT TO:<${C}>`]);
+    assert.equal(transactions(stub).length, 3);
+    assert.equal(second.ledger.status("mail", "1:opened"), "delivered");
+  } finally {
+    second.ledger.close();
+    await stub.close();
+  }
+});
+
+test("a display name and an upper-case domain map to one id; the local part keeps its case", async () => {
+  assert.equal(recipientId("Ops <Alice@Example.TEST>"), "Alice@example.test");
+  const stub = await startSmtpStub();
+  const c = chain(stub.port, ["Ops <Alice@Example.TEST>"], statePath());
+  try {
+    c.delivery.enqueue(note("1:opened"));
+    await c.delivery.idle();
+    assert.deepEqual(transactions(stub), [["RCPT TO:<Alice@example.test>"]]);
+    assert.equal(c.ledger.status("mail", "1:opened"), "delivered");
+  } finally {
+    c.ledger.close();
+    await stub.close();
+  }
+});
+
+/** The email sender alone, with a fake `SendMail` that records each envelope. */
+function fakeSender(to: string[], reply: (envelopeTo: string[]) => SendMailResult) {
+  const calls: string[][] = [];
+  const send = createEmailSender(
+    {
+      id: "mail",
+      type: "email",
+      smtp: { host: "127.0.0.1", port: 1, tls: "none" },
+      from: "pulse@example.test",
+      to,
+    },
+    {
+      sendMail: async (_smtp, m) => {
+        calls.push(m.envelopeTo);
+        return reply(m.envelopeTo);
+      },
+      now: () => 0,
+    },
+  );
+  return { send, calls };
+}
+
+async function partialOf(attempt: Promise<void>): Promise<PartialDeliveryError> {
+  try {
+    await attempt;
+  } catch (err) {
+    if (err instanceof PartialDeliveryError) return err;
+    throw err;
+  }
+  throw new Error("attempt resolved");
+}
+
+test("changed recipients: delivered ids stay, added ones are tried, removed ones are left out", async () => {
+  const { send, calls } = fakeSender([A, C], (envelope) => ({ accepted: envelope, refused: [] }));
+  await send(note("1:opened"), undefined, { delivered: [A, B], refused: [] });
+  assert.deepEqual(calls, [[C]]);
+  const refusing = fakeSender([C], () => ({
+    accepted: [],
+    refused: [{ recipient: C, responseCode: 550 }],
+  }));
+  const err = await partialOf(
+    refusing.send(note("1:opened"), undefined, { delivered: [A], refused: [] }),
+  );
+  assert.deepEqual(err.progress, { delivered: [A], refused: [C] });
+  assert.equal(err.isPermanent, true);
+});
+
+test("nothing remaining connects to nothing", async () => {
+  const done = fakeSender([A, B], () => ({ accepted: [], refused: [] }));
+  await done.send(note("1:opened"), undefined, { delivered: [A, B], refused: [] });
+  assert.deepEqual(done.calls, []);
+  const refused = fakeSender([A, B], () => ({ accepted: [], refused: [] }));
+  const err = await partialOf(
+    refused.send(note("1:opened"), undefined, { delivered: [A], refused: [B] }),
+  );
+  assert.deepEqual(refused.calls, []);
+  assert.equal(err.isPermanent, true);
+  assert.equal(err.message, "SMTP refused 1 of 2 recipients");
+});
+
+test("an unexpected accepted or refused address is never recorded", async () => {
+  const { send } = fakeSender([A, B], () => ({
+    accepted: [A, "x@example.test"],
+    refused: [{ recipient: "y@example.test", responseCode: 550 }],
+  }));
+  const err = await partialOf(send(note("1:opened"), undefined));
+  assert.deepEqual(err.progress, { delivered: [A], refused: [] });
+  assert.equal(err.isPermanent, false);
+  assert.equal(err.remaining, 1);
+});
+
+test("an accepted address matches its id after the domain is lowercased", async () => {
+  const { send, calls } = fakeSender(["Bob@example.test"], () => ({
+    accepted: ["Bob@EXAMPLE.test"],
+    refused: [],
+  }));
+  await assert.doesNotReject(send(note("1:opened"), undefined));
+  assert.deepEqual(calls, [["Bob@example.test"]]);
+});
+
+test("a failed progress write is logged and the next attempt still skips a", async () => {
+  const stub = await startSmtpStub({ replies: { [`RCPT TO:<${B}`]: "451 later" } });
+  let isCounting = false;
+  let commits = 0;
+  const c = chain(stub.port, [A, B], statePath(), {
+    hooks: {
+      beforeCommit: () => {
+        // Commit 1 is the claim, commit 2 the progress write.
+        if (isCounting && ++commits === 2) throw new Error("disk full");
+      },
+    },
+  });
+  try {
+    isCounting = true;
+    c.delivery.enqueue(note("1:opened"));
+    await c.delivery.idle();
+    const log = c.logger.entries.find((e) => e.msg === "ledger recipient write failed");
+    assert.deepEqual(log?.fields, { channel: "mail", key: "1:opened", error: "disk full" });
+    assert.deepEqual(transactions(stub), [
+      [`RCPT TO:<${A}>`, `RCPT TO:<${B}>`],
+      [`RCPT TO:<${B}>`],
+    ]);
+    assert.equal(c.ledger.status("mail", "1:opened"), "delivered");
+  } finally {
+    c.ledger.close();
+    await stub.close();
+  }
+});
+
+test("other SMTP failures change no progress and keep their classification", async () => {
+  for (const [replies, isPermanent] of [
+    [{ "MAIL FROM": "550 no" }, true],
+    [{ DATA: "451 later" }, false],
+  ] as const) {
+    const stub = await startSmtpStub({ replies: { ...replies } });
+    const c = chain(stub.port, [A, B], statePath(), { retryAttempts: 1 });
+    try {
+      c.delivery.enqueue(note("1:opened"));
+      await c.delivery.idle();
+      const failed = c.ledger.failed()[0];
+      assert.equal(failed?.recipients, undefined);
+      const log = c.logger.entries.find((e) => e.msg === "notification delivery failed");
+      assert.equal(log?.fields.permanent === true, isPermanent);
+    } finally {
+      c.ledger.close();
+      await stub.close();
+    }
+  }
+});
+
+test("a secret and CR/LF in a refusal reply reach no log, error or ledger", async () => {
+  const marker = "MARKER-SECRET-77";
+  const stub = await startSmtpStub({
+    replies: { [`RCPT TO:<${B}`]: `550-${marker}\r\n550 ${marker}` },
+  });
+  const path = statePath();
+  const c = chain(stub.port, [A, B], path);
+  try {
+    c.delivery.enqueue(note("1:opened"));
+    await c.delivery.idle();
+    assert.equal(c.ledger.status("mail", "1:opened"), "failed");
+    const failed = c.logger.entries.find((e) => e.msg === "notification delivery failed");
+    assert.equal(failed?.fields.error, "SMTP refused 1 of 2 recipients: 550");
+    assert.equal(JSON.stringify(c.logger.entries).includes(marker), false);
+  } finally {
+    c.ledger.close();
+    await stub.close();
+  }
+  for (const file of [path, `${path}-wal`]) {
+    try {
+      assert.equal(readFileSync(file, "latin1").includes(marker), false, file);
+    } catch (err) {
+      // The WAL may be gone after close; only its absence is acceptable.
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
   }
 });
