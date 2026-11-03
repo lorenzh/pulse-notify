@@ -1,6 +1,7 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, test } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { detectEvents, seedKeys } from "../src/detector.ts";
@@ -44,13 +45,20 @@ afterEach(async () => {
 
 let current: Ledger | undefined;
 
-/** Writes the batched changes of the last ledger and returns the state file. */
+/** Reads the hook channel from the state file through a second ledger. */
 async function savedState(): Promise<{
   channels: Record<string, Record<string, { status: string }>>;
   version: number;
 }> {
   await current?.flush();
-  return JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+  const path = join(dir, "state.json");
+  const db = new Database(path, { readonly: true });
+  const row = db.query("PRAGMA user_version").get() as { user_version: number };
+  db.close();
+  const reopened = new Ledger(path);
+  const hook = Object.fromEntries(reopened.entries("hook").map(([k, status]) => [k, { status }]));
+  reopened.close();
+  return { channels: { hook }, version: row.user_version };
 }
 
 function make(sleep: Sleep = async () => {}): Notifier {
@@ -138,7 +146,7 @@ test("older reminder keys are pruned from the ledger", async () => {
     Object.keys(state.channels.hook ?? {}).sort((a, b) => a.localeCompare(b)),
     ["1:opened", "1:reminder:2"],
   );
-  assert.equal(state.version, 2);
+  assert.equal(state.version, 3);
 });
 
 test("a resolved incident gets no reminder", async () => {

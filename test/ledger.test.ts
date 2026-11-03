@@ -1,11 +1,11 @@
+import { Database } from "bun:sqlite";
 import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { Ledger } from "../src/ledger.ts";
+import { Ledger, LedgerClosedError } from "../src/ledger.ts";
 import type { Notification } from "../src/types.ts";
-import { recordingFs } from "./support.ts";
 
 function note(key: string): Notification {
   return {
@@ -73,57 +73,65 @@ test("a corrupt ledger is an error, not an empty state", () => {
   assert.throws(() => new Ledger(path), /unsupported format/);
 });
 
-test("settle removes the payload; a ledger without payloads loads", async () => {
+test("settle removes the payload; a ledger without payloads loads", () => {
   const path = tmpPath();
   const a = new Ledger(path);
   a.claim("c", "1:opened", note("1:opened"));
   a.settle("c", "1:opened", "delivered");
-  await a.flush();
+  a.close();
+  const db = new Database(path, { readonly: true });
+  assert.deepEqual(db.query("SELECT key, payload, recipients FROM entries").all(), [
+    { key: "1:opened", payload: null, recipients: null },
+  ]);
+  db.close();
   assert.deepEqual(new Ledger(path).pending(), []);
-  assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).payloads, { c: {} });
 
-  writeFileSync(path, JSON.stringify({ version: 1, channels: { c: { "9:opened": "pending" } } }));
-  assert.deepEqual(new Ledger(path).pending(), [{ channelId: "c", key: "9:opened" }]);
+  const legacy = tmpPath();
+  mkdirSync(dirname(legacy), { recursive: true });
+  writeFileSync(legacy, JSON.stringify({ version: 1, channels: { c: { "9:opened": "pending" } } }));
+  assert.deepEqual(new Ledger(legacy).pending(), [{ channelId: "c", key: "9:opened" }]);
 });
 
-test("a failed sync write leaves the state unchanged", () => {
+test("format 3 has the exact schema, user_version 3 and WAL mode", () => {
   const path = tmpPath();
-  const fs = recordingFs();
-  const ledger = new Ledger(path, { fs });
+  const ledger = new Ledger(path);
+  ledger.close();
+  const db = new Database(path, { readonly: true });
+  const sql = db
+    .query("SELECT sql FROM sqlite_master WHERE type = 'table' ORDER BY name")
+    .all()
+    .map((row) =>
+      String((row as { sql: string }).sql)
+        .replace(/\s+/g, " ")
+        .trim(),
+    );
+  assert.deepEqual(sql, [
+    "CREATE TABLE channels ( id TEXT PRIMARY KEY, reminders_from INTEGER, manual_from INTEGER, check_routing TEXT, component_routing TEXT ) STRICT",
+    "CREATE TABLE entries ( channel_id TEXT NOT NULL, key TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('seeded','pending','delivered','failed','dropped')), at INTEGER NOT NULL, payload TEXT, recipients TEXT, PRIMARY KEY (channel_id, key) ) STRICT",
+  ]);
+  assert.deepEqual(db.query("PRAGMA user_version").get(), { user_version: 3 });
+  assert.deepEqual(db.query("PRAGMA journal_mode").get(), { journal_mode: "wal" });
+  db.close();
+});
+
+test("after close a claim throws LedgerClosedError and writes nothing", () => {
+  const path = tmpPath();
+  const ledger = new Ledger(path);
   ledger.seed("c", []);
-  fs.faults.isOpenTempFailing = true;
-  assert.throws(() => ledger.claim("c", "1:opened", note("1:opened")));
-  assert.equal(ledger.has("c", "1:opened"), false);
-  assert.throws(() => ledger.seed("d", []));
-  assert.equal(ledger.hasChannel("d"), false);
-  fs.faults.isOpenTempFailing = false;
-  assert.equal(ledger.claim("c", "1:opened", note("1:opened")), true);
+  ledger.close();
+  assert.throws(() => ledger.claim("c", "1:opened", note("1:opened")), LedgerClosedError);
+  assert.throws(() => ledger.seed("c", ["x"]), { name: "LedgerClosedError" });
+  const reopened = new Ledger(path);
+  assert.deepEqual(reopened.entries("c"), []);
+  reopened.close();
 });
 
-const DURABLE_STEPS = ["fsync:file", "rename", "open:dir", "fsync:dir"];
-
-test("a claim and a flushed batch fsync the temp file, rename, then fsync the directory", async () => {
+test("flush checkpoints the WAL down to 0 bytes", async () => {
   const path = tmpPath();
-  const fs = recordingFs();
-  const ledger = new Ledger(path, { fs, schedule: () => () => {} });
+  const ledger = new Ledger(path);
   ledger.claim("c", "1:opened", note("1:opened"));
-  assert.deepEqual(fs.steps, DURABLE_STEPS);
-  fs.steps.length = 0;
-  ledger.settle("c", "1:opened", "delivered");
+  assert.ok(statSync(`${path}-wal`).size > 0);
   await ledger.flush();
-  assert.deepEqual(fs.steps, DURABLE_STEPS);
-  assert.equal(new Ledger(path).status("c", "1:opened"), "delivered");
-});
-
-test("a write interrupted before the rename keeps the old file and leaves no temp file", () => {
-  const path = tmpPath();
-  mkdirSync(dirname(path), { recursive: true });
-  const before = '{"version":2,"channels":{"c":{}}}';
-  writeFileSync(path, before);
-  const fs = recordingFs();
-  const ledger = new Ledger(path, { fs });
-  fs.faults.isTempFsyncFailing = true;
-  assert.throws(() => ledger.claim("c", "1:opened", note("1:opened")), /at write/);
-  assert.equal(readFileSync(path, "utf8"), before);
-  assert.deepEqual(readdirSync(dirname(path)), ["state.json"]);
+  assert.equal(statSync(`${path}-wal`).size, 0);
+  ledger.close();
 });

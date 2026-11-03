@@ -388,7 +388,13 @@ export class Notifier {
     if (this.#lastPruneMs !== undefined && nowMs - this.#lastPruneMs < PRUNE_EVERY_MS) return;
     this.#lastPruneMs = nowMs;
     const days = this.#opts.stateRetentionDays ?? 30;
-    const count = this.#opts.ledger.prune(days * DAY_MS, this.#visible, this.#visibleManual);
+    let count: number;
+    try {
+      count = this.#opts.ledger.prune(days * DAY_MS, this.#visible, this.#visibleManual);
+    } catch (err) {
+      this.#opts.logger.error("ledger prune failed, the next prune retries", errorFields(err));
+      return;
+    }
     if (count > 0) this.#opts.logger.info("old ledger entries pruned", { count });
   }
 
@@ -566,7 +572,15 @@ export class Notifier {
   ): boolean {
     const { ledger, logger } = this.#opts;
     if (!reminders) {
-      ledger.setRemindersFrom(id, undefined);
+      try {
+        ledger.setRemindersFrom(id, undefined);
+      } catch (err) {
+        logger.error("ledger seed failed, the next poll retries", {
+          channel: id,
+          ...errorFields(err),
+        });
+        return false;
+      }
       return true;
     }
     if (ledger.remindersFrom(id) !== undefined) return true;

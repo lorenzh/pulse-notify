@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, test } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFailed } from "../src/failed-cli.ts";
@@ -96,6 +96,33 @@ test("resend <key> sets the entry pending in every channel, --channel narrows it
   assert.equal(rest.code, 0);
   assert.equal(ledger.status("hook", "1:opened"), "pending");
   assert.equal(ledger.status("hook", "2:opened"), "failed");
+});
+
+test("resend keeps delivered recipients and clears refused ones, also after a reopen", async () => {
+  const ledger = await failedLedger();
+  ledger.setRecipients("hook", "1:opened", {
+    delivered: ["a@example.test", "b@example.test"],
+    refused: ["c@example.test"],
+  });
+  assert.deepEqual(
+    ledger.failed().find((e) => e.channelId === "hook" && e.key === "1:opened")?.recipients,
+    {
+      delivered: ["a@example.test", "b@example.test"],
+      refused: ["c@example.test"],
+    },
+  );
+  assert.equal(runFailed(["resend", "1:opened", "--channel", "hook"], ledger).code, 0);
+  ledger.close();
+  const reopened = new Ledger(state);
+  assert.deepEqual(reopened.pending(), [
+    {
+      channelId: "hook",
+      key: "1:opened",
+      notification: note("1:opened"),
+      recipients: { delivered: ["a@example.test", "b@example.test"], refused: [] },
+    },
+  ]);
+  reopened.close();
 });
 
 test("resend --all, with and without --channel", async () => {
@@ -241,9 +268,16 @@ test("end to end: a 404 receiver fails the event, the CLI resends it, the servic
   await second.running.stop();
   assert.equal(asRecord(rx.accepted()[0]?.body).key, "1:opened");
   assert.equal(rx.accepted()[0]?.headers["idempotency-key"], "1:opened");
-  assert.equal(
-    JSON.parse(readFileSync(state, "utf8")).channels.hook["1:opened"].status,
-    "delivered",
-  );
+  assert.equal(savedStatus(state, "hook", "1:opened"), "delivered");
   assert.equal(rx.accepted().length, 1, "delivered once");
 });
+
+/** Reads one status from the state file through a second ledger. */
+function savedStatus(path: string, channelId: string, key: string): string | undefined {
+  const ledger = new Ledger(path);
+  try {
+    return ledger.status(channelId, key);
+  } finally {
+    ledger.close();
+  }
+}

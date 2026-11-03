@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, test } from "bun:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MailMessage, SendMail, SmtpOptions } from "../src/channels/mailer.ts";
@@ -263,8 +263,7 @@ test("an SMTP error that never clears ends as failed", async () => {
   assert.ok(mailCalls > 0);
   assert.ok(logger.entries.some((e) => e.msg === "notification delivery failed"));
   await current?.flush();
-  const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
-  assert.equal(state.channels.m["1:opened"].status, "failed");
+  assert.equal(savedStatus(join(dir, "state.json"), "m", "1:opened"), "failed");
 });
 
 test("routing: checks pattern and excludeChecks apply to every channel type", async () => {
@@ -311,7 +310,16 @@ test("no secret, URL or password appears in logs or metrics", async () => {
   assert.ok(mailCalls > 0);
   assert.ok(logger.entries.some((e) => e.msg === "notification delivery failed"));
   await current?.flush();
-  const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
-  assert.equal(state.channels.m["1:opened"].status, "failed");
+  assert.equal(savedStatus(join(dir, "state.json"), "m", "1:opened"), "failed");
   for (const secret of secrets) assert.equal(dump.includes(secret), false, secret);
 });
+
+/** Reads one status from the state file through a second ledger. */
+function savedStatus(path: string, channelId: string, key: string): string | undefined {
+  const ledger = new Ledger(path);
+  try {
+    return ledger.status(channelId, key);
+  } finally {
+    ledger.close();
+  }
+}

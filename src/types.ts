@@ -100,6 +100,12 @@ export interface Config {
 }
 
 /** Sends one notification; rejects on failure. */
+/** Recipient ids of one email event: `delivered` got the message, `refused` got a 5xx at RCPT. */
+export interface RecipientProgress {
+  delivered: string[];
+  refused: string[];
+}
+
 export type Sender = (notification: Notification, signal?: AbortSignal) => Promise<void>;
 
 /** Resolves after `ms`, or early when `signal` aborts. */

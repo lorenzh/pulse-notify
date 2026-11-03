@@ -1,14 +1,34 @@
-import { afterAll, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterAll, afterEach, test } from "bun:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Ledger, WRITE_BATCH_MS } from "../src/ledger.ts";
-import type { Notification, Schedule } from "../src/types.ts";
-import { recordingFs } from "./support.ts";
+import { Ledger, type LedgerOptions } from "../src/ledger.ts";
+import type { Notification } from "../src/types.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-ledger2-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+const open: Ledger[] = [];
+afterEach(() => {
+  for (const ledger of open.splice(0)) ledger.close();
+});
+
+/** Opens a ledger that is closed after the test. */
+function ledgerAt(file: string, opts?: LedgerOptions): Ledger {
+  const ledger = new Ledger(file, opts);
+  open.push(ledger);
+  return ledger;
+}
 
 let counter = 0;
 function path(): string {
@@ -29,157 +49,231 @@ function note(key: string, incidentId = 1): Notification {
   };
 }
 
-/** A schedule whose timers fire only when the test says so. */
-function fakeSchedule(): { schedule: Schedule; fire: () => void; delays: number[] } {
-  const timers = new Map<number, () => void>();
-  const delays: number[] = [];
-  let next = 0;
-  return {
-    delays,
-    schedule: (fn, ms) => {
-      const id = next++;
-      delays.push(ms);
-      timers.set(id, fn);
-      return () => timers.delete(id);
-    },
-    fire: () => {
-      for (const [id, fn] of [...timers]) {
-        timers.delete(id);
-        fn();
-      }
+/** A commit hook that throws while `isFailing` is set. */
+function fault(): { isFailing: boolean; beforeCommit: () => void } {
+  const f = {
+    isFailing: false,
+    beforeCommit: () => {
+      if (f.isFailing) throw new Error("injected commit failure");
     },
   };
+  return f;
 }
 
-function read(file: string): {
-  version: number;
-  channels: Record<string, Record<string, { status: string; at: number }>>;
-  payloads?: Record<string, Record<string, unknown>>;
-  remindersFrom?: Record<string, number>;
-} {
-  return JSON.parse(readFileSync(file, "utf8"));
-}
+const V2_FIXTURE = JSON.stringify({
+  version: 2,
+  channels: {
+    c: {
+      "1:opened": { status: "delivered", at: 10 },
+      "2:opened": { status: "failed", at: 20 },
+      "3:opened": { status: "pending", at: 30 },
+      "4:opened": { status: "pending", at: 40 },
+    },
+    d: {},
+  },
+  payloads: { c: { "2:opened": note("2:opened", 2), "3:opened": note("3:opened", 3) } },
+  remindersFrom: { c: 50 },
+  manualFrom: { c: 60 },
+});
 
-test("a v1 file loads, entries get the load time, and writes are v2", () => {
+test("a v1 file migrates, entries get the load time, and a v1 backup keeps its bytes", () => {
   const file = path();
-  writeFileSync(
-    file,
-    JSON.stringify({
-      version: 1,
-      channels: { c: { "1:opened": "delivered", "2:opened": "failed" } },
-    }),
-  );
-  const ledger = new Ledger(file, { now: () => 5000 });
+  const v1 = JSON.stringify({
+    version: 1,
+    channels: { c: { "1:opened": "delivered", "2:opened": "failed" } },
+  });
+  writeFileSync(file, v1);
+  const ledger = ledgerAt(file, { now: () => 5000 });
+  assert.deepEqual(ledger.migration, {
+    from: 1,
+    entries: 2,
+    backup: `${file}.v1.bak`,
+  });
   assert.equal(ledger.status("c", "1:opened"), "delivered");
   assert.deepEqual(ledger.failed(), [{ channelId: "c", key: "2:opened", at: 5000 }]);
-  ledger.seed("c", ["3:opened"]);
-  const saved = read(file);
-  assert.equal(saved.version, 2);
-  assert.deepEqual(saved.channels.c?.["1:opened"], { status: "delivered", at: 5000 });
-  assert.equal(saved.remindersFrom, undefined);
+  assert.equal(readFileSync(`${file}.v1.bak`, "utf8"), v1);
+  assert.equal(readFileSync(file).subarray(0, 15).toString(), "SQLite format 3");
 });
 
-test("a newer format or a bad entry is refused", () => {
+test("a v2 file migrates statuses, times, payloads, marks and legacy pending entries", () => {
   const file = path();
-  writeFileSync(file, JSON.stringify({ version: 3, channels: {} }));
-  assert.throws(() => new Ledger(file), /unsupported format/);
-  writeFileSync(file, JSON.stringify({ version: 2, channels: { c: { k: "delivered" } } }));
-  assert.throws(() => new Ledger(file), /unsupported format/);
-  writeFileSync(file, JSON.stringify({ version: 2, channels: { c: "x" } }));
-  assert.throws(() => new Ledger(file), /unsupported format/);
+  writeFileSync(file, V2_FIXTURE);
+  const first = new Ledger(file);
+  assert.deepEqual(first.migration, { from: 2, entries: 4, backup: `${file}.v2.bak` });
+  first.close();
+  assert.equal(readFileSync(`${file}.v2.bak`, "utf8"), V2_FIXTURE);
+
+  const ledger = ledgerAt(file);
+  assert.equal(ledger.migration, undefined, "a second open does not migrate again");
+  assert.deepEqual(ledger.entries("c"), [
+    ["1:opened", "delivered"],
+    ["2:opened", "failed"],
+    ["3:opened", "pending"],
+    ["4:opened", "pending"],
+  ]);
+  assert.equal(ledger.hasChannel("d"), true);
+  assert.deepEqual(ledger.failed(), [
+    { channelId: "c", key: "2:opened", at: 20, notification: note("2:opened", 2) },
+  ]);
+  assert.deepEqual(ledger.pending(), [
+    { channelId: "c", key: "3:opened", notification: note("3:opened", 3) },
+    { channelId: "c", key: "4:opened" },
+  ]);
+  assert.equal(ledger.remindersFrom("c"), 50);
+  assert.equal(ledger.manualFrom("c"), 60);
+  assert.equal(ledger.checkRouting("c"), undefined);
+  assert.equal(ledger.componentRouting("c"), undefined);
 });
 
-test("claim is on disk before it returns, with a time", () => {
+test("a crash before the publish leaves the JSON in place and the next open migrates", () => {
   const file = path();
-  const ledger = new Ledger(file, { now: () => 1234 });
-  ledger.claim("c", "1:opened", note("1:opened"));
-  // Crash simulation: read the file without any flush.
-  const saved = read(file);
-  assert.deepEqual(saved.channels.c?.["1:opened"], { status: "pending", at: 1234 });
-  assert.ok(saved.payloads?.c?.["1:opened"]);
+  writeFileSync(file, V2_FIXTURE);
+  assert.throws(
+    () =>
+      new Ledger(file, {
+        hooks: {
+          beforePublish: () => {
+            throw new Error("crash");
+          },
+        },
+      }),
+    /crash/,
+  );
+  assert.equal(readFileSync(file, "utf8"), V2_FIXTURE);
+  const ledger = ledgerAt(file);
+  assert.equal(ledger.migration?.from, 2);
+  assert.equal(ledger.status("c", "1:opened"), "delivered");
+  assert.equal(existsSync(`${file}.migrating`), false);
 });
 
-test("settle is batched: one write after the window, or at flush", async () => {
+/** A `-wal` of another database at `file`, holding the key `old:key`. */
+function plantStaleWal(file: string): void {
+  const other = path();
+  const ledger = new Ledger(other);
+  ledger.seed("c", ["old:key"]);
+  // Copy the WAL while it still holds the seed, before close checkpoints it.
+  writeFileSync(`${file}-wal`, readFileSync(`${other}-wal`));
+  writeFileSync(`${file}-shm`, readFileSync(`${other}-shm`));
+  ledger.close();
+}
+
+test("a stale WAL beside a fresh or JSON path is not replayed", () => {
+  const fresh = path();
+  plantStaleWal(fresh);
+  const a = ledgerAt(fresh);
+  a.seed("c", ["new:key"]);
+  assert.deepEqual(a.entries("c"), [["new:key", "seeded"]]);
+  a.close();
+  assert.deepEqual(ledgerAt(fresh).entries("c"), [["new:key", "seeded"]]);
+
+  const json = path();
+  writeFileSync(
+    json,
+    JSON.stringify({ version: 2, channels: { c: { "1:opened": { status: "seeded", at: 1 } } } }),
+  );
+  plantStaleWal(json);
+  assert.deepEqual(ledgerAt(json).entries("c"), [["1:opened", "seeded"]]);
+});
+
+test("a newer format or a bad entry is refused and the file is unchanged", () => {
   const file = path();
-  const timers = fakeSchedule();
-  const ledger = new Ledger(file, { schedule: timers.schedule });
+  for (const text of [
+    JSON.stringify({ version: 3, channels: {} }),
+    JSON.stringify({ version: 2, channels: { c: { k: "delivered" } } }),
+    JSON.stringify({ version: 2, channels: { c: "x" } }),
+  ]) {
+    writeFileSync(file, text);
+    assert.throws(() => new Ledger(file), /unsupported format/);
+    assert.equal(readFileSync(file, "utf8"), text);
+  }
+});
+
+/** A SQLite file built by `build`, with the bytes it had before any open. */
+function sqliteFixture(build: (db: Database) => void): { file: string; bytes: Buffer } {
+  const file = path();
+  const db = new Database(file, { create: true });
+  build(db);
+  db.close();
+  return { file, bytes: readFileSync(file) };
+}
+
+const SCHEMA_V3 = `
+CREATE TABLE channels (id TEXT PRIMARY KEY, reminders_from INTEGER, manual_from INTEGER,
+  check_routing TEXT, component_routing TEXT) STRICT;
+CREATE TABLE entries (channel_id TEXT NOT NULL, key TEXT NOT NULL, status TEXT NOT NULL,
+  at INTEGER NOT NULL, payload TEXT, recipients TEXT, PRIMARY KEY (channel_id, key)) STRICT;
+PRAGMA user_version = 3;
+INSERT INTO channels (id) VALUES ('c');
+`;
+
+test("hostile SQLite files are refused without a change", () => {
+  const cases: [string, (db: Database) => void][] = [
+    ["user_version 4", (db) => db.run(`${SCHEMA_V3} PRAGMA user_version = 4;`)],
+    [
+      "missing entries table",
+      (db) => db.run("CREATE TABLE channels (id TEXT) STRICT; PRAGMA user_version = 3;"),
+    ],
+    [
+      "status sent",
+      (db) => db.run(`${SCHEMA_V3} INSERT INTO entries VALUES ('c', 'k', 'sent', 1, NULL, NULL);`),
+    ],
+    [
+      "payload [1]",
+      (db) =>
+        db.run(`${SCHEMA_V3} INSERT INTO entries VALUES ('c', 'k', 'failed', 1, '[1]', NULL);`),
+    ],
+    [
+      "malformed recipients",
+      (db) =>
+        db.run(
+          `${SCHEMA_V3} INSERT INTO entries VALUES ('c', 'k', 'failed', 1, NULL, '{"delivered":"x"}');`,
+        ),
+    ],
+  ];
+  for (const [name, build] of cases) {
+    const { file, bytes } = sqliteFixture(build);
+    assert.throws(() => new Ledger(file), /unsupported format/, name);
+    assert.deepEqual(readFileSync(file), bytes, name);
+  }
+});
+
+test("each mutation is on disk when it returns, with no flush", () => {
+  const file = path();
+  let clock = 1234;
+  const ledger = ledgerAt(file, { now: () => clock });
   ledger.claim("c", "1:opened", note("1:opened"));
   ledger.claim("c", "2:opened", note("2:opened"));
+  clock = 2000;
   ledger.settle("c", "1:opened", "delivered");
   ledger.settle("c", "2:opened", "failed");
-  assert.deepEqual(timers.delays, [WRITE_BATCH_MS]);
-  assert.equal(read(file).channels.c?.["1:opened"]?.status, "pending");
-  await ledger.flush();
-  const saved = read(file);
-  assert.equal(saved.channels.c?.["1:opened"]?.status, "delivered");
-  assert.equal(saved.channels.c?.["2:opened"]?.status, "failed");
+  ledger.setRemindersFrom("c", 77);
+  const saved = new Ledger(file);
+  assert.equal(saved.status("c", "1:opened"), "delivered");
   // A delivered key loses its payload; a failed key keeps it for a resend.
-  assert.equal(saved.payloads?.c?.["1:opened"], undefined);
-  assert.ok(saved.payloads?.c?.["2:opened"]);
+  assert.deepEqual(saved.failed(), [
+    { channelId: "c", key: "2:opened", at: 2000, notification: note("2:opened") },
+  ]);
+  assert.equal(saved.remindersFrom("c"), 77);
+  saved.close();
 });
 
-test("the batch timer writes the file", async () => {
-  const file = path();
-  const timers = fakeSchedule();
-  const ledger = new Ledger(file, { schedule: timers.schedule });
-  ledger.claim("c", "1:opened", note("1:opened"));
-  ledger.settle("c", "1:opened", "delivered");
-  timers.fire();
-  await ledger.flush();
-  assert.equal(read(file).channels.c?.["1:opened"]?.status, "delivered");
-});
-
-test("sync and batch writes do not follow a planted temp-file symlink", async () => {
+test("a planted .migrating symlink is removed, not written through", () => {
   const file = path();
   const victim = `${file}.victim`;
   writeFileSync(victim, "DO_NOT_OVERWRITE");
-  symlinkSync(victim, `${file}.tmp`);
-  symlinkSync(victim, `${file}.batch.tmp`);
-  const timers = fakeSchedule();
-  const ledger = new Ledger(file, { schedule: timers.schedule });
-  ledger.claim("c", "1:opened", note("1:opened"));
-  ledger.settle("c", "1:opened", "delivered");
-  timers.fire();
-  await ledger.flush();
+  symlinkSync(victim, `${file}.migrating`);
+  writeFileSync(file, V2_FIXTURE);
+  const ledger = ledgerAt(file);
+  ledger.claim("c", "9:opened", note("9:opened"));
   assert.equal(readFileSync(victim, "utf8"), "DO_NOT_OVERWRITE");
-  assert.equal(read(file).channels.c?.["1:opened"]?.status, "delivered");
-});
-
-test("a sync claim between a batch snapshot and its rename is not overwritten", async () => {
-  const file = path();
-  const timers = fakeSchedule();
-  const ledger = new Ledger(file, { schedule: timers.schedule });
-  ledger.claim("c", "1:opened", note("1:opened"));
-  ledger.settle("c", "1:opened", "delivered");
-  const flushing = ledger.flush(); // snapshot taken, write in flight
-  ledger.claim("c", "2:opened", note("2:opened")); // sync write of the newer state
-  await flushing;
-  const saved = read(file);
-  assert.equal(saved.channels.c?.["2:opened"]?.status, "pending");
-  assert.equal(saved.channels.c?.["1:opened"]?.status, "delivered");
-  assert.equal(existsSync(`${file}.batch.tmp`), false);
-});
-
-test("a failed batch write reports the error and stays queued", async () => {
-  const own = join(dir, "gone");
-  const file = join(own, "state.json");
-  const errors: Error[] = [];
-  const timers = fakeSchedule();
-  const ledger = new Ledger(file, { schedule: timers.schedule, onError: (e) => errors.push(e) });
-  ledger.claim("c", "1:opened", note("1:opened"));
-  ledger.settle("c", "1:opened", "delivered");
-  rmSync(own, { recursive: true, force: true });
-  timers.fire();
-  await new Promise((r) => setImmediate(r));
-  await new Promise((r) => setTimeout(r, 20));
-  assert.equal(errors.length, 1);
-  await assert.rejects(ledger.flush());
+  assert.equal(existsSync(`${file}.migrating`), false);
+  assert.equal(lstatSync(file).isSymbolicLink(), false);
 });
 
 test("prune removes old settled entries and payloads, never pending", () => {
   const file = path();
   let clock = 1_000;
-  const ledger = new Ledger(file, { now: () => clock, schedule: fakeSchedule().schedule });
+  const ledger = ledgerAt(file, { now: () => clock });
   ledger.seed("c", ["1:opened", "other"]);
   ledger.claim("c", "2:opened", note("2:opened", 2));
   ledger.claim("c", "3:opened", note("3:opened", 3));
@@ -197,43 +291,51 @@ test("prune removes old settled entries and payloads, never pending", () => {
   assert.equal(ledger.hasChannel("c"), true);
   // Not old enough: nothing is removed.
   assert.equal(ledger.prune(60_000, new Set()), 0);
+  const saved = ledgerAt(file);
+  assert.deepEqual(saved.entries("c"), [
+    ["1:opened", "seeded"],
+    ["2:opened", "pending"],
+    ["4:opened", "pending"],
+  ]);
 });
 
 test("prune keeps every incident key until a poll has shown the visible incidents", () => {
   let clock = 0;
-  const ledger = new Ledger(path(), { now: () => clock, schedule: fakeSchedule().schedule });
+  const ledger = ledgerAt(path(), { now: () => clock });
   ledger.seed("c", ["1:opened", "x"]);
   clock = 100_000;
   assert.equal(ledger.prune(1, undefined), 1);
   assert.equal(ledger.has("c", "1:opened"), true);
 });
 
-test("prune and the reminder mark are written by flush", async () => {
+test("a failed prune or reminder mark write changes nothing", () => {
   const file = path();
   let clock = 0;
-  const ledger = new Ledger(file, { now: () => clock, schedule: fakeSchedule().schedule });
+  const f = fault();
+  const ledger = ledgerAt(file, { now: () => clock, hooks: f });
   ledger.seed("c", ["x"], { remindersFrom: 50 });
-  assert.equal(ledger.remindersFrom("c"), 50);
-  assert.equal(read(file).remindersFrom?.c, 50);
   clock = 100;
-  ledger.prune(10, new Set());
+  f.isFailing = true;
+  assert.throws(() => ledger.prune(10, new Set()), /injected/);
+  assert.throws(() => ledger.setRemindersFrom("c", undefined), /injected/);
+  assert.equal(ledger.has("c", "x"), true);
+  assert.equal(ledger.remindersFrom("c"), 50);
+  f.isFailing = false;
+  assert.equal(ledger.prune(10, new Set()), 1);
   ledger.setRemindersFrom("c", undefined);
-  await ledger.flush();
-  const saved = read(file);
-  assert.deepEqual(saved.channels.c, {});
-  assert.equal(saved.remindersFrom?.c, undefined);
-  assert.equal(new Ledger(file).remindersFrom("c"), undefined);
+  const saved = ledgerAt(file);
+  assert.deepEqual(saved.entries("c"), []);
+  assert.equal(saved.remindersFrom("c"), undefined);
 });
 
 test("resend sets a failed key back to pending and keeps its payload", () => {
   const file = path();
-  const ledger = new Ledger(file, { schedule: fakeSchedule().schedule });
+  const ledger = ledgerAt(file);
   ledger.claim("c", "1:opened", note("1:opened"));
   ledger.settle("c", "1:opened", "failed");
   assert.equal(ledger.resend("c", "9:opened"), "not-failed");
   assert.equal(ledger.resend("c", "1:opened"), "resent");
-  assert.equal(read(file).channels.c?.["1:opened"]?.status, "pending");
-  assert.deepEqual(new Ledger(file).pending(), [
+  assert.deepEqual(ledgerAt(file).pending(), [
     { channelId: "c", key: "1:opened", notification: note("1:opened") },
   ]);
   assert.equal(ledger.resend("c", "1:opened"), "not-failed");
@@ -242,54 +344,99 @@ test("resend sets a failed key back to pending and keeps its payload", () => {
 test("resend of a failed key without a payload is refused", () => {
   const file = path();
   writeFileSync(file, JSON.stringify({ version: 1, channels: { c: { "1:opened": "failed" } } }));
-  const ledger = new Ledger(file);
+  const ledger = ledgerAt(file);
   assert.equal(ledger.resend("c", "1:opened"), "no-payload");
   assert.equal(ledger.status("c", "1:opened"), "failed");
 });
 
-test("a failed seed or claim rolls back its change, including pruned reminders", async () => {
+test("a failed seed, claim, resend or setRecipients changes neither memory nor disk", () => {
   const file = path();
-  const fs = recordingFs();
-  const ledger = new Ledger(file, { schedule: fakeSchedule().schedule, fs });
+  const f = fault();
+  const ledger = ledgerAt(file, { hooks: f });
   const reminder = (n: number): Notification => ({
     ...note(`1:reminder:${n}`),
     event: "reminder",
   });
   ledger.claim("c", "1:reminder:1", reminder(1));
   ledger.settle("c", "1:reminder:1", "delivered");
-  await ledger.flush();
-  fs.faults.isOpenTempFailing = true;
-  assert.throws(() => ledger.claim("c", "1:reminder:2", reminder(2)));
-  assert.equal(ledger.status("c", "1:reminder:1"), "delivered");
-  assert.equal(ledger.has("c", "1:reminder:2"), false);
-  assert.throws(() => ledger.seed("c", ["z"], { remindersFrom: 7 }));
-  assert.equal(ledger.has("c", "z"), false);
-  assert.equal(ledger.remindersFrom("c"), undefined);
-  fs.faults.isOpenTempFailing = false;
+  ledger.claim("c", "2:opened", note("2:opened"));
+  ledger.claim("c", "3:opened", note("3:opened"));
+  ledger.settle("c", "3:opened", "failed");
+  f.isFailing = true;
+  assert.throws(() => ledger.claim("c", "1:reminder:2", reminder(2)), /injected/);
+  assert.throws(() => ledger.seed("c", ["z"], { remindersFrom: 7, manualFrom: 7 }), /injected/);
+  assert.throws(() => ledger.seed("new", []), /injected/);
+  assert.throws(() => ledger.resend("c", "3:opened"), /injected/);
+  assert.throws(
+    () => ledger.setRecipients("c", "2:opened", { delivered: ["a"], refused: [] }),
+    /injected/,
+  );
+  const expected = [
+    ["1:reminder:1", "delivered"],
+    ["2:opened", "pending"],
+    ["3:opened", "failed"],
+  ];
+  for (const view of [ledger, ledgerAt(file)]) {
+    assert.deepEqual(view.entries("c"), expected);
+    assert.equal(view.remindersFrom("c"), undefined);
+    assert.equal(view.manualFrom("c"), undefined);
+    assert.equal(view.hasChannel("new"), false);
+    assert.deepEqual(view.pending(), [
+      { channelId: "c", key: "2:opened", notification: note("2:opened") },
+    ]);
+  }
+  f.isFailing = false;
   ledger.claim("c", "1:reminder:2", reminder(2));
-  assert.equal(new Ledger(file).status("c", "1:reminder:2"), "pending");
+  assert.equal(ledgerAt(file).status("c", "1:reminder:2"), "pending");
+  assert.equal(ledgerAt(file).has("c", "1:reminder:1"), false, "older reminder pruned");
 });
 
-test("close stops batched writes", async () => {
+test("setRecipients survives a reopen and pending keeps the claim order", () => {
   const file = path();
-  const ledger = new Ledger(file, { schedule: fakeSchedule().schedule });
-  ledger.claim("c", "1:opened", note("1:opened"));
-  ledger.settle("c", "1:opened", "delivered");
+  const ledger = ledgerAt(file);
+  ledger.claim("b", "2:opened", note("2:opened"));
+  ledger.claim("a", "1:opened", note("1:opened"));
+  ledger.claim("b", "3:opened", note("3:opened"));
+  ledger.setRecipients("b", "3:opened", { delivered: ["x@example.test"], refused: ["y@e.test"] });
   ledger.close();
-  await ledger.flush();
-  assert.equal(read(file).channels.c?.["1:opened"]?.status, "pending");
+  assert.deepEqual(ledgerAt(file).pending(), [
+    { channelId: "b", key: "2:opened", notification: note("2:opened") },
+    {
+      channelId: "b",
+      key: "3:opened",
+      notification: note("3:opened"),
+      recipients: { delivered: ["x@example.test"], refused: ["y@e.test"] },
+    },
+    { channelId: "a", key: "1:opened", notification: note("1:opened") },
+  ]);
 });
 
-test("manualFrom round-trips, survives prune and drops a non-number value", async () => {
+test("seed stores routing fingerprints with the keys", () => {
+  const file = path();
+  const ledger = ledgerAt(file);
+  ledger.seed("c", ["1:opened"], {
+    checkRouting: '{"checks":["api"],"excludeChecks":[]}',
+    componentRouting: '{"components":[],"excludeComponents":[]}',
+  });
+  ledger.close();
+  const saved = ledgerAt(file);
+  assert.equal(saved.checkRouting("c"), '{"checks":["api"],"excludeChecks":[]}');
+  assert.equal(saved.componentRouting("c"), '{"components":[],"excludeComponents":[]}');
+  assert.equal(saved.status("c", "1:opened"), "seeded");
+});
+
+test("manualFrom round-trips, survives prune and drops a non-number value", () => {
   const file = path();
   let clock = 0;
-  const ledger = new Ledger(file, { now: () => clock, schedule: fakeSchedule().schedule });
+  const ledger = new Ledger(file, { now: () => clock });
   ledger.seed("c", ["manual:1:opened"], { manualFrom: 40 });
   assert.equal(ledger.manualFrom("c"), 40);
   clock = 100;
   ledger.prune(10, new Set(), new Set());
-  await ledger.flush();
-  assert.equal(new Ledger(file).manualFrom("c"), 40);
+  ledger.close();
+  const reopened = new Ledger(file);
+  assert.equal(reopened.manualFrom("c"), 40);
+  reopened.close();
   writeFileSync(
     file,
     JSON.stringify({
@@ -298,7 +445,7 @@ test("manualFrom round-trips, survives prune and drops a non-number value", asyn
       manualFrom: { a: "40", b: null, c: 7 },
     }),
   );
-  const loaded = new Ledger(file);
+  const loaded = ledgerAt(file);
   assert.equal(loaded.manualFrom("a"), undefined);
   assert.equal(loaded.manualFrom("b"), undefined);
   assert.equal(loaded.manualFrom("c"), 7);
@@ -307,18 +454,5 @@ test("manualFrom round-trips, survives prune and drops a non-number value", asyn
 test("manualFrom of a v1 file is ignored", () => {
   const file = path();
   writeFileSync(file, JSON.stringify({ version: 1, channels: { c: {} }, manualFrom: { c: 5 } }));
-  assert.equal(new Ledger(file).manualFrom("c"), undefined);
-});
-
-test("a failed seed rolls back both marks", () => {
-  const file = path();
-  const fs = recordingFs();
-  const ledger = new Ledger(file, { schedule: fakeSchedule().schedule, fs });
-  ledger.seed("c", [], { remindersFrom: 3 });
-  fs.faults.isOpenTempFailing = true;
-  assert.throws(() => ledger.seed("c", ["manual:1:opened"], { remindersFrom: 9, manualFrom: 9 }));
-  assert.equal(ledger.remindersFrom("c"), 3);
-  assert.equal(ledger.manualFrom("c"), undefined);
-  assert.equal(ledger.has("c", "manual:1:opened"), false);
-  fs.faults.isOpenTempFailing = false;
+  assert.equal(ledgerAt(file).manualFrom("c"), undefined);
 });

@@ -1,16 +1,17 @@
-import { mkdirSync, readFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { Database } from "bun:sqlite";
 import {
-  AtomicWriteError,
-  type AtomicWriteFs,
-  type AtomicWriteSyncFs,
-  isRecord,
-  nodeAtomicWriteFs,
-  nodeAtomicWriteSyncFs,
-  writeFileAtomic,
-  writeFileAtomicSync,
-} from "@lorenzh/pulse-kit";
-import type { Notification, Schedule } from "./types.ts";
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+} from "node:fs";
+import { dirname } from "node:path";
+import { isRecord, writeFileAtomicSync } from "@lorenzh/pulse-kit";
+import type { Notification, RecipientProgress } from "./types.ts";
 
 /**
  * `dropped`: a reminder that was not sent because its incident resolved first.
@@ -20,99 +21,77 @@ export type LedgerStatus = "seeded" | "pending" | "delivered" | "failed" | "drop
 
 const STATUSES: readonly LedgerStatus[] = ["seeded", "pending", "delivered", "failed", "dropped"];
 
-/** Newest format this version reads and the only one it writes. */
-export const LEDGER_VERSION = 2;
+/** Newest format this version reads and the only one it writes (a SQLite `user_version`). */
+export const LEDGER_VERSION = 3;
 
-/** Quiet time before batched changes (settle, prune) are written. */
-export const WRITE_BATCH_MS = 100;
+const SCHEMA = `
+CREATE TABLE channels (
+  id TEXT PRIMARY KEY,
+  reminders_from INTEGER,
+  manual_from INTEGER,
+  check_routing TEXT,
+  component_routing TEXT
+) STRICT;
+CREATE TABLE entries (
+  channel_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('seeded','pending','delivered','failed','dropped')),
+  at INTEGER NOT NULL,
+  payload TEXT,
+  recipients TEXT,
+  PRIMARY KEY (channel_id, key)
+) STRICT;
+PRAGMA user_version = ${LEDGER_VERSION};
+`;
+
+const SQLITE_HEADER = "SQLite format 3\0";
+
+/** A mutation on a ledger after `close()`. Nothing was written. */
+export class LedgerClosedError extends Error {
+  override readonly name = "LedgerClosedError";
+  constructor() {
+    super("ledger is closed");
+  }
+}
 
 interface LedgerEntry {
   status: LedgerStatus;
   /** Epoch milliseconds of the last status change (the load time for a migrated v1 entry). */
   at: number;
+  /** Kept for `pending` and `failed` keys, so they can be resent. */
+  payload?: Notification | undefined;
+  recipients?: RecipientProgress | undefined;
 }
 
-interface LedgerData {
-  version: typeof LEDGER_VERSION;
-  channels: Record<string, Record<string, LedgerEntry>>;
-  /** Notifications of `pending` and `failed` keys, so they can be resent. */
-  payloads?: Record<string, Record<string, Notification>>;
-  /** Per channel: when reminders were switched on (epoch ms). Absent while they are off. */
-  remindersFrom?: Record<string, number>;
-  /** Per channel: when the manual feed was first seen and seeded (epoch ms). Never cleared. */
-  manualFrom?: Record<string, number>;
+interface ChannelMarks {
+  remindersFrom?: number | undefined;
+  manualFrom?: number | undefined;
+  checkRouting?: string | undefined;
+  componentRouting?: string | undefined;
 }
 
-/** Marks are optional: an entry that is not a finite number is dropped and counts as absent. */
-function readMarks(raw: unknown): Record<string, number> | undefined {
-  if (!isRecord(raw)) return undefined;
-  const marks: Record<string, number> = {};
-  for (const [id, value] of Object.entries(raw)) {
-    if (typeof value === "number" && Number.isFinite(value)) marks[id] = value;
-  }
-  return marks;
+interface ChannelState {
+  marks: ChannelMarks;
+  /** Insertion order is the claim order. */
+  entries: Map<string, LedgerEntry>;
 }
 
-function isStatus(value: unknown): value is LedgerStatus {
-  return STATUSES.some((s) => s === value);
-}
+type Mark = keyof ChannelMarks;
 
-function migrateEntries(
-  rawEntries: Record<string, unknown>,
-  version: unknown,
-  loadedAt: number,
-): Record<string, LedgerEntry> | undefined {
-  const entries: Record<string, LedgerEntry> = {};
-  for (const [key, value] of Object.entries(rawEntries)) {
-    if (version === 1 && isStatus(value)) {
-      entries[key] = { status: value, at: loadedAt };
-    } else if (isRecord(value) && isStatus(value.status) && typeof value.at === "number") {
-      entries[key] = { status: value.status, at: value.at };
-    } else {
-      return undefined;
-    }
-  }
-  return entries;
-}
-
-/** Trust boundary: reads the file content as far as the ledger relies on it. */
-function migrate(raw: unknown, loadedAt: number, path: string): LedgerData {
-  const bad = (): Error => new Error(`ledger ${path} has an unsupported format`);
-  if (!isRecord(raw) || !isRecord(raw.channels)) throw bad();
-  if (raw.version !== 1 && raw.version !== LEDGER_VERSION) throw bad();
-  const channels: LedgerData["channels"] = {};
-  for (const [id, rawEntries] of Object.entries(raw.channels)) {
-    const entries = isRecord(rawEntries)
-      ? migrateEntries(rawEntries, raw.version, loadedAt)
-      : undefined;
-    if (!entries) throw bad();
-    channels[id] = entries;
-  }
-  const data: LedgerData = { version: LEDGER_VERSION, channels };
-  if (isRecord(raw.payloads)) data.payloads = raw.payloads as LedgerData["payloads"] & object;
-  if (raw.version === LEDGER_VERSION && isRecord(raw.remindersFrom)) {
-    data.remindersFrom = raw.remindersFrom as Record<string, number>;
-  }
-  const manualFrom = raw.version === LEDGER_VERSION ? readMarks(raw.manualFrom) : undefined;
-  if (manualFrom) data.manualFrom = manualFrom;
-  return data;
-}
-
-const REMINDER_KEY = /^(\d+):reminder:(\d+)$/;
-const INCIDENT_KEY = /^(\d+):/;
-const MANUAL_KEY = /^manual:(\d+):/;
-
-interface Removed {
-  key: string;
-  entry: LedgerEntry;
-  notification?: Notification | undefined;
-}
+const MARK_COLUMNS: Record<Mark, string> = {
+  remindersFrom: "reminders_from",
+  manualFrom: "manual_from",
+  checkRouting: "check_routing",
+  componentRouting: "component_routing",
+};
 
 export interface PendingEntry {
   channelId: string;
   key: string;
   /** Absent for entries written by an older version. */
   notification?: Notification;
+  /** Absent while no recipient progress was stored. */
+  recipients?: RecipientProgress;
 }
 
 export interface FailedEntry {
@@ -122,176 +101,395 @@ export interface FailedEntry {
   at: number;
   /** Absent for entries written by an older version: they cannot be resent. */
   notification?: Notification;
+  recipients?: RecipientProgress;
 }
 
 export type ResendResult = "resent" | "no-payload" | "not-failed";
 
+export interface LedgerMigration {
+  from: 1 | 2;
+  entries: number;
+  backup: string;
+}
+
 export interface LedgerOptions {
   /** Clock for entry times. */
   now?: () => number;
-  /** Timer for batched writes. */
-  schedule?: Schedule;
-  /** Receives the error of a batched write that failed; the changes stay queued for the next write. */
-  onError?: (err: Error) => void;
-  /** Test only: lets a test pause a batched write between its temp file and the rename. */
-  hooks?: { beforeRename?: () => Promise<void> };
-  /** File operations of the atomic writes. Default: the node fs of pulse-kit. */
-  fs?: { sync?: AtomicWriteSyncFs; async?: AtomicWriteFs };
+  /** Test only. */
+  hooks?: {
+    /** Runs inside each write transaction; a throw rolls it back. */
+    beforeCommit?: () => void;
+    /** Runs after the migration backup and before the rename; a throw simulates a crash. */
+    beforePublish?: () => void;
+  };
+}
+
+// ---- JSON formats 1 and 2 (read only, for the migration) ----
+
+interface JsonData {
+  version: 1 | 2;
+  channels: Map<string, ChannelState>;
+  count: number;
+}
+
+/** Marks are optional: an entry that is not a finite number is dropped and counts as absent. */
+function readMarks(raw: unknown): Record<string, number> {
+  const marks: Record<string, number> = {};
+  if (!isRecord(raw)) return marks;
+  for (const [id, value] of Object.entries(raw)) {
+    if (typeof value === "number" && Number.isFinite(value)) marks[id] = Math.trunc(value);
+  }
+  return marks;
+}
+
+function isStatus(value: unknown): value is LedgerStatus {
+  return STATUSES.some((s) => s === value);
+}
+
+function migrateEntry(value: unknown, version: 1 | 2, loadedAt: number): LedgerEntry | undefined {
+  if (version === 1 && isStatus(value)) return { status: value, at: loadedAt };
+  if (isRecord(value) && isStatus(value.status) && typeof value.at === "number") {
+    if (!Number.isFinite(value.at)) return undefined;
+    return { status: value.status, at: Math.trunc(value.at) };
+  }
+  return undefined;
+}
+
+function migrateChannel(
+  rawEntries: unknown,
+  rawPayloads: unknown,
+  version: 1 | 2,
+  loadedAt: number,
+): Map<string, LedgerEntry> | undefined {
+  if (!isRecord(rawEntries)) return undefined;
+  const payloads = isRecord(rawPayloads) ? rawPayloads : {};
+  const entries = new Map<string, LedgerEntry>();
+  for (const [key, value] of Object.entries(rawEntries)) {
+    const entry = migrateEntry(value, version, loadedAt);
+    if (!entry) return undefined;
+    const payload = Object.hasOwn(payloads, key) ? payloads[key] : undefined;
+    // Trust boundary: the payload was written by this service; only its shape is checked.
+    if (isRecord(payload)) entry.payload = payload as unknown as Notification;
+    entries.set(key, entry);
+  }
+  return entries;
+}
+
+/** Trust boundary: reads a JSON ledger (format 1 or 2) as far as the ledger relies on it. */
+function parseJson(raw: unknown, loadedAt: number, path: string): JsonData {
+  const bad = (): Error => unsupported(path);
+  if (!isRecord(raw) || !isRecord(raw.channels)) throw bad();
+  const version = raw.version;
+  if (version !== 1 && version !== 2) throw bad();
+  const payloads = isRecord(raw.payloads) ? raw.payloads : {};
+  const reminders = version === 2 ? readMarks(raw.remindersFrom) : {};
+  const manual = version === 2 ? readMarks(raw.manualFrom) : {};
+  const channels = new Map<string, ChannelState>();
+  let count = 0;
+  for (const [id, rawEntries] of Object.entries(raw.channels)) {
+    const entries = migrateChannel(rawEntries, payloads[id], version, loadedAt);
+    if (!entries) throw bad();
+    count += entries.size;
+    const marks: ChannelMarks = {
+      remindersFrom: Object.hasOwn(reminders, id) ? reminders[id] : undefined,
+      manualFrom: Object.hasOwn(manual, id) ? manual[id] : undefined,
+    };
+    channels.set(id, { marks, entries });
+  }
+  return { version, channels, count };
+}
+
+// ---- Format 3 rows (trust boundary at open) ----
+
+function unsupported(path: string, opts?: ErrorOptions): Error {
+  return new Error(`ledger ${path} has an unsupported format`, opts);
+}
+
+function isStringList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((v) => typeof v === "string");
+}
+
+function parseJsonText(text: unknown): unknown {
+  if (typeof text !== "string") return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    // An unparsable column is reported as an unsupported format by the caller.
+    return undefined;
+  }
+}
+
+/** A row that breaks the format; the open reports it as an unsupported format. */
+class BadRowError extends Error {
+  override readonly name = "BadRowError";
+}
+
+/** Throws `BadRowError` unless `raw` is NULL or a JSON object. */
+function readPayload(raw: unknown): Notification | undefined {
+  if (raw === null) return undefined;
+  const value = parseJsonText(raw);
+  if (!isRecord(value)) throw new BadRowError("bad payload");
+  return value as unknown as Notification;
+}
+
+/** Throws `BadRowError` unless `raw` is NULL or a `RecipientProgress` JSON. */
+function readRecipients(raw: unknown): RecipientProgress | undefined {
+  if (raw === null) return undefined;
+  const value = parseJsonText(raw);
+  if (!isRecord(value) || !isStringList(value.delivered) || !isStringList(value.refused)) {
+    throw new BadRowError("bad recipients");
+  }
+  return { delivered: [...value.delivered], refused: [...value.refused] };
+}
+
+/** A routing fingerprint is a JSON object of string lists. */
+function isFingerprint(raw: unknown): raw is string | null {
+  if (raw === null) return true;
+  const value = parseJsonText(raw);
+  return isRecord(value) && Object.values(value).every(isStringList);
+}
+
+function isOptionalInteger(raw: unknown): raw is number | null {
+  return raw === null || (typeof raw === "number" && Number.isSafeInteger(raw));
+}
+
+function readChannelRow(row: Record<string, unknown>): [string, ChannelMarks] | undefined {
+  const { id, reminders_from, manual_from, check_routing, component_routing } = row;
+  if (typeof id !== "string") return undefined;
+  if (!isOptionalInteger(reminders_from) || !isOptionalInteger(manual_from)) return undefined;
+  if (!isFingerprint(check_routing) || !isFingerprint(component_routing)) return undefined;
+  return [
+    id,
+    {
+      remindersFrom: reminders_from ?? undefined,
+      manualFrom: manual_from ?? undefined,
+      checkRouting: check_routing ?? undefined,
+      componentRouting: component_routing ?? undefined,
+    },
+  ];
+}
+
+function readEntryRow(row: Record<string, unknown>): [string, string, LedgerEntry] | undefined {
+  const { channel_id, key, status, at } = row;
+  if (typeof channel_id !== "string" || typeof key !== "string") return undefined;
+  if (!isStatus(status) || typeof at !== "number" || !Number.isSafeInteger(at)) return undefined;
+  const payload = readPayload(row.payload);
+  const recipients = readRecipients(row.recipients);
+  return [channel_id, key, { status, at, payload, recipients }];
+}
+
+function loadRows(db: Database, path: string): Map<string, ChannelState> {
+  const channels = new Map<string, ChannelState>();
+  for (const row of db.query("SELECT * FROM channels ORDER BY rowid").all()) {
+    const parsed = isRecord(row) ? readChannelRow(row) : undefined;
+    if (!parsed) throw unsupported(path);
+    channels.set(parsed[0], { marks: parsed[1], entries: new Map() });
+  }
+  for (const row of db.query("SELECT * FROM entries ORDER BY rowid").all()) {
+    const parsed = isRecord(row) ? readEntryRow(row) : undefined;
+    const channel = parsed ? channels.get(parsed[0]) : undefined;
+    if (!parsed || !channel) throw unsupported(path);
+    channel.entries.set(parsed[1], parsed[2]);
+  }
+  return channels;
+}
+
+// ---- Files ----
+
+function unlinkIfPresent(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+}
+
+/** Sidecars of a database at `path`, plus the database itself when `withMain` is set. */
+function removeDatabaseFiles(path: string, withMain: boolean): void {
+  if (withMain) unlinkIfPresent(path);
+  for (const suffix of ["-journal", "-wal", "-shm"]) unlinkIfPresent(`${path}${suffix}`);
+}
+
+function syncDir(dir: string): void {
+  const fd = openSync(dir, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** The first 16 bytes; `undefined` when there is no file. */
+function readHeader(path: string): string | undefined {
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+  try {
+    const buf = Buffer.alloc(16);
+    const n = readSync(fd, buf, 0, 16, 0);
+    return buf.subarray(0, n).toString("latin1");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function writeRows(db: Database, channels: Map<string, ChannelState>): void {
+  const insertChannel = db.query(
+    "INSERT INTO channels (id, reminders_from, manual_from, check_routing, component_routing) VALUES (?, ?, ?, ?, ?)",
+  );
+  const insertEntry = db.query(
+    "INSERT INTO entries (channel_id, key, status, at, payload, recipients) VALUES (?, ?, ?, ?, ?, ?)",
+  );
+  db.transaction(() => {
+    for (const [id, { marks, entries }] of channels) {
+      insertChannel.run(
+        id,
+        marks.remindersFrom ?? null,
+        marks.manualFrom ?? null,
+        marks.checkRouting ?? null,
+        marks.componentRouting ?? null,
+      );
+      for (const [key, e] of entries) {
+        insertEntry.run(id, key, e.status, e.at, json(e.payload), json(e.recipients));
+      }
+    }
+  })();
+}
+
+function json(value: object | undefined): string | null {
+  return value === undefined ? null : JSON.stringify(value);
 }
 
 /**
- * Durable delivery ledger: one JSON file, rewritten atomically (temp file + rename).
+ * Builds a format-3 database at `<path>.migrating` in rollback-journal mode and renames it over
+ * `path`. Sidecars at `path` belong to an older database and would be replayed: they go first.
+ */
+function publish(
+  path: string,
+  channels: Map<string, ChannelState>,
+  beforeRename?: () => void,
+): void {
+  const building = `${path}.migrating`;
+  const db = new Database(building, { create: true, readwrite: true });
+  try {
+    db.run(SCHEMA);
+    writeRows(db, channels);
+  } finally {
+    db.close();
+  }
+  beforeRename?.();
+  removeDatabaseFiles(path, false);
+  renameSync(building, path);
+  syncDir(dirname(path));
+}
+
+const REMINDER_KEY = /^(\d+):reminder:(\d+)$/;
+const INCIDENT_KEY = /^(\d+):/;
+const MANUAL_KEY = /^manual:(\d+):/;
+
+/**
+ * Durable delivery ledger: a SQLite database (format 3) in WAL mode with `synchronous = FULL`.
+ *
+ * Every mutation is one transaction that writes only the rows it changes; memory changes only
+ * after the commit. A failed transaction rolls back, throws and leaves memory unchanged.
+ * Reads come from a mirror loaded at open. A JSON ledger (format 1 or 2) is migrated at open.
  *
  * `manualFrom` marks a channel whose manual incidents were seeded on the first good manual read;
  * a channel without it gets the manual keys seeded quietly before manual detection runs.
- *
- * `seed`, `claim` and `resend` write at once and fsync: a claim must be on disk before the first
- * send. `settle`, `prune` and `setRemindersFrom` change memory and are written in one batch after
- * `WRITE_BATCH_MS`, or by `flush()`. A lost batch only causes a resend after a crash.
- * A sync write that fails throws and undoes its own change.
  */
 export class Ledger {
   readonly #path: string;
   readonly #now: () => number;
-  readonly #schedule: Schedule;
-  readonly #onError: (err: Error) => void;
-  readonly #beforeRename: (() => Promise<void>) | undefined;
-  readonly #syncFs: AtomicWriteSyncFs;
-  readonly #asyncFs: AtomicWriteFs;
-  #data: LedgerData;
-  #isDirty = false;
+  readonly #beforeCommit: (() => void) | undefined;
+  readonly #db: Database;
+  readonly #channels: Map<string, ChannelState>;
   #isClosed = false;
-  #cancelTimer: (() => void) | undefined;
-  /** Counts sync writes, so a batch that raced one knows its snapshot is outdated. */
-  #syncWrites = 0;
-  /** Batched writes run one after another. */
-  #chain: Promise<void> = Promise.resolve();
+  /** Set when this open migrated a JSON ledger. */
+  readonly migration: LedgerMigration | undefined;
 
   constructor(path: string, opts: LedgerOptions = {}) {
     this.#path = path;
     this.#now = opts.now ?? Date.now;
-    this.#schedule = opts.schedule ?? unrefSchedule;
-    this.#onError = opts.onError ?? (() => {});
-    this.#beforeRename = opts.hooks?.beforeRename;
-    this.#syncFs = opts.fs?.sync ?? nodeAtomicWriteSyncFs;
-    this.#asyncFs = opts.fs?.async ?? nodeAtomicWriteFs;
-    this.#data = this.#load();
-  }
-
-  #load(): LedgerData {
-    let text: string;
-    try {
-      text = readFileSync(this.#path, "utf8");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-        return { version: LEDGER_VERSION, channels: {} };
-      }
-      throw err;
+    this.#beforeCommit = opts.hooks?.beforeCommit;
+    removeDatabaseFiles(`${path}.migrating`, true);
+    const header = readHeader(path);
+    if (header === undefined) {
+      mkdirSync(dirname(path), { recursive: true });
+      publish(path, new Map());
+    } else if (header !== SQLITE_HEADER) {
+      this.migration = this.#migrateJson(opts.hooks?.beforePublish);
     }
-    return migrate(JSON.parse(text), this.#now(), this.#path);
+    const opened = this.#open();
+    this.#db = opened.db;
+    this.#channels = opened.channels;
   }
 
-  /** Writes the whole current state to disk before it returns. */
-  #writeSync(): void {
-    mkdirSync(dirname(this.#path), { recursive: true });
-    writeFileAtomicSync(this.#path, JSON.stringify(this.#data), { fs: this.#syncFs });
-    this.#syncWrites++;
-    this.#isDirty = false;
-    this.#cancelTimer?.();
-    this.#cancelTimer = undefined;
+  #migrateJson(beforePublish: (() => void) | undefined): LedgerMigration {
+    const bytes = readFileSync(this.#path);
+    const data = parseJson(JSON.parse(bytes.toString("utf8")), this.#now(), this.#path);
+    const backup = `${this.#path}.v${data.version}.bak`;
+    publish(this.#path, data.channels, () => {
+      writeFileAtomicSync(backup, bytes);
+      beforePublish?.();
+    });
+    return { from: data.version, entries: data.count, backup };
   }
 
-  /** The change is already in memory: write it now, or call `undo` and rethrow. */
-  #commit(undo: () => void): void {
+  #open(): { db: Database; channels: Map<string, ChannelState> } {
+    const db = new Database(this.#path, { create: false, readwrite: true });
     try {
-      this.#writeSync();
-    } catch (err) {
-      undo();
-      throw err;
-    }
-  }
-
-  #markDirty(): void {
-    this.#isDirty = true;
-    if (this.#cancelTimer || this.#isClosed) return;
-    this.#cancelTimer = this.#schedule(() => {
-      this.#cancelTimer = undefined;
-      this.#writeBatch().catch((err: unknown) => {
-        this.#onError(err instanceof Error ? err : new Error(String(err)));
-      });
-    }, WRITE_BATCH_MS);
-  }
-
-  #writeBatch(): Promise<void> {
-    this.#chain = this.#chain.then(
-      () => this.#writeSnapshot(),
-      () => this.#writeSnapshot(),
-    );
-    return this.#chain;
-  }
-
-  async #writeSnapshot(): Promise<void> {
-    if (!this.#isDirty || this.#isClosed) return;
-    const syncWrites = this.#syncWrites;
-    const text = JSON.stringify(this.#data);
-    try {
-      const isPublished = await writeFileAtomic(this.#path, text, {
-        fs: this.#asyncFs,
-        beforeRename: async () => {
-          // A sync write saved a newer state meanwhile; renaming this snapshot would undo it.
-          if (syncWrites !== this.#syncWrites || this.#isClosed) return false;
-          await this.#beforeRename?.();
-          return true;
-        },
-      });
-      if (isPublished) this.#recheckAfterRename(syncWrites, text);
-    } catch (err) {
-      // After a failed directory fsync the snapshot is renamed already: repair a raced sync write.
-      const isRenamed = err instanceof AtomicWriteError && err.stage === "sync-dir";
+      // Read the version before any pragma that writes, so a refused file stays unchanged.
+      const row = db.query("PRAGMA user_version").get();
+      if (!isRecord(row) || row.user_version !== LEDGER_VERSION) throw unsupported(this.#path);
+      let channels: Map<string, ChannelState>;
       try {
-        if (isRenamed) this.#recheckAfterRename(syncWrites, text);
-      } finally {
-        this.#isDirty = true;
+        channels = loadRows(db, this.#path);
+      } catch (err) {
+        throw unsupported(this.#path, { cause: err });
       }
+      db.run("PRAGMA journal_mode = WAL");
+      db.run("PRAGMA synchronous = FULL");
+      return { db, channels };
+    } catch (err) {
+      db.close();
       throw err;
     }
   }
 
-  /** The rename is the only point where a sync write can slip in unseen: re-check. */
-  #recheckAfterRename(syncWrites: number, text: string): void {
-    if (syncWrites !== this.#syncWrites) {
-      if (!this.#isClosed) this.#writeSync();
-    } else {
-      this.#isDirty = this.#hasChangedSince(text);
-    }
+  /** Runs `write` in one transaction, then `apply` to memory. */
+  #transact(write: () => void, apply: () => void): void {
+    if (this.#isClosed) throw new LedgerClosedError();
+    this.#db.transaction(() => {
+      write();
+      this.#beforeCommit?.();
+    })();
+    apply();
   }
 
-  /** True when memory changed after the snapshot `text` was taken. */
-  #hasChangedSince(text: string): boolean {
-    return JSON.stringify(this.#data) !== text;
-  }
-
-  /** Writes the batched changes now. Rejects if that fails. Call it before the process exits. */
+  /** Checkpoints the WAL into the database file and truncates it. Rejects if that fails. */
   async flush(): Promise<void> {
-    this.#cancelTimer?.();
-    this.#cancelTimer = undefined;
-    await this.#writeBatch();
+    if (this.#isClosed) return;
+    const row = this.#db.query("PRAGMA wal_checkpoint(TRUNCATE)").get();
+    if (isRecord(row) && row.busy !== 0) throw new Error("ledger checkpoint was blocked");
   }
 
-  /** Stops batched writes for good, for a process that lost its lock. */
+  /** Closes the database. Every later mutation throws `LedgerClosedError`. */
   close(): void {
+    if (this.#isClosed) return;
     this.#isClosed = true;
-    this.#cancelTimer?.();
-    this.#cancelTimer = undefined;
+    this.#db.close();
   }
 
   hasChannel(channelId: string): boolean {
-    return Object.hasOwn(this.#data.channels, channelId);
+    return this.#channels.has(channelId);
   }
 
   #entry(channelId: string, key: string): LedgerEntry | undefined {
-    const entries = this.#data.channels[channelId];
-    return entries && Object.hasOwn(entries, key) ? entries[key] : undefined;
+    return this.#channels.get(channelId)?.entries.get(key);
   }
 
   status(channelId: string, key: string): LedgerStatus | undefined {
@@ -300,122 +498,114 @@ export class Ledger {
 
   /** Keys of the channel with their status. */
   entries(channelId: string): [string, LedgerStatus][] {
-    return Object.entries(this.#data.channels[channelId] ?? {}).map(([key, e]) => [key, e.status]);
+    const entries = this.#channels.get(channelId)?.entries ?? new Map<string, LedgerEntry>();
+    return [...entries].map(([key, e]) => [key, e.status]);
   }
 
   has(channelId: string, key: string): boolean {
     return this.status(channelId, key) !== undefined;
   }
 
-  /** When reminders were switched on for the channel; `undefined` while they are off. */
-  remindersFrom(channelId: string): number | undefined {
-    const from = this.#data.remindersFrom;
-    return from && Object.hasOwn(from, channelId) ? from[channelId] : undefined;
+  #mark<M extends Mark>(channelId: string, mark: M): ChannelMarks[M] {
+    return this.#channels.get(channelId)?.marks[mark];
   }
 
-  /** Switches the reminder mark on (a time) or off (`undefined`). Written in a batch. */
-  setRemindersFrom(channelId: string, value: number | undefined): void {
-    if (this.remindersFrom(channelId) === value) return;
-    if (value === undefined) {
-      if (this.#data.remindersFrom) delete this.#data.remindersFrom[channelId];
-    } else {
-      this.#data.remindersFrom ??= {};
-      this.#data.remindersFrom[channelId] = value;
-    }
-    this.#markDirty();
+  /** When reminders were switched on for the channel; `undefined` while they are off. */
+  remindersFrom(channelId: string): number | undefined {
+    return this.#mark(channelId, "remindersFrom");
   }
 
   /** When the manual feed was first seen and seeded for the channel; `undefined` before. */
   manualFrom(channelId: string): number | undefined {
-    const from = this.#data.manualFrom;
-    return from && Object.hasOwn(from, channelId) ? from[channelId] : undefined;
+    return this.#mark(channelId, "manualFrom");
+  }
+
+  /** The stored check routing fingerprint; `undefined` when none was stored yet. */
+  checkRouting(channelId: string): string | undefined {
+    return this.#mark(channelId, "checkRouting");
+  }
+
+  /** The stored component routing fingerprint; `undefined` when none was stored yet. */
+  componentRouting(channelId: string): string | undefined {
+    return this.#mark(channelId, "componentRouting");
+  }
+
+  /** Switches the reminder mark on (a time) or off (`undefined`). Creates the channel record. */
+  setRemindersFrom(channelId: string, value: number | undefined): void {
+    if (this.remindersFrom(channelId) === value) return;
+    this.#transact(
+      () => {
+        this.#upsertChannel(channelId);
+        this.#db
+          .query("UPDATE channels SET reminders_from = ? WHERE id = ?")
+          .run(value ?? null, channelId);
+      },
+      () => {
+        this.#channelState(channelId).marks.remindersFrom = value;
+      },
+    );
+  }
+
+  #upsertChannel(channelId: string): void {
+    this.#db.query("INSERT OR IGNORE INTO channels (id) VALUES (?)").run(channelId);
+  }
+
+  #channelState(channelId: string): ChannelState {
+    let channel = this.#channels.get(channelId);
+    if (!channel) {
+      channel = { marks: {}, entries: new Map() };
+      this.#channels.set(channelId, channel);
+    }
+    return channel;
   }
 
   /**
    * Records the keys as handled without sending; creates the channel record.
-   * `marks` sets the reminder and manual marks in the same write; a failed write undoes both.
+   * `marks` are written in the same transaction; a failed write changes nothing.
    */
-  seed(
-    channelId: string,
-    keys: string[],
-    marks: { remindersFrom?: number; manualFrom?: number } = {},
-  ): void {
-    const hadChannel = this.hasChannel(channelId);
-    const entries = this.#data.channels[channelId] ?? {};
-    const added: string[] = [];
+  seed(channelId: string, keys: string[], marks: ChannelMarks = {}): void {
+    const known = this.#channels.get(channelId)?.entries;
+    const added = [...new Set(keys)].filter((key) => !known?.has(key));
     const at = this.#now();
-    for (const key of keys) {
-      if (Object.hasOwn(entries, key)) continue;
-      entries[key] = { status: "seeded", at };
-      added.push(key);
-    }
-    this.#data.channels[channelId] = entries;
-    const undoReminders = this.#setMark("remindersFrom", channelId, marks.remindersFrom);
-    const undoManual = this.#setMark("manualFrom", channelId, marks.manualFrom);
-    this.#commit(() => {
-      for (const key of added) delete entries[key];
-      if (!hadChannel) delete this.#data.channels[channelId];
-      undoReminders();
-      undoManual();
-    });
+    const given = (Object.keys(MARK_COLUMNS) as Mark[]).filter((m) => marks[m] !== undefined);
+    this.#transact(
+      () => {
+        this.#upsertChannel(channelId);
+        for (const mark of given) {
+          this.#db
+            .query(`UPDATE channels SET ${MARK_COLUMNS[mark]} = ? WHERE id = ?`)
+            .run(marks[mark] ?? null, channelId);
+        }
+        const insert = this.#db.query(
+          "INSERT INTO entries (channel_id, key, status, at) VALUES (?, ?, 'seeded', ?)",
+        );
+        for (const key of added) insert.run(channelId, key, at);
+      },
+      () => {
+        const channel = this.#channelState(channelId);
+        for (const mark of given) Object.assign(channel.marks, { [mark]: marks[mark] });
+        for (const key of added) channel.entries.set(key, { status: "seeded", at });
+      },
+    );
   }
 
-  /** Sets a mark when `value` is given; returns the undo. */
-  #setMark(
-    field: "remindersFrom" | "manualFrom",
-    channelId: string,
-    value: number | undefined,
-  ): () => void {
-    if (value === undefined) return () => undefined;
-    const marks = this.#data[field] ?? {};
-    this.#data[field] = marks;
-    const hadMark = Object.hasOwn(marks, channelId);
-    const previous = marks[channelId];
-    marks[channelId] = value;
-    return () => {
-      if (hadMark && previous !== undefined) marks[channelId] = previous;
-      else delete marks[channelId];
-    };
-  }
-
-  /** Removes the settled reminder keys of the same incident that are older than `key`. */
-  #pruneReminders(entries: Record<string, LedgerEntry>, channelId: string, key: string): Removed[] {
-    const removed: Removed[] = [];
+  /** The settled reminder keys of the same incident that are older than `key`. */
+  #olderReminders(channelId: string, key: string): string[] {
     const latest = REMINDER_KEY.exec(key);
-    if (!latest) return removed;
-    for (const [other, entry] of Object.entries(entries)) {
+    const entries = this.#channels.get(channelId)?.entries;
+    if (!latest || !entries) return [];
+    const out: string[] = [];
+    for (const [other, entry] of entries) {
       const match = REMINDER_KEY.exec(other);
       if (!match || match[1] !== latest[1] || entry.status === "pending") continue;
-      if (Number(match[2]) >= Number(latest[2])) continue;
-      removed.push(this.#remove(entries, channelId, other));
+      if (Number(match[2]) < Number(latest[2])) out.push(other);
     }
-    return removed;
+    return out;
   }
 
-  #remove(entries: Record<string, LedgerEntry>, channelId: string, key: string): Removed {
-    const entry = entries[key] as LedgerEntry;
-    const payloads = this.#data.payloads?.[channelId];
-    const hasPayload = payloads !== undefined && Object.hasOwn(payloads, key);
-    const removed: Removed = { key, entry, notification: hasPayload ? payloads[key] : undefined };
-    delete entries[key];
-    if (hasPayload) delete payloads[key];
-    return removed;
-  }
-
-  #restore(channelId: string, removed: Removed[]): void {
-    const entries = this.#data.channels[channelId] ?? {};
-    this.#data.channels[channelId] = entries;
-    for (const { key, entry, notification } of removed) {
-      entries[key] = entry;
-      if (notification) this.#setPayload(channelId, key, notification);
-    }
-  }
-
-  #setPayload(channelId: string, key: string, notification: Notification): void {
-    this.#data.payloads ??= {};
-    const payloads = this.#data.payloads[channelId] ?? {};
-    payloads[key] = notification;
-    this.#data.payloads[channelId] = payloads;
+  #deleteRows(channelId: string, keys: string[]): void {
+    const del = this.#db.query("DELETE FROM entries WHERE channel_id = ? AND key = ?");
+    for (const key of keys) del.run(channelId, key);
   }
 
   /**
@@ -423,79 +613,131 @@ export class Ledger {
    * False if the key is already recorded.
    */
   claim(channelId: string, key: string, notification: Notification): boolean {
+    if (this.#isClosed) throw new LedgerClosedError();
     if (this.has(channelId, key)) return false;
-    const hadChannel = this.hasChannel(channelId);
-    const entries = this.#data.channels[channelId] ?? {};
-    this.#data.channels[channelId] = entries;
-    const removed = this.#pruneReminders(entries, channelId, key);
-    entries[key] = { status: "pending", at: this.#now() };
-    this.#setPayload(channelId, key, notification);
-    this.#commit(() => {
-      delete entries[key];
-      const payloads = this.#data.payloads?.[channelId];
-      if (payloads) delete payloads[key];
-      this.#restore(channelId, removed);
-      if (!hadChannel && Object.keys(entries).length === 0) delete this.#data.channels[channelId];
-    });
+    const older = this.#olderReminders(channelId, key);
+    const at = this.#now();
+    this.#transact(
+      () => {
+        this.#upsertChannel(channelId);
+        this.#deleteRows(channelId, older);
+        this.#db
+          .query(
+            "INSERT INTO entries (channel_id, key, status, at, payload) VALUES (?, ?, 'pending', ?, ?)",
+          )
+          .run(channelId, key, at, JSON.stringify(notification));
+      },
+      () => {
+        const channel = this.#channelState(channelId);
+        for (const other of older) channel.entries.delete(other);
+        channel.entries.set(key, { status: "pending", at, payload: notification });
+      },
+    );
     return true;
   }
 
-  /**
-   * Ends a pending claim. A `failed` key keeps its notification so it can be resent.
-   * Written in a batch.
-   */
+  /** Ends a pending claim. A `failed` key keeps its notification and recipients for a resend. */
   settle(channelId: string, key: string, status: "delivered" | "failed" | "dropped"): void {
     const entry = this.#entry(channelId, key);
     if (entry?.status !== "pending") {
       throw new Error(`cannot settle ${channelId}/${key}: not pending`);
     }
-    entry.status = status;
-    entry.at = this.#now();
-    const payloads = this.#data.payloads?.[channelId];
-    if (payloads && status !== "failed") delete payloads[key];
-    this.#markDirty();
+    const at = this.#now();
+    const isKept = status === "failed";
+    this.#transact(
+      () => {
+        const sql = isKept
+          ? "UPDATE entries SET status = ?, at = ? WHERE channel_id = ? AND key = ?"
+          : "UPDATE entries SET status = ?, at = ?, payload = NULL, recipients = NULL WHERE channel_id = ? AND key = ?";
+        this.#db.query(sql).run(status, at, channelId, key);
+      },
+      () => {
+        entry.status = status;
+        entry.at = at;
+        if (!isKept) {
+          entry.payload = undefined;
+          entry.recipients = undefined;
+        }
+      },
+    );
+  }
+
+  /** Stores the recipient progress of a pending or failed key. */
+  setRecipients(channelId: string, key: string, progress: RecipientProgress): void {
+    const entry = this.#entry(channelId, key);
+    if (entry?.status !== "pending" && entry?.status !== "failed") {
+      throw new Error(`cannot store recipients of ${channelId}/${key}: not pending`);
+    }
+    const copy = { delivered: [...progress.delivered], refused: [...progress.refused] };
+    this.#transact(
+      () => {
+        this.#db
+          .query("UPDATE entries SET recipients = ? WHERE channel_id = ? AND key = ?")
+          .run(JSON.stringify(copy), channelId, key);
+      },
+      () => {
+        entry.recipients = copy;
+      },
+    );
   }
 
   /** Pending keys in the order they were claimed. */
   pending(): PendingEntry[] {
     const out: PendingEntry[] = [];
-    for (const [channelId, entries] of Object.entries(this.#data.channels)) {
-      for (const [key, { status }] of Object.entries(entries)) {
-        if (status !== "pending") continue;
-        const notification = this.#payload(channelId, key);
-        out.push(notification ? { channelId, key, notification } : { channelId, key });
+    for (const [channelId, { entries }] of this.#channels) {
+      for (const [key, e] of entries) {
+        if (e.status !== "pending") continue;
+        const item: PendingEntry = { channelId, key };
+        if (e.payload) item.notification = e.payload;
+        if (e.recipients) item.recipients = e.recipients;
+        out.push(item);
       }
     }
     return out;
   }
 
-  #payload(channelId: string, key: string): Notification | undefined {
-    const payloads = this.#data.payloads?.[channelId];
-    return payloads && Object.hasOwn(payloads, key) ? payloads[key] : undefined;
-  }
-
   /** Failed keys, oldest failure first. */
   failed(): FailedEntry[] {
     const out: FailedEntry[] = [];
-    for (const [channelId, entries] of Object.entries(this.#data.channels)) {
-      for (const [key, { status, at }] of Object.entries(entries)) {
-        if (status !== "failed") continue;
-        const notification = this.#payload(channelId, key);
-        out.push(notification ? { channelId, key, at, notification } : { channelId, key, at });
+    for (const [channelId, { entries }] of this.#channels) {
+      for (const [key, e] of entries) {
+        if (e.status !== "failed") continue;
+        const item: FailedEntry = { channelId, key, at: e.at };
+        if (e.payload) item.notification = e.payload;
+        if (e.recipients) item.recipients = e.recipients;
+        out.push(item);
       }
     }
     return out.sort((a, b) => a.at - b.at);
   }
 
-  /** Sets a failed key back to `pending` with its stored notification. Written at once. */
+  /**
+   * Sets a failed key back to `pending` with its stored notification. Delivered recipients
+   * stay; refused ones are cleared, so they are tried once more.
+   */
   resend(channelId: string, key: string): ResendResult {
+    if (this.#isClosed) throw new LedgerClosedError();
     const entry = this.#entry(channelId, key);
     if (entry?.status !== "failed") return "not-failed";
-    if (!this.#payload(channelId, key)) return "no-payload";
-    const previous = { ...entry };
-    entry.status = "pending";
-    entry.at = this.#now();
-    this.#commit(() => Object.assign(entry, previous));
+    if (!entry.payload) return "no-payload";
+    const at = this.#now();
+    const recipients = entry.recipients
+      ? { delivered: [...entry.recipients.delivered], refused: [] }
+      : undefined;
+    this.#transact(
+      () => {
+        this.#db
+          .query(
+            "UPDATE entries SET status = 'pending', at = ?, recipients = ? WHERE channel_id = ? AND key = ?",
+          )
+          .run(at, json(recipients), channelId, key);
+      },
+      () => {
+        entry.status = "pending";
+        entry.at = at;
+        entry.recipients = recipients;
+      },
+    );
     return "resent";
   }
 
@@ -503,7 +745,7 @@ export class Ledger {
    * Removes settled entries (not `pending`) older than `maxAgeMs`, with their notifications.
    * A key of an incident in `visible` (or a manual one in `visibleManual`) stays, or it would look unhandled and be sent again.
    * When `visible` is `undefined` (no successful poll yet), every incident key stays.
-   * Returns the number of removed entries. Written in a batch.
+   * Returns the number of removed entries.
    */
   prune(
     maxAgeMs: number,
@@ -511,27 +753,42 @@ export class Ledger {
     visibleManual?: ReadonlySet<number>,
   ): number {
     const cutoff = this.#now() - maxAgeMs;
+    const removed: [string, string[]][] = [];
     let count = 0;
-    for (const [channelId, entries] of Object.entries(this.#data.channels)) {
-      for (const [key, entry] of Object.entries(entries)) {
-        if (entry.status === "pending" || entry.at >= cutoff) continue;
-        const match = INCIDENT_KEY.exec(key);
-        if (match && (visible === undefined || visible.has(Number(match[1])))) continue;
-        const manual = MANUAL_KEY.exec(key);
-        if (manual && (visibleManual === undefined || visibleManual.has(Number(manual[1])))) {
-          continue;
-        }
-        this.#remove(entries, channelId, key);
-        count++;
-      }
+    for (const [channelId, { entries }] of this.#channels) {
+      const keys = [...entries]
+        .filter(([key, e]) => isPrunable(key, e, cutoff, visible, visibleManual))
+        .map(([key]) => key);
+      if (keys.length === 0) continue;
+      removed.push([channelId, keys]);
+      count += keys.length;
     }
-    if (count > 0) this.#markDirty();
+    if (count === 0) return 0;
+    this.#transact(
+      () => {
+        for (const [channelId, keys] of removed) this.#deleteRows(channelId, keys);
+      },
+      () => {
+        for (const [channelId, keys] of removed) {
+          const entries = this.#channels.get(channelId)?.entries;
+          for (const key of keys) entries?.delete(key);
+        }
+      },
+    );
     return count;
   }
 }
 
-const unrefSchedule: Schedule = (fn, ms) => {
-  const timer = setTimeout(fn, ms);
-  timer.unref();
-  return () => clearTimeout(timer);
-};
+function isPrunable(
+  key: string,
+  entry: LedgerEntry,
+  cutoff: number,
+  visible: ReadonlySet<number> | undefined,
+  visibleManual: ReadonlySet<number> | undefined,
+): boolean {
+  if (entry.status === "pending" || entry.at >= cutoff) return false;
+  const match = INCIDENT_KEY.exec(key);
+  if (match && (visible === undefined || visible.has(Number(match[1])))) return false;
+  const manual = MANUAL_KEY.exec(key);
+  return !(manual && (visibleManual === undefined || visibleManual.has(Number(manual[1]))));
+}

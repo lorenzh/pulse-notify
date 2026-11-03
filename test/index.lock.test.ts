@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConfigError } from "../src/config.ts";
 import { type MainDeps, main, type Stoppable } from "../src/index.ts";
+import { Ledger } from "../src/ledger.ts";
 import type { Schedule } from "../src/types.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-main-lock-"));
@@ -162,10 +163,7 @@ test("batched ledger changes are flushed on stop, before the lock is freed", asy
     },
   );
   await running.stop();
-  assert.equal(
-    JSON.parse(readFileSync(state, "utf8")).channels.log["1:opened"].status,
-    "delivered",
-  );
+  assert.equal(savedStatus(state, "log", "1:opened"), "delivered");
   assert.equal(existsSync(`${state}.lock`), false);
 });
 
@@ -199,3 +197,13 @@ test("a state parent that is a file throws ConfigError", () => {
     (err: unknown) => err instanceof ConfigError && /^cannot use state file /.test(err.message),
   );
 });
+
+/** Reads one status from the state file through a second ledger. */
+function savedStatus(path: string, channelId: string, key: string): string | undefined {
+  const ledger = new Ledger(path);
+  try {
+    return ledger.status(channelId, key);
+  } finally {
+    ledger.close();
+  }
+}
