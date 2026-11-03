@@ -135,3 +135,24 @@ test("flush checkpoints the WAL down to 0 bytes", async () => {
   assert.equal(statSync(`${path}-wal`).size, 0);
   ledger.close();
 });
+
+test("on an open ledger an equal reminder mark and a prune without candidate write nothing", () => {
+  let commits = 0;
+  const ledger = new Ledger(tmpPath(), {
+    now: () => 1000,
+    hooks: {
+      beforeCommit: () => {
+        commits += 1;
+      },
+    },
+  });
+  ledger.seed("c", ["1:opened"]);
+  ledger.setRemindersFrom("c", 500);
+  commits = 0;
+  assert.equal(ledger.setRemindersFrom("c", 500), undefined);
+  assert.equal(ledger.setRemindersFrom("absent", undefined), undefined);
+  assert.equal(ledger.prune(1, undefined), 0);
+  assert.equal(commits, 0);
+  assert.equal(ledger.remindersFrom("c"), 500);
+  ledger.close();
+});

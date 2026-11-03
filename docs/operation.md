@@ -178,4 +178,4 @@ From a version with a JSON state file (format 1 or 2):
 - The first start migrates the file to SQLite format 3 and keeps the original as `<state>.v<N>.bak` (logged as `ledger migrated`). Statuses, times, payloads and marks are kept. A later start does not migrate again.
 - Routing filters are stored from the first poll after the upgrade on. A filter widening made in the same restart as the upgrade sends the history of the newly routed checks once. Upgrade first, then change filters in a later restart, see [channels.md](channels.md#routing).
 - Backup now needs a stopped service, see [State: the delivery ledger](#state-the-delivery-ledger).
-- Downgrade to a JSON version: stop, restore `<state>.v2.bak` to `<state>`, remove `<state>-wal` and `<state>-shm`. Events settled after the migration may then be sent again.
+- Downgrade to a JSON version: stop, restore the backup that the `ledger migrated` log line names as `backup` to `<state>` (`<state>.v1.bak` if the migration was from format 1, `<state>.v2.bak` if from format 2), remove `<state>-wal` and `<state>-shm`. Events settled after the migration may then be sent again.

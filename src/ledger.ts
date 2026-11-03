@@ -483,9 +483,14 @@ export class Ledger {
     }
   }
 
+  /** Throws `LedgerClosedError` after `close()`. Runs first in every mutation, before any read. */
+  #assertOpen(): void {
+    if (this.#isClosed) throw new LedgerClosedError();
+  }
+
   /** Runs `write` in one transaction, then `apply` to memory. */
   #transact(write: () => void, apply: () => void): void {
-    if (this.#isClosed) throw new LedgerClosedError();
+    this.#assertOpen();
     this.#db.transaction(() => {
       write();
       this.#beforeCommit?.();
@@ -555,6 +560,7 @@ export class Ledger {
 
   /** Switches the reminder mark on (a time) or off (`undefined`). Creates the channel record. */
   setRemindersFrom(channelId: string, value: number | undefined): void {
+    this.#assertOpen();
     if (this.remindersFrom(channelId) === value) return;
     this.#transact(
       () => {
@@ -587,6 +593,7 @@ export class Ledger {
    * `marks` are written in the same transaction; a failed write changes nothing.
    */
   seed(channelId: string, keys: string[], marks: ChannelMarks = {}): void {
+    this.#assertOpen();
     const known = this.#channels.get(channelId)?.entries;
     const added = [...new Set(keys)].filter((key) => !known?.has(key));
     const at = this.#now();
@@ -636,7 +643,7 @@ export class Ledger {
    * False if the key is already recorded.
    */
   claim(channelId: string, key: string, notification: Notification): boolean {
-    if (this.#isClosed) throw new LedgerClosedError();
+    this.#assertOpen();
     if (this.has(channelId, key)) return false;
     const older = this.#olderReminders(channelId, key);
     const at = this.#now();
@@ -661,6 +668,7 @@ export class Ledger {
 
   /** Ends a pending claim. A `failed` key keeps its notification and recipients for a resend. */
   settle(channelId: string, key: string, status: "delivered" | "failed" | "dropped"): void {
+    this.#assertOpen();
     const entry = this.#entry(channelId, key);
     if (entry?.status !== "pending") {
       throw new Error(`cannot settle ${channelId}/${key}: not pending`);
@@ -687,6 +695,7 @@ export class Ledger {
 
   /** Stores the recipient progress of a pending or failed key. */
   setRecipients(channelId: string, key: string, progress: RecipientProgress): void {
+    this.#assertOpen();
     const entry = this.#entry(channelId, key);
     if (entry?.status !== "pending" && entry?.status !== "failed") {
       throw new Error(`cannot store recipients of ${channelId}/${key}: not pending`);
@@ -739,7 +748,7 @@ export class Ledger {
    * stay; refused ones are cleared, so they are tried once more.
    */
   resend(channelId: string, key: string): ResendResult {
-    if (this.#isClosed) throw new LedgerClosedError();
+    this.#assertOpen();
     const entry = this.#entry(channelId, key);
     if (entry?.status !== "failed") return "not-failed";
     if (!entry.payload) return "no-payload";
@@ -775,6 +784,7 @@ export class Ledger {
     visible: ReadonlySet<number> | undefined,
     visibleManual?: ReadonlySet<number>,
   ): number {
+    this.#assertOpen();
     const cutoff = this.#now() - maxAgeMs;
     const removed: [string, string[]][] = [];
     let count = 0;
