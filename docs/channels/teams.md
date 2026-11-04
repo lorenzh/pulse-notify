@@ -26,3 +26,5 @@ Reason: HTTP 503
 Time: 2026-01-01T12:00:00.000Z
 [Status page]   (only when statusUrl is set)
 ```
+
+A warning (see [Warnings](../channels.md#warnings)) has the title `BUDGET LOW`, `TLS EXPIRES SOON` or `DOMAIN EXPIRES SOON` with the escaped subject name, and the facts `Error budget left` and `Availability`, or `Expires in` and `Kind`, then `Time` and the status page action.

@@ -36,6 +36,7 @@ import { defaultSchedule } from "./timeout.ts";
 import type {
   ChannelConfig,
   Config,
+  IncidentNotification,
   Notification,
   NotificationEvent,
   RecipientProgress,
@@ -119,7 +120,7 @@ function buildNotification(
   incident: Incident,
   names: Map<string, string>,
   nowMs: number,
-): Notification {
+): IncidentNotification {
   const timeMs = eventTimeMs(event, incident, nowMs);
   return {
     key,
@@ -134,7 +135,7 @@ function buildNotification(
   };
 }
 
-function buildManualNotification(detected: DetectedManualEvent): Notification {
+function buildManualNotification(detected: DetectedManualEvent): IncidentNotification {
   const { incident, event, key, timeMs, updateIndex } = detected;
   const update = incident.updates[updateIndex];
   const message = event === "resolved" ? (incident.updates.at(-1)?.message ?? "") : update?.message;

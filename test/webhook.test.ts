@@ -1,9 +1,18 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { createServer } from "node:http";
 import { createWebhookSender } from "../src/channels/webhook.ts";
 import type { Notification, Schedule } from "../src/types.ts";
-import { close, fakeFetch, listen, startReceiver } from "./support.ts";
+import {
+  asRecord,
+  budgetNote,
+  close,
+  expiryNote,
+  fakeFetch,
+  listen,
+  startReceiver,
+} from "./support.ts";
 
 const note: Notification = {
   key: "7:opened",
@@ -117,4 +126,37 @@ test("a stalled response body times out via the injected timer", async () => {
   await new Promise((r) => setImmediate(r));
   fire?.();
   await assert.rejects(sending, /timeout after 20ms/);
+});
+
+test("a warning is posted as raw JSON, signed, with the key as idempotency key", async () => {
+  const rx = await startReceiver();
+  try {
+    const send = createWebhookSender(
+      { id: "h", type: "webhook", url: rx.url, secret: "test-signing-key" },
+      { now: () => 1767268800000 },
+    );
+    const warnings = [
+      budgetNote(),
+      expiryNote(),
+      expiryNote({ event: "domain-expiry", key: "expiry:1:3:cccccccccccccccccccccccccccccccc" }),
+    ];
+    for (const w of warnings) await send(w);
+    assert.deepEqual(
+      rx.requests.map((r) => r.headers["idempotency-key"]),
+      [
+        "budget:check:1767268800000:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expiry:1767268800000:14:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "expiry:1:3:cccccccccccccccccccccccccccccccc",
+      ],
+    );
+    rx.requests.forEach((req, i) => {
+      assert.deepEqual(req.body, warnings[i]);
+      assert.equal(req.headers["idempotency-key"], asRecord(req.body).key);
+      const mac = createHmac("sha256", "test-signing-key").update(req.raw).digest("hex");
+      assert.equal(req.headers["x-pulse-signature"], `sha256=${mac}`);
+      assert.equal(req.headers["x-pulse-timestamp"], "1767268800");
+    });
+  } finally {
+    await rx.close();
+  }
 });

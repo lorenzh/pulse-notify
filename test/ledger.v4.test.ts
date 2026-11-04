@@ -16,7 +16,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger, type LedgerOptions } from "../src/ledger.ts";
-import type { Notification } from "../src/types.ts";
+import type { IncidentNotification, WarningNotification } from "../src/types.ts";
+import { budgetNote, expiryNote } from "./support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-ledger4-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -37,8 +38,7 @@ function path(): string {
   return join(dir, `state-${counter++}.json`);
 }
 
-function note(key: string, event = "opened"): Notification {
-  // Trust boundary of the test: a warning event is stored as an opaque payload here.
+function note(key: string, event: IncidentNotification["event"] = "opened"): IncidentNotification {
   return {
     key,
     event,
@@ -49,7 +49,13 @@ function note(key: string, event = "opened"): Notification {
     time: "2026-01-01T00:00:00.000Z",
     timeMs: 0,
     openedMs: 0,
-  } as Notification;
+  };
+}
+
+/** A warning payload with the given key, of each of the three variants. */
+function warn(key: string, event: WarningNotification["event"]): WarningNotification {
+  if (event === "budget-low") return budgetNote({ key });
+  return expiryNote({ key, event });
 }
 
 const SCHEMA_V3 = `
@@ -311,8 +317,8 @@ test("a failed alert batch changes no row and no entry, in memory and on disk", 
     ledger.applyAlerts(
       [{ kind: "budget-check", subjectId: "a", state: { lastEventAt: 1000 } }],
       [
-        { channelId: "w1", key, notification: note(key, "budget-low") },
-        { channelId: "w2", key, notification: note(key, "budget-low") },
+        { channelId: "w1", key, notification: warn(key, "budget-low") },
+        { channelId: "w2", key, notification: warn(key, "budget-low") },
       ],
     ),
   );
@@ -335,8 +341,8 @@ test("alert batches survive a reopen, also an observed_at-only advance", () => {
   const added = ledger.applyAlerts(
     [{ kind: "expiry", subjectId: "x", state: { stage: 14, episodeAt: 500, observedAt: 900 } }],
     [
-      { channelId: "w1", key, notification: note(key, "tls-expiry") },
-      { channelId: "w1", key, notification: note(key, "tls-expiry") },
+      { channelId: "w1", key, notification: warn(key, "tls-expiry") },
+      { channelId: "w1", key, notification: warn(key, "tls-expiry") },
     ],
   );
   assert.deepEqual(
@@ -345,7 +351,7 @@ test("alert batches survive a reopen, also an observed_at-only advance", () => {
   );
   // A key the channel already has is not added again.
   assert.deepEqual(
-    ledger.applyAlerts([], [{ channelId: "w1", key, notification: note(key, "tls-expiry") }]),
+    ledger.applyAlerts([], [{ channelId: "w1", key, notification: warn(key, "tls-expiry") }]),
     [],
   );
   clock = 61_000;
@@ -382,7 +388,7 @@ test("alert batches survive a reopen, also an observed_at-only advance", () => {
     ],
   ]);
   assert.deepEqual(again.pending(), [
-    { channelId: "w1", key, notification: note(key, "tls-expiry") },
+    { channelId: "w1", key, notification: warn(key, "tls-expiry") },
   ]);
 });
 
@@ -392,7 +398,7 @@ function dropFixture(file: string, opts?: LedgerOptions): Ledger {
     ledger.claim(ch, "1:opened", note("1:opened"));
     ledger.claim(ch, "manual:2:opened", note("manual:2:opened"));
     ledger.setRecipients(ch, "1:opened", { delivered: ["a@example.com"], refused: [] });
-    ledger.claim(ch, "budget:check:1:h", note("budget:check:1:h", "budget-low"));
+    ledger.claim(ch, "budget:check:1:h", warn("budget:check:1:h", "budget-low"));
     ledger.claim(ch, "3:opened", note("3:opened"));
     ledger.settle(ch, "3:opened", "failed");
   }
@@ -451,7 +457,7 @@ test("dropping pending incidents is all or nothing over every given channel", ()
 test("dropping with nothing to drop writes nothing", () => {
   const f = fault();
   const ledger = ledgerAt(path(), { hooks: f });
-  ledger.claim("w1", "budget:check:1:h", note("budget:check:1:h", "budget-low"));
+  ledger.claim("w1", "budget:check:1:h", warn("budget:check:1:h", "budget-low"));
   const calls = f.calls;
   assert.deepEqual(
     [...ledger.dropPendingIncidents(["w1", "none"])],
@@ -498,7 +504,7 @@ test("a recent alert row stays and pruning a budget entry keeps its alert row", 
   const key = "budget:check:1000000:h";
   ledger.applyAlerts(
     [{ kind: "budget-check", subjectId: "a", state: { lastEventAt: T0 } }],
-    [{ channelId: "w", key, notification: note(key, "budget-low") }],
+    [{ channelId: "w", key, notification: warn(key, "budget-low") }],
   );
   ledger.settle("w", key, "delivered");
   clock = T0 + DAY / 2;
@@ -550,4 +556,64 @@ test("a refused file keeps the bytes of its main file, WAL and SHM", () => {
     });
     assert.equal(existsSync(`${file}.v3.bak`), false, name);
   }
+});
+
+const WARNINGS: WarningNotification[] = [
+  budgetNote({
+    key: "budget:component:1767268800000:0123456789abcdef0123456789abcdef",
+    subject: { kind: "component", id: "web", name: "Web <tier>" },
+    budget: { remaining: -3.25, threshold: 25, target: 99.5, availability: null, windowDays: 30 },
+  }),
+  expiryNote({ key: "expiry:1767268800000:14:0123456789abcdef0123456789abcdef" }),
+  expiryNote({
+    key: "expiry:1767268800000:3:fedcba9876543210fedcba9876543210",
+    event: "domain-expiry",
+    subject: { kind: "check", id: "dom", name: "Domain" },
+    expiry: { daysLeft: 0, milestone: 3, observedMs: 1767268800000 },
+  }),
+];
+
+test("pending and failed warning payloads of all three variants survive a reopen unchanged", () => {
+  const file = path();
+  const ledger = ledgerAt(file, { now: () => 5 });
+  for (const w of WARNINGS) {
+    ledger.claim("p", w.key, w);
+    ledger.claim("f", w.key, w);
+    ledger.settle("f", w.key, "failed");
+  }
+  ledger.close();
+  const again = ledgerAt(file, { now: () => 6 });
+  assert.deepEqual(
+    again.pending().map((p) => p.notification),
+    WARNINGS,
+  );
+  assert.deepEqual(
+    again.failed().map((e) => [e.key, e.notification?.event]),
+    [
+      [WARNINGS[0]?.key, "budget-low"],
+      [WARNINGS[1]?.key, "tls-expiry"],
+      [WARNINGS[2]?.key, "domain-expiry"],
+    ],
+  );
+  assert.equal(
+    again.resend("f", "expiry:1767268800000:14:0123456789abcdef0123456789abcdef"),
+    "resent",
+  );
+  const resent = again.pending().find((p) => p.channelId === "f");
+  assert.deepEqual(resent?.notification, WARNINGS[1]);
+});
+
+test("the incident drop keeps pending warnings of all three variants with their payloads", () => {
+  const file = path();
+  const ledger = ledgerAt(file, { now: () => 5 });
+  ledger.claim("h", "7:opened", note("7:opened"));
+  for (const w of WARNINGS) ledger.claim("h", w.key, w);
+  assert.deepEqual([...ledger.dropPendingIncidents(["h"])], [["h", 1]]);
+  ledger.close();
+  const again = ledgerAt(file, { now: () => 6 });
+  assert.equal(again.status("h", "7:opened"), "dropped");
+  assert.deepEqual(
+    again.pending().map((p) => p.notification),
+    WARNINGS,
+  );
 });

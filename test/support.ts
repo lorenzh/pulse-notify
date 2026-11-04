@@ -1,6 +1,14 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { Check, Incident, ManualIncident } from "@lorenzh/pulse-contract";
+import type {
+  Check,
+  CheckStateFields,
+  CheckWithState,
+  ComponentWithState,
+  Incident,
+  ManualIncident,
+  Slo,
+} from "@lorenzh/pulse-contract";
 import {
   type AtomicWriteFs,
   type AtomicWriteSyncFs,
@@ -9,6 +17,7 @@ import {
   nodeAtomicWriteFs,
   nodeAtomicWriteSyncFs,
 } from "@lorenzh/pulse-kit";
+import type { BudgetNotification, ExpiryNotification } from "../src/types.ts";
 
 export interface LogEntry {
   level: LogLevel;
@@ -335,4 +344,79 @@ export function recordingFs(): RecordingFs {
     },
   };
   return { steps, faults, sync, async };
+}
+
+/** An SLO with target 99.9; `availability` defaults to a value that fits `budgetRemaining`. */
+export function slo(budgetRemaining: number | null, availability: number | null = 99.95): Slo {
+  return {
+    target: 99.9,
+    windowDays: 30,
+    availability: budgetRemaining === null ? null : availability,
+    budgetRemaining,
+  };
+}
+
+/** A check with state; `readings` are `[timestamp, location]` results with `certDaysLeft`. */
+export function checkState(
+  check: Check,
+  over: Partial<CheckStateFields> = {},
+  readings: number[] = [],
+): CheckWithState {
+  const locations = readings.map((timestamp, i) => ({
+    location: `loc-${i}`,
+    stale: false,
+    result: {
+      checkId: check.id,
+      timestamp,
+      status: "up" as const,
+      statusCode: null,
+      latencyMs: 1,
+      reason: null,
+      location: `loc-${i}`,
+      attempts: 1,
+    },
+  }));
+  return {
+    ...check,
+    state: "up",
+    consecutiveDown: 0,
+    lastResultAt: readings.length === 0 ? null : Math.max(...readings),
+    lastReason: null,
+    locations,
+    ...over,
+  };
+}
+
+export function componentState(
+  id: string,
+  name: string,
+  over: Partial<ComponentWithState> = {},
+): ComponentWithState {
+  return { id, name, checkIds: ["a"], state: "up", uptime: null, incidentIds: [], ...over };
+}
+
+export const WARNING_TIME_MS = Date.UTC(2026, 0, 1, 12, 0, 0);
+
+export function budgetNote(over: Partial<BudgetNotification> = {}): BudgetNotification {
+  return {
+    key: `budget:check:${WARNING_TIME_MS}:${"a".repeat(32)}`,
+    event: "budget-low",
+    time: new Date(WARNING_TIME_MS).toISOString(),
+    timeMs: WARNING_TIME_MS,
+    subject: { kind: "check", id: "api-health", name: "API health" },
+    budget: { remaining: 18.4, threshold: 25, target: 99.9, availability: 99.8816, windowDays: 30 },
+    ...over,
+  };
+}
+
+export function expiryNote(over: Partial<ExpiryNotification> = {}): ExpiryNotification {
+  return {
+    key: `expiry:${WARNING_TIME_MS}:14:${"b".repeat(32)}`,
+    event: "tls-expiry",
+    time: new Date(WARNING_TIME_MS + 5000).toISOString(),
+    timeMs: WARNING_TIME_MS + 5000,
+    subject: { kind: "check", id: "site-tls", name: "Site TLS" },
+    expiry: { daysLeft: 13, milestone: 14, observedMs: WARNING_TIME_MS },
+    ...over,
+  };
 }

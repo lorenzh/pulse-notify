@@ -108,12 +108,63 @@ Credentials never go inline in the config file, except the webhook `url`:
 
 Exactly one of each pair. The `...Env` key holds the name of an environment variable; the `...File` key holds a path. A file is read once at start and one trailing newline is removed. A missing or empty variable or file stops startup with an error that names the channel and the key, never the value. Logs, errors and `/metrics` do not contain these values.
 
+## Warnings
+
+Besides incidents, a channel can get three warning events. It opts in with `alerts`, a list of `"budget-low"`, `"tls-expiry"` and `"domain-expiry"`. Absent or empty means no warnings. With `sendIncidents: false` the channel gets only warnings.
+
+- `budget-low`: the error budget of an SLO (`slo.budgetRemaining` of `GET /checks` or `GET /components`) is strictly below the threshold (default 25). The comparison uses the unrounded value; `null` and a subject without `slo` never warn. A low SLO gets at most one event per 24 elapsed hours (not per calendar day). A recovery and a new drop inside that time send nothing, and days missed while notify was down give one event. A check and a component with the same id are two SLOs. There is no recovery event.
+- `tls-expiry` and `domain-expiry`: the days left (`certDaysLeft` of a `tls` or `domain` check) reach a milestone. The first reading in `4..14` sends milestone 14, the first in `0..3` sends milestone 3. A first reading of 3 or less sends only milestone 3. Expired values (below 0) send nothing. Only a reading above 14 days rearms the check for a new episode. A reading is used only when it is fresh (at most `2 × intervalMs + 60 s` old) and newer than every reading used before, also across a restart.
+
+Keys: `budget:check:<eventMs>:<h>`, `budget:component:<eventMs>:<h>` and `expiry:<episodeMs>:<milestone>:<h>`, where `<h>` is the first 32 hex characters of the SHA-256 of the subject id. Treat them as opaque.
+
+Routing: a check warning follows `checks` and `excludeChecks`; a component warning follows `components` and `excludeComponents`, and is never expanded to the member checks. `sendIncidents` does not affect warnings.
+
+Payload (webhook body and file line):
+
+```json
+{
+  "key": "budget:check:1767268800000:<32 hex>",
+  "event": "budget-low",
+  "time": "2026-01-01T12:00:00.000Z",
+  "timeMs": 1767268800000,
+  "subject": { "kind": "check", "id": "api-health", "name": "API health" },
+  "budget": {
+    "remaining": 18.4,
+    "threshold": 25,
+    "target": 99.9,
+    "availability": 99.8816,
+    "windowDays": 30
+  }
+}
+```
+
+```json
+{
+  "key": "expiry:1767268800000:14:<32 hex>",
+  "event": "tls-expiry",
+  "time": "2026-01-01T12:00:05.000Z",
+  "timeMs": 1767268805000,
+  "subject": { "kind": "check", "id": "site-tls", "name": "Site TLS" },
+  "expiry": { "daysLeft": 13, "milestone": 14, "observedMs": 1767268800000 }
+}
+```
+
+`time` is the poll time of the event. `subject.kind` is `component` only for `budget-low`. `budget` holds the raw api values (not rounded) and the threshold in force.
+
+Known limits:
+
+- A renewal that keeps the days left at 14 or below (for example a new certificate valid for 10 days) is not seen; that episode gets no new warnings.
+- A channel that subscribes later, or whose filters widen, gets the next event that becomes due, not past ones.
+- A warning can be up to `2 × intervalMs` late, because notify reads the newest result of the check.
+
 ## Message content
 
 Slack, Teams and email show: the check name, the state (`DOWN`, `RESOLVED`, `STILL DOWN`), the reason, the time in UTC, for reminders how long the incident has been open, and a link to your status page. Per channel:
 
 - `statusUrl`: an `http(s)` URL shown as the link. Without it there is no link.
 - `hideReason: true`: leaves the reason out (it may hold internal details). It does not change the webhook or file payload.
+
+Warnings show the label `BUDGET LOW`, `TLS EXPIRES SOON` or `DOMAIN EXPIRES SOON`, the subject name, the time and the link. Budget warnings add `Error budget left: <r>% (alert below <t>%)` and `Availability: <a>% (target <target>%, 30 days)`; `<r>` is rounded down to 0.1 and `<a>` to 0.001 (`24.96` shows `24.9`, `-3.25` shows `-3.3`), or `no data`. Expiry warnings add `Expires in: <n> days` (`1 day`, `less than 1 day` for 0) and `Kind: TLS certificate` or `Kind: domain registration`. `hideReason` does not apply to warnings.
 
 The reason is untrusted text: it is cut to 300 characters, control characters are removed, and it is escaped for the target format.
 

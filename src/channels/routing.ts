@@ -1,4 +1,4 @@
-import type { ChannelConfig } from "../types.ts";
+import type { AlertEvent, AlertSubject, ChannelConfig } from "../types.ts";
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
@@ -37,6 +37,25 @@ export function isRouted(
   if (isListed(channel.excludeChecks, checkId)) return false;
   const include = channel.checks;
   return include === undefined || include.length === 0 || isListed(include, checkId);
+}
+
+/**
+ * Whether the channel wants a warning: the event is in `alerts`, and the subject passes the check
+ * filters (a check) or the component filters (a component). `sendIncidents` does not matter, and a
+ * component is never expanded to its member checks.
+ */
+export function isAlertRouted(
+  channel: Pick<
+    ChannelConfig,
+    "alerts" | "checks" | "excludeChecks" | "components" | "excludeComponents"
+  >,
+  event: AlertEvent,
+  subject: Pick<AlertSubject, "kind" | "id">,
+): boolean {
+  if (!(channel.alerts ?? []).includes(event)) return false;
+  return subject.kind === "check"
+    ? isRouted(channel, subject.id)
+    : isManualRouted(channel, [subject.id]);
 }
 
 type CheckFilters = Pick<ChannelConfig, "checks" | "excludeChecks">;
