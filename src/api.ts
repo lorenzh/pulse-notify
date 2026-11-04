@@ -227,16 +227,17 @@ export async function fetchChecksWithState(
     const path = `checks[${i}]`;
     const id = listedId(raw);
     if (id !== undefined) result.listedIds.add(id);
-    const validated = validateCheck(raw, path);
-    if (!validated.ok) {
-      opts.onInvalidCheck?.(i);
+    // The with-state validator also checks the base fields, so a valid item is validated once.
+    const stated = withState ? validateCheckWithState(raw, path) : undefined;
+    if (stated?.ok === true) {
+      result.checks.push(stated.value);
+      result.states.push(stated.value);
       continue;
     }
-    result.checks.push(validated.value);
-    if (!withState) continue;
-    const stated = validateCheckWithState(raw, path);
-    if (stated.ok) result.states.push(stated.value);
-    else opts.onInvalidCheck?.(i);
+    const validated = validateCheck(raw, path);
+    if (validated.ok) result.checks.push(validated.value);
+    // Without state a valid check is fine; with state it failed the second validator.
+    if (!validated.ok || withState) opts.onInvalidCheck?.(i);
   }
   return result;
 }
