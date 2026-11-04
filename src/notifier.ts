@@ -3,6 +3,8 @@ import type { Logger } from "@lorenzh/pulse-kit";
 import { type AlertInputs, isSubscribed, planAlerts } from "./alert-poll.ts";
 import {
   ApiReadError,
+  type ChecksResult,
+  type ComponentsResult,
   fetchChecksWithState,
   fetchComponents,
   fetchIncidents,
@@ -421,7 +423,7 @@ export class Notifier {
       this.#pruneLedger(nowMs);
     }
     if (hasAlerts) {
-      this.#runAlerts({ checks: checksResult?.states, components }, nowMs);
+      this.#runAlerts(checksResult, components, nowMs);
       this.#pruneAlerts(nowMs);
     }
     return isOk;
@@ -461,12 +463,19 @@ export class Notifier {
   }
 
   /** One evaluation of all warning kinds, committed in one transaction, then enqueued. */
-  #runAlerts(inputs: AlertInputs, nowMs: number): void {
+  #runAlerts(
+    checksResult: ChecksResult | undefined,
+    componentsResult: ComponentsResult | undefined,
+    nowMs: number,
+  ): void {
     const { ledger, logger } = this.#opts;
-    if (inputs.checks) this.#alertPresence.checks = new Set(inputs.checks.map((c) => c.id));
-    if (inputs.components) {
-      this.#alertPresence.components = new Set(inputs.components.map((c) => c.id));
-    }
+    // Visibility for pruning counts every listed item, also one that cannot be evaluated.
+    if (checksResult) this.#alertPresence.checks = checksResult.listedIds;
+    if (componentsResult) this.#alertPresence.components = componentsResult.listedIds;
+    const inputs: AlertInputs = {
+      checks: checksResult?.states,
+      components: componentsResult?.components,
+    };
     let added: AlertDelivery[];
     try {
       const plan = planAlerts(this.#opts.config.channels, inputs, {

@@ -201,6 +201,16 @@ export interface ChecksResult {
   checks: Check[];
   /** The checks that are also a valid `CheckWithState`; empty unless `withState` was set. */
   states: CheckWithState[];
+  /** The id of every listed item, valid or not: an item that is still listed keeps its alert state. */
+  listedIds: Set<string>;
+}
+
+/** The `id` of a raw feed item when it is an own string data property, else `undefined`. */
+function listedId(raw: unknown): string | undefined {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  // A descriptor read never runs a getter of untrusted input.
+  const value: unknown = Object.getOwnPropertyDescriptor(raw, "id")?.value;
+  return typeof value === "string" ? value : undefined;
 }
 
 /**
@@ -211,10 +221,12 @@ export async function fetchChecksWithState(
   opts: ApiOptions,
   withState: boolean,
 ): Promise<ChecksResult> {
-  const result: ChecksResult = { checks: [], states: [] };
+  const result: ChecksResult = { checks: [], states: [], listedIds: new Set() };
   const items = await getArray(opts, "checks");
   for (const [i, raw] of items.entries()) {
     const path = `checks[${i}]`;
+    const id = listedId(raw);
+    if (id !== undefined) result.listedIds.add(id);
     const validated = validateCheck(raw, path);
     if (!validated.ok) {
       opts.onInvalidCheck?.(i);
@@ -234,17 +246,27 @@ export async function fetchChecks(opts: ApiOptions): Promise<Check[]> {
   return (await fetchChecksWithState(opts, false)).checks;
 }
 
+export interface ComponentsResult {
+  /** The valid components. */
+  components: ComponentWithState[];
+  /** The id of every listed item, valid or not. */
+  listedIds: Set<string>;
+}
+
 /** Reads `/components`; `undefined` on a 404 (an older api). Invalid items are skipped. */
-export async function fetchComponents(opts: ApiOptions): Promise<ComponentWithState[] | undefined> {
+export async function fetchComponents(opts: ApiOptions): Promise<ComponentsResult | undefined> {
   const items = await getArray(opts, "components", true);
   if (items === undefined) return undefined;
   const components: ComponentWithState[] = [];
+  const listedIds = new Set<string>();
   for (const [i, raw] of items.entries()) {
+    const id = listedId(raw);
+    if (id !== undefined) listedIds.add(id);
     const validated = validateComponentWithState(raw, `components[${i}]`);
     if (validated.ok) components.push(validated.value);
     else opts.onInvalidComponent?.(i);
   }
-  return components;
+  return { components, listedIds };
 }
 
 export interface ManualIncidentsResult {

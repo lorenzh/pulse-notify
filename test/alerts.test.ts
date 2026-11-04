@@ -71,7 +71,12 @@ function open(opts: LedgerOptions = {}): Ledger {
 
 function make(
   ledger: Ledger,
-  over: { channels?: ChannelConfig[]; metrics?: Metrics; sleep?: () => Promise<void> } = {},
+  over: {
+    channels?: ChannelConfig[];
+    metrics?: Metrics;
+    sleep?: () => Promise<void>;
+    stateRetentionDays?: number;
+  } = {},
 ) {
   return new Notifier({
     config: { channels: over.channels ?? channels() },
@@ -83,6 +88,9 @@ function make(
     sleep: over.sleep ?? (async () => {}),
     schedule: () => () => {},
     ...(over.metrics ? { metrics: over.metrics } : {}),
+    ...(over.stateRetentionDays === undefined
+      ? {}
+      : { stateRetentionDays: over.stateRetentionDays }),
   });
 }
 
@@ -355,4 +363,54 @@ test("a check failing the second validator keeps its name and is counted", async
     [{ feed: "checks", index: 0, reason: "invalid" }],
   );
   await n.stop();
+});
+
+test("an item still listed but invalid keeps its alert state through pruning", async () => {
+  const DAY_MS = 24 * HOUR_MS;
+  const sites = [
+    {
+      name: "check failing the second validator",
+      kind: "expiry" as const,
+      id: "site-tls",
+      setValid: () => {
+        api.checks = [tls(13, nowMs)];
+      },
+      // A valid Check without state: it fails only the CheckWithState validator.
+      setInvalid: () => {
+        api.checks = [tlsCheck("site-tls", "Site TLS")];
+      },
+    },
+    {
+      name: "component failing its validator",
+      kind: "budget-component" as const,
+      id: "core",
+      setValid: () => {
+        api.components = [componentState("core", "Core", { slo: slo(10) })];
+      },
+      setInvalid: () => {
+        api.components = [{ id: "core", name: 7 } as never];
+      },
+    },
+  ];
+  for (const site of sites) {
+    nowMs = T0;
+    rmSync(join(dir, "state.db"), { force: true });
+    api.checks = [];
+    api.components = [];
+    const ledger = open();
+    const n = make(ledger, {
+      channels: [{ id: "a", type: "webhook", url: rx.url, alerts: ["budget-low", "tls-expiry"] }],
+      stateRetentionDays: 1,
+    });
+    site.setValid();
+    await poll(n);
+    assert.ok(ledger.alertState(site.kind, site.id), `${site.name}: row after the first poll`);
+    nowMs = T0 + 2 * DAY_MS;
+    site.setInvalid();
+    await poll(n);
+    assert.ok(ledger.alertState(site.kind, site.id), `${site.name}: row after the prune`);
+    await n.stop();
+    ledger.close();
+    ledgers.pop();
+  }
 });
