@@ -209,6 +209,7 @@ INSERT INTO channels (id) VALUES ('c');
 test("hostile SQLite files are refused without a change", () => {
   const cases: [string, (db: Database) => void][] = [
     ["user_version 4", (db) => db.run(`${SCHEMA_V3} PRAGMA user_version = 4;`)],
+    ["user_version 5", (db) => db.run(`${SCHEMA_V3} PRAGMA user_version = 5;`)],
     [
       "missing entries table",
       (db) => db.run("CREATE TABLE channels (id TEXT) STRICT; PRAGMA user_version = 3;"),
