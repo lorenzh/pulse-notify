@@ -2,10 +2,10 @@ import { type Counter, createRegistry, type Gauge } from "@lorenzh/pulse-kit";
 
 export type PollOutcome = "ok" | "error";
 export type DeliveryOutcome = "success" | "failure";
-/** The api paths that notify reads every poll. */
-export type FeedName = "incidents" | "checks" | "manual-incidents";
+/** The api paths that notify reads; `components` only with a budget-low subscription. */
+export type FeedName = "incidents" | "checks" | "manual-incidents" | "components";
 
-const FEED_NAMES: readonly FeedName[] = ["incidents", "checks", "manual-incidents"];
+const FEED_NAMES: readonly FeedName[] = ["incidents", "checks", "manual-incidents", "components"];
 
 const POLL_OUTCOMES: readonly PollOutcome[] = ["ok", "error"];
 const DELIVERY_OUTCOMES: readonly DeliveryOutcome[] = ["success", "failure"];

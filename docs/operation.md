@@ -73,7 +73,7 @@ The ledger keeps a per-channel `manualFrom` time: the first good `GET /manual-in
 
 ## Failing feeds
 
-Each poll reads `GET /incidents`, `GET /checks` and `GET /manual-incidents`. The feed names in logs and metrics are these paths. A 404 on `manual-incidents` (an older api) counts as an answer with no manual incidents. When a feed fails, the poll uses the feeds that answered:
+Each poll reads `GET /incidents`, `GET /checks` and `GET /manual-incidents`, and `GET /components` when a channel has `budget-low` in `alerts`. A 404 on `components` means no components and does not fail the poll; any other failure of it counts for `/readyz` like the other feeds and skips only the component budgets. The items of `checks` are also validated with the full check state only when a channel has `alerts`; an item that fails that second check keeps its name and is counted under `pulse_notify_skipped_items_total{feed="checks"}`. The feed names in logs and metrics are these paths. A 404 on `manual-incidents` (an older api) counts as an answer with no manual incidents. When a feed fails, the poll uses the feeds that answered:
 
 | Failing feed       | Skipped this poll                                                                                                                                                  | Still done                                                          |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
@@ -98,6 +98,11 @@ Logs are JSON lines on stderr. Each line has `time` (ISO 8601 UTC), `level` (`de
 | `error` | `ledger recipient write failed`                                     | `channel`, `key`, `error`, `code`, `cause`                                                                      |
 | `error` | `notification delivery failed`                                      | `channel`, `key`, `attempts`, `error`, `code`, `cause`; for a permanent error also `permanent: true` and `note` |
 | `info`  | `old ledger entries pruned`                                         | `count`                                                                                                         |
+| `info`  | `old alert state pruned`                                            | `count`                                                                                                         |
+| `info`  | `incident notifications dropped: channel sends no incidents`        | `channel`, `count` (once per channel with `sendIncidents: false` and count above 0, at start)                   |
+| `warn`  | `component skipped: malformed data`                                 | `feed` (`components`), `index`, `reason` (`invalid`); once per index                                            |
+| `error` | `alert state write failed, the next poll retries`                   | `error`                                                                                                         |
+| `error` | `incident seed failed, the next poll retries`                       | `channel`, `error`                                                                                              |
 | `info`  | `ledger migrated`                                                   | `from`, `entries`, `backup`                                                                                     |
 | `error` | `ledger prune failed, the next prune retries`                       | `error`                                                                                                         |
 | `info`  | `reminders enabled: due reminders of open incidents skipped`        | `channel`                                                                                                       |

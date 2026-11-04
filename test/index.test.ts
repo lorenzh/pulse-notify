@@ -349,3 +349,51 @@ test("entry point: occupied health port prints one line and exits 2", async () =
     /^pulse-notify: cannot listen on 127\.0\.0\.1:\d+ \(PULSE_HEALTH_HOST\/PULSE_HEALTH_PORT\): [^\n]+\n$/,
   );
 });
+
+test("a failing notifier constructor closes the ledger and frees the lock", async () => {
+  const configPath = join(dir, "c-ctor.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({ channels: [{ id: "log", type: "file", path: join(dir, "o.jsonl") }] }),
+  );
+  const env = { PULSE_NOTIFY_CONFIG: configPath, PULSE_NOTIFY_STATE: join(dir, "ctor.db") };
+  const boom = new Error(
+    "cannot drop pending incident notifications of channels with sendIncidents false",
+  );
+  assert.throws(
+    () =>
+      main(env, {
+        createNotifier: (): Stoppable => {
+          throw boom;
+        },
+      }),
+    (err) => err === boom,
+  );
+  const running = main(env, { createNotifier: (): Stoppable => ({ start() {}, async stop() {} }) });
+  await running.stop();
+});
+
+test("PULSE_NOTIFY_BUDGET_THRESHOLD outside 0..100 stops startup", () => {
+  const configPath = join(dir, "c-threshold.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({ channels: [{ id: "log", type: "file", path: join(dir, "o.jsonl") }] }),
+  );
+  for (const value of ["101", "-1", "25.5", "abc", "25abc"]) {
+    assert.throws(
+      () =>
+        main(
+          {
+            PULSE_NOTIFY_CONFIG: configPath,
+            PULSE_NOTIFY_STATE: join(dir, "threshold.db"),
+            PULSE_NOTIFY_BUDGET_THRESHOLD: value,
+          },
+          { createNotifier: (): Stoppable => ({ start() {}, async stop() {} }) },
+        ),
+      (err) =>
+        err instanceof StartupError &&
+        err.message === "PULSE_NOTIFY_BUDGET_THRESHOLD: must be an integer from 0 to 100" &&
+        !err.message.includes(value),
+    );
+  }
+});

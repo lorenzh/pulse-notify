@@ -4,7 +4,13 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StartupError } from "@lorenzh/pulse-kit";
-import { ConfigError, loadConfigFile, loadSettings, parseConfig } from "../src/config.ts";
+import {
+  ConfigError,
+  loadBudgetThreshold,
+  loadConfigFile,
+  loadSettings,
+  parseConfig,
+} from "../src/config.ts";
 
 const hook = { id: "h", type: "webhook", url: "https://example.com/x" };
 const file = { id: "f", type: "file", path: "./out.jsonl" };
@@ -438,4 +444,68 @@ test("timer settings and the lock lease have an upper bound; byte limits do not"
     loadSettings({ ...base, PULSE_NOTIFY_API_MAX_BYTES: "3000000000" }).apiMaxBytes,
     3000000000,
   );
+});
+
+const ALERTS_TEXT = 'alerts must be an array of "budget-low", "tls-expiry" or "domain-expiry"';
+
+test("alerts and sendIncidents parse on every channel type, duplicates are ignored", () => {
+  const config = parseConfig({
+    channels: [
+      { ...hook, alerts: ["budget-low", "budget-low", "tls-expiry"], sendIncidents: false },
+      { ...file, alerts: [] },
+    ],
+  });
+  assert.deepEqual(config.channels[0]?.alerts, ["budget-low", "tls-expiry"]);
+  assert.equal(config.channels[0]?.sendIncidents, false);
+  assert.deepEqual(config.channels[1]?.alerts, []);
+  assert.equal("sendIncidents" in (config.channels[1] ?? {}), false);
+  for (const type of ["slack", "teams", "email"]) {
+    const base =
+      type === "email"
+        ? {
+            id: "x",
+            type,
+            smtp: { host: "localhost", port: 25 },
+            from: "a@example.com",
+            to: ["b@example.com"],
+          }
+        : { id: "x", type, urlEnv: "U" };
+    const parsed = parseConfig({ channels: [{ ...base, alerts: ["domain-expiry"] }] }, "c", {
+      env: { U: "https://hooks.example.com/x" },
+      readFile: () => "",
+    });
+    assert.deepEqual(parsed.channels[0]?.alerts, ["domain-expiry"]);
+  }
+});
+
+test("alerts and sendIncidents errors are fixed and never echo the value", () => {
+  const cases: [Record<string, unknown>, string][] = [
+    [{ alerts: "budget-low" }, ALERTS_TEXT],
+    [{ alerts: ["secret-value"] }, ALERTS_TEXT],
+    [{ alerts: [1] }, ALERTS_TEXT],
+    [{ alerts: null }, ALERTS_TEXT],
+    [{ sendIncidents: "no" }, "sendIncidents must be true or false"],
+    [{ sendIncidents: 0 }, "sendIncidents must be true or false"],
+    [{ sendIncidents: false }, "sendIncidents false needs alerts"],
+    [{ sendIncidents: false, alerts: [] }, "sendIncidents false needs alerts"],
+    [
+      { sendIncidents: false, alerts: ["budget-low"], remindEverySeconds: 60 },
+      "remindEverySeconds needs sendIncidents",
+    ],
+  ];
+  for (const [extra, text] of cases) {
+    assert.throws(
+      () => parseConfig({ channels: [{ ...hook, ...extra }] }),
+      (err) =>
+        err instanceof ConfigError &&
+        err.message === `channel "h": ${text}` &&
+        !err.message.includes("secret-value"),
+    );
+  }
+});
+
+test("the budget threshold defaults to 25 and accepts 0 and 100", () => {
+  assert.equal(loadBudgetThreshold({}), 25);
+  assert.equal(loadBudgetThreshold({ PULSE_NOTIFY_BUDGET_THRESHOLD: "0" }), 0);
+  assert.equal(loadBudgetThreshold({ PULSE_NOTIFY_BUDGET_THRESHOLD: "100" }), 100);
 });

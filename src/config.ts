@@ -156,8 +156,24 @@ function baseOf(
   raw: RawChannel,
 ): Pick<
   ChannelConfig,
-  "id" | "checks" | "excludeChecks" | "components" | "excludeComponents" | "remindEverySeconds"
+  | "id"
+  | "checks"
+  | "excludeChecks"
+  | "components"
+  | "excludeComponents"
+  | "remindEverySeconds"
+  | "alerts"
+  | "sendIncidents"
 > {
+  const alerts = raw.alerts === undefined ? undefined : [...new Set(raw.alerts)];
+  if (raw.sendIncidents === false) {
+    if (alerts === undefined || alerts.length === 0) {
+      throw new ConfigError(`channel "${raw.id}": sendIncidents false needs alerts`);
+    }
+    if (raw.remindEverySeconds !== undefined) {
+      throw new ConfigError(`channel "${raw.id}": remindEverySeconds needs sendIncidents`);
+    }
+  }
   return {
     id: raw.id,
     ...(raw.checks === undefined ? {} : { checks: raw.checks }),
@@ -165,6 +181,8 @@ function baseOf(
     ...(raw.components === undefined ? {} : { components: raw.components }),
     ...(raw.excludeComponents === undefined ? {} : { excludeComponents: raw.excludeComponents }),
     ...(raw.remindEverySeconds === undefined ? {} : { remindEverySeconds: raw.remindEverySeconds }),
+    ...(alerts === undefined ? {} : { alerts }),
+    ...(raw.sendIncidents === undefined ? {} : { sendIncidents: raw.sendIncidents }),
   };
 }
 
@@ -353,6 +371,18 @@ function parseSmtpClientName(env: Env): string | undefined {
     throw new StartupError(`${name}: must be a host name or an address literal`, { setting: name });
   }
   return value;
+}
+
+export const DEFAULT_BUDGET_THRESHOLD = 25;
+
+/** Read apart from `loadSettings`: a budget alert below this percent of error budget left. */
+export function loadBudgetThreshold(env: Env): number {
+  return readInt(env, "PULSE_NOTIFY_BUDGET_THRESHOLD", {
+    fallback: DEFAULT_BUDGET_THRESHOLD,
+    min: 0,
+    max: 100,
+    describe: "must be an integer from 0 to 100",
+  });
 }
 
 export function loadLockLeaseSeconds(env: Env): number {

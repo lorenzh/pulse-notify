@@ -38,6 +38,9 @@ const address = (key: string): z.ZodString =>
       `${key} must hold an email address`,
     );
 
+const ALERT_EVENTS = ["budget-low", "tls-expiry", "domain-expiry"] as const;
+const ALERTS_MESSAGE = 'alerts must be an array of "budget-low", "tls-expiry" or "domain-expiry"';
+
 const baseShape = {
   id: z.string(),
   checks: checkList("checks"),
@@ -49,6 +52,8 @@ const baseShape = {
     .int("remindEverySeconds must be an integer of at least 60")
     .min(60, "remindEverySeconds must be an integer of at least 60")
     .optional(),
+  alerts: z.array(z.enum(ALERT_EVENTS, ALERTS_MESSAGE), ALERTS_MESSAGE).optional(),
+  sendIncidents: z.boolean("sendIncidents must be true or false").optional(),
 };
 
 const messageShape = {

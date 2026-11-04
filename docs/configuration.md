@@ -4,24 +4,25 @@ pulse-notify reads environment variables and one JSON config file. Both are read
 
 ## Environment variables
 
-| Variable                               | Default                 | Meaning                                                                                                                                                                               |
-| -------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PULSE_NOTIFY_CONFIG`                  | required                | Path to the channel config file                                                                                                                                                       |
-| `PULSE_API_URL`                        | `http://localhost:3000` | pulse-api base URL                                                                                                                                                                    |
-| `PULSE_NOTIFY_STATE`                   | `./notify-state.json`   | Delivery ledger, a SQLite database with `-wal` and `-shm` files beside it (the name keeps `.json`), see [operation.md](operation.md)                                                  |
-| `PULSE_NOTIFY_POLL_MS`                 | `5000`                  | Poll interval in milliseconds, from 1 to 2147483647                                                                                                                                   |
-| `PULSE_NOTIFY_RETRY_DELAY_MS`          | `1000`                  | Initial delay before the first retry in milliseconds, at most 2147483647; it doubles per retry                                                                                        |
-| `PULSE_NOTIFY_RETRY_MAX_DELAY_MS`      | `60000`                 | Cap of the delay between attempts, at least the initial delay and at most 2147483647                                                                                                  |
-| `PULSE_NOTIFY_RETRY_ATTEMPTS`          | `12`                    | Total attempts per event; `0` retries without end                                                                                                                                     |
-| `PULSE_NOTIFY_TIMEOUT_MS`              | `5000`                  | Timeout per webhook attempt and per api request, from 1 to 2147483647. It covers reading the response body. For an email channel it covers one whole attempt, from connect to `QUIT`. |
-| `PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS` | `5`                     | `/readyz` returns 503 after this many failed polls in a row, at least 1. `/healthz` does not use it. See [operation.md](operation.md#health-and-metrics).                             |
-| `PULSE_NOTIFY_LOCK_LEASE_SECONDS`      | `60`                    | Lease of the state file lock, from 30 to 12884901. The holder refreshes it every lease/6. See [operation.md](operation.md#state-file-lock).                                           |
-| `PULSE_NOTIFY_STATE_RETENTION_DAYS`    | `30`                    | Settled ledger entries older than this are pruned, at least 1. See [operation.md](operation.md#state-the-delivery-ledger).                                                            |
-| `PULSE_NOTIFY_API_MAX_BYTES`           | `5242880`               | Largest API response body in bytes (5 MiB), at least 1. A larger body fails the poll.                                                                                                 |
-| `PULSE_NOTIFY_SMTP_CLIENT_NAME`        | host name               | Name sent with `EHLO` by email channels: a host name or an address literal. See [email.md](channels/email.md).                                                                        |
-| `PULSE_LOG_LEVEL`                      | `info`                  | `debug`, `info`, `warn` or `error`. Another value stops startup.                                                                                                                      |
-| `PULSE_HEALTH_PORT`                    | unset                   | Port of the health and metrics listener, see [operation.md](operation.md). Unset means no listener.                                                                                   |
-| `PULSE_HEALTH_HOST`                    | `127.0.0.1`             | Address of that listener. The Docker image sets `0.0.0.0` and port `9100`; its healthcheck follows `PULSE_HEALTH_PORT`.                                                               |
+| Variable                               | Default                 | Meaning                                                                                                                                                                                                                     |
+| -------------------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PULSE_NOTIFY_CONFIG`                  | required                | Path to the channel config file                                                                                                                                                                                             |
+| `PULSE_API_URL`                        | `http://localhost:3000` | pulse-api base URL                                                                                                                                                                                                          |
+| `PULSE_NOTIFY_STATE`                   | `./notify-state.json`   | Delivery ledger, a SQLite database with `-wal` and `-shm` files beside it (the name keeps `.json`), see [operation.md](operation.md)                                                                                        |
+| `PULSE_NOTIFY_POLL_MS`                 | `5000`                  | Poll interval in milliseconds, from 1 to 2147483647                                                                                                                                                                         |
+| `PULSE_NOTIFY_RETRY_DELAY_MS`          | `1000`                  | Initial delay before the first retry in milliseconds, at most 2147483647; it doubles per retry                                                                                                                              |
+| `PULSE_NOTIFY_RETRY_MAX_DELAY_MS`      | `60000`                 | Cap of the delay between attempts, at least the initial delay and at most 2147483647                                                                                                                                        |
+| `PULSE_NOTIFY_RETRY_ATTEMPTS`          | `12`                    | Total attempts per event; `0` retries without end                                                                                                                                                                           |
+| `PULSE_NOTIFY_TIMEOUT_MS`              | `5000`                  | Timeout per webhook attempt and per api request, from 1 to 2147483647. It covers reading the response body. For an email channel it covers one whole attempt, from connect to `QUIT`.                                       |
+| `PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS` | `5`                     | `/readyz` returns 503 after this many failed polls in a row, at least 1. `/healthz` does not use it. See [operation.md](operation.md#health-and-metrics).                                                                   |
+| `PULSE_NOTIFY_LOCK_LEASE_SECONDS`      | `60`                    | Lease of the state file lock, from 30 to 12884901. The holder refreshes it every lease/6. See [operation.md](operation.md#state-file-lock).                                                                                 |
+| `PULSE_NOTIFY_STATE_RETENTION_DAYS`    | `30`                    | Settled ledger entries older than this are pruned, at least 1. See [operation.md](operation.md#state-the-delivery-ledger).                                                                                                  |
+| `PULSE_NOTIFY_BUDGET_THRESHOLD`        | `25`                    | A `budget-low` warning fires when the error budget left is strictly below this percent, an integer from 0 to 100. A change takes effect at the next start and resets no stored state. See [warnings](channels.md#warnings). |
+| `PULSE_NOTIFY_API_MAX_BYTES`           | `5242880`               | Largest API response body in bytes (5 MiB), at least 1. A larger body fails the poll.                                                                                                                                       |
+| `PULSE_NOTIFY_SMTP_CLIENT_NAME`        | host name               | Name sent with `EHLO` by email channels: a host name or an address literal. See [email.md](channels/email.md).                                                                                                              |
+| `PULSE_LOG_LEVEL`                      | `info`                  | `debug`, `info`, `warn` or `error`. Another value stops startup.                                                                                                                                                            |
+| `PULSE_HEALTH_PORT`                    | unset                   | Port of the health and metrics listener, see [operation.md](operation.md). Unset means no listener.                                                                                                                         |
+| `PULSE_HEALTH_HOST`                    | `127.0.0.1`             | Address of that listener. The Docker image sets `0.0.0.0` and port `9100`; its healthcheck follows `PULSE_HEALTH_PORT`.                                                                                                     |
 
 The schedule is in [channels.md](channels.md#delivery-and-retries).
 
@@ -59,15 +60,17 @@ Top level:
 
 Every channel:
 
-| Key                  | Required | Meaning                                                                                                              |
-| -------------------- | -------- | -------------------------------------------------------------------------------------------------------------------- |
-| `id`                 | yes      | Non-empty string, unique in the file. The delivery ledger is keyed by it.                                            |
-| `type`               | yes      | `webhook`, `file`, `slack`, `teams` or `email`                                                                       |
-| `checks`             | no       | Check ids or `*` globs. Absent or empty means all checks. Unknown ids are allowed and match nothing.                 |
-| `excludeChecks`      | no       | Check ids or `*` globs to skip. Wins over `checks`. See [routing](channels.md#routing).                              |
-| `components`         | no       | Component ids for manual incidents. Absent or empty means all. See [manual incidents](channels.md#manual-incidents). |
-| `excludeComponents`  | no       | Component ids whose manual incidents are skipped. Wins over `components`.                                            |
-| `remindEverySeconds` | no       | Integer of at least 60. Sends a `reminder` while an incident is open. See [reminders](channels.md#reminders).        |
+| Key                  | Required | Meaning                                                                                                                                                      |
+| -------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `id`                 | yes      | Non-empty string, unique in the file. The delivery ledger is keyed by it.                                                                                    |
+| `type`               | yes      | `webhook`, `file`, `slack`, `teams` or `email`                                                                                                               |
+| `checks`             | no       | Check ids or `*` globs. Absent or empty means all checks. Unknown ids are allowed and match nothing.                                                         |
+| `excludeChecks`      | no       | Check ids or `*` globs to skip. Wins over `checks`. See [routing](channels.md#routing).                                                                      |
+| `components`         | no       | Component ids for manual incidents. Absent or empty means all. See [manual incidents](channels.md#manual-incidents).                                         |
+| `excludeComponents`  | no       | Component ids whose manual incidents are skipped. Wins over `components`.                                                                                    |
+| `remindEverySeconds` | no       | Integer of at least 60. Sends a `reminder` while an incident is open. See [reminders](channels.md#reminders).                                                |
+| `alerts`             | no       | Array of `"budget-low"`, `"tls-expiry"`, `"domain-expiry"`. Absent or empty means no warnings; duplicates are ignored. See [warnings](channels.md#warnings). |
+| `sendIncidents`      | no       | `true` (default) or `false`.`false` needs a non-empty `alerts` and no `remindEverySeconds`; the channel then gets only warnings.                             |
 
 Per type:
 
@@ -82,5 +85,7 @@ Per type:
 Unknown keys are rejected at startup, for example `notify.json: unknown key "check" in channels[0]`. Check the spelling of `checks`. The place is a path, so an unknown key inside the SMTP block reads `notify.json: unknown key "extra" in channels[0].smtp`. Details of each channel are in [channels.md](channels.md).
 
 Secrets and credential URLs (Slack, Teams, SMTP password, webhook signing secret) are read from environment variables or files, see [secrets](channels.md#secrets). Relative secret file paths are relative to the working directory. Do not put secrets in a webhook `url`: the config file holds it in clear text. pulse-notify does not log URLs.
+
+Config errors for the new keys have fixed texts and never repeat the value: `channel "<id>": alerts must be an array of "budget-low", "tls-expiry" or "domain-expiry"`, `channel "<id>": sendIncidents must be true or false`, `channel "<id>": sendIncidents false needs alerts` and `channel "<id>": remindEverySeconds needs sendIncidents`.
 
 An invalid config stops startup with `pulse-notify: <message>` and exit code 2. The messages are listed in [troubleshooting.md](troubleshooting.md).

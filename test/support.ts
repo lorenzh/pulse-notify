@@ -80,6 +80,8 @@ export interface FakeApi {
   checks: Check[];
   /** `undefined` answers 404, like an older api. */
   manualIncidents: ManualIncident[] | undefined;
+  /** `undefined` (the default) answers 404, like an older api. */
+  components: ComponentWithState[] | undefined;
   failing: boolean;
   /** Answers 500 on `/manual-incidents` only. */
   failingManual: boolean;
@@ -104,6 +106,7 @@ export async function startFakeApi(): Promise<FakeApi> {
     incidents: [],
     checks: [],
     manualIncidents: [],
+    components: undefined,
     failing: false,
     failingManual: false,
     failingPaths: new Map(),
@@ -130,7 +133,9 @@ export async function startFakeApi(): Promise<FakeApi> {
     else if (req.url === "/manual-incidents" && api.manualIncidents) {
       res.end(JSON.stringify(api.manualIncidents));
     } else if (req.url === "/checks") res.end(JSON.stringify(api.checks));
-    else {
+    else if (req.url === "/components" && api.components) {
+      res.end(JSON.stringify(api.components));
+    } else {
       res.statusCode = 404;
       res.end("{}");
     }

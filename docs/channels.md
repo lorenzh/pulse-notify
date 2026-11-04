@@ -151,8 +151,13 @@ Payload (webhook body and file line):
 
 `time` is the poll time of the event. `subject.kind` is `component` only for `budget-low`. `budget` holds the raw api values (not rounded) and the threshold in force.
 
+Evaluation runs in each poll after the incident processing. Budget of checks needs a good `/checks` read; budget of components needs `/components`, which is read only when a channel has `budget-low` (a 404, an older api, means no components). Expiry needs `/checks`. A kind is skipped for the whole poll while any channel that subscribes to it is not yet in the ledger, so a new channel is seeded first. All alert changes of one poll and the `pending` entries of the routed channels are one ledger transaction; the deliveries start only after it committed. A failed write logs `alert state write failed, the next poll retries` and changes nothing. An event with no routed channel still advances the alert state.
+
+A channel with `sendIncidents: false` sends no incident event. At start, before anything is sent, its pending incident entries (also held reminders and legacy keys) are set to `dropped` in one transaction and logged as `incident notifications dropped: channel sends no incidents` with `channel` and `count`. If that transaction fails, startup fails with `cannot drop pending incident notifications of channels with sendIncidents false` and the ledger is unchanged. Each poll records the incident keys that it would send as `seeded`, so switching back to `sendIncidents: true` sends only events that are new after that start. A failed seed logs `incident seed failed, the next poll retries`. Pending warnings stay and are resent; `failed` incident entries stay as a record, and a `failed resend` of one is dropped at the next start.
+
 Known limits:
 
+- Incidents of a warning-only channel that were pending at the switch are dropped, not sent.
 - A renewal that keeps the days left at 14 or below (for example a new certificate valid for 10 days) is not seen; that episode gets no new warnings.
 - A channel that subscribes later, or whose filters widen, gets the next event that becomes due, not past ones.
 - A warning can be up to `2 × intervalMs` late, because notify reads the newest result of the check.
