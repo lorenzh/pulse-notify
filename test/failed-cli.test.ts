@@ -6,9 +6,11 @@ import { join } from "node:path";
 import { runFailed } from "../src/failed-cli.ts";
 import { main, runCli } from "../src/index.ts";
 import { Ledger } from "../src/ledger.ts";
-import type { Notification } from "../src/types.ts";
+import type { IncidentNotification } from "../src/types.ts";
 import {
   asRecord,
+  budgetNote,
+  expiryNote,
   type FakeApi,
   httpCheck,
   incident,
@@ -37,7 +39,7 @@ afterEach(async () => {
   await rx.close();
 });
 
-function note(key: string, event: Notification["event"] = "opened"): Notification {
+function note(key: string, event: IncidentNotification["event"] = "opened"): IncidentNotification {
   return {
     key,
     event,
@@ -281,3 +283,27 @@ function savedStatus(path: string, channelId: string, key: string): string | und
     ledger.close();
   }
 }
+
+test("failed list and resend work for the three warning events and keep their keys", () => {
+  const warnings = [
+    budgetNote(),
+    expiryNote(),
+    expiryNote({ event: "domain-expiry", key: "expiry:1:3:cccccccccccccccccccccccccccccccc" }),
+  ];
+  const ledger = new Ledger(state, { now: () => Date.UTC(2026, 0, 2) });
+  for (const w of warnings) {
+    ledger.claim("hook", w.key, w);
+    ledger.settle("hook", w.key, "failed");
+  }
+  assert.deepEqual(runFailed(["list"], ledger).lines, [
+    "hook\tbudget:check:1767268800000:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t2026-01-02T00:00:00.000Z\tbudget-low\tpayload",
+    "hook\texpiry:1767268800000:14:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t2026-01-02T00:00:00.000Z\ttls-expiry\tpayload",
+    "hook\texpiry:1:3:cccccccccccccccccccccccccccccccc\t2026-01-02T00:00:00.000Z\tdomain-expiry\tpayload",
+  ]);
+  const key = "expiry:1767268800000:14:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  assert.equal(runFailed(["resend", key], ledger).code, 0);
+  ledger.close();
+  const reopened = new Ledger(state);
+  assert.deepEqual(reopened.pending(), [{ channelId: "hook", key, notification: warnings[1] }]);
+  reopened.close();
+});

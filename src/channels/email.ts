@@ -9,7 +9,7 @@ import {
   type SendMail,
   type SendMailResult,
 } from "./mailer.ts";
-import { cleanText, type MessageParts, messageParts } from "./message.ts";
+import { cleanText, type MessageParts, messageParts, type WarningParts } from "./message.ts";
 
 export interface EmailOptions {
   sendMail: SendMail;
@@ -22,7 +22,16 @@ export interface EmailOptions {
   hostname?: (() => string) | undefined;
 }
 
+function warningBody(parts: MessageParts, warning: WarningParts): string {
+  const lines = [`${parts.state}: ${parts.name}`, "", `${warning.subjectKind}: ${parts.name}`];
+  for (const fact of warning.facts) lines.push(`${fact.title}: ${fact.value}`);
+  lines.push(`Time: ${parts.time}`);
+  if (parts.link !== undefined) lines.push(`Status: ${parts.link}`);
+  return `${lines.join("\n")}\n`;
+}
+
 function bodyText(parts: MessageParts): string {
+  if (parts.warning) return warningBody(parts, parts.warning);
   const m = parts.manual;
   const lines = m
     ? [`${parts.state}: ${parts.name}`, "", `Incident: ${parts.name}`]

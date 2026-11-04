@@ -1,15 +1,21 @@
 import { Database } from "bun:sqlite";
 import {
   closeSync,
+  copyFileSync,
+  existsSync,
   fsyncSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
   readSync,
   renameSync,
+  rmSync,
+  statSync,
   unlinkSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { isRecord, writeFileAtomicSync } from "@lorenzh/pulse-kit";
 import type { Notification, RecipientProgress } from "./types.ts";
 
@@ -22,7 +28,10 @@ export type LedgerStatus = "seeded" | "pending" | "delivered" | "failed" | "drop
 const STATUSES: readonly LedgerStatus[] = ["seeded", "pending", "delivered", "failed", "dropped"];
 
 /** Newest format this version reads and the only one it writes (a SQLite `user_version`). */
-export const LEDGER_VERSION = 3;
+export const LEDGER_VERSION = 4;
+
+/** The previous SQLite format; such a file is migrated at open. */
+const PREVIOUS_VERSION = 3;
 
 const SCHEMA = `
 CREATE TABLE channels (
@@ -41,10 +50,57 @@ CREATE TABLE entries (
   recipients TEXT,
   PRIMARY KEY (channel_id, key)
 ) STRICT;
+CREATE TABLE alert_state (
+  kind TEXT NOT NULL CHECK (kind IN ('budget-check','budget-component','expiry')),
+  subject_id TEXT NOT NULL,
+  last_event_at INTEGER,
+  stage INTEGER CHECK (stage IN (14, 3)),
+  episode_at INTEGER,
+  observed_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (kind, subject_id)
+) STRICT;
 PRAGMA user_version = ${LEDGER_VERSION};
 `;
 
 const SQLITE_HEADER = "SQLite format 3\0";
+
+/**
+ * Runs `read` on a read-only connection to a private copy of `path` with its `-wal` and `-shm`
+ * files. SQLite rewrites the WAL index in `-shm` even on a read-only connection, so reading the
+ * original would change a file that is then refused. The copy lives in a 0700 temp directory.
+ */
+function readSnapshot<T>(path: string, read: (db: Database) => T): T {
+  const dir = mkdtempSync(join(tmpdir(), "notify-ledger-read-"));
+  try {
+    const copy = join(dir, "state");
+    copyFileSync(path, copy);
+    for (const suffix of ["-wal", "-shm"]) {
+      if (existsSync(`${path}${suffix}`)) copyFileSync(`${path}${suffix}`, `${copy}${suffix}`);
+    }
+    const db = new Database(copy, { readonly: true });
+    try {
+      return read(db);
+    } finally {
+      db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+interface LoadedRows {
+  channels: Map<string, ChannelState>;
+  alerts: AlertMirror;
+}
+
+/** A WAL checkpoint that could not move every committed frame into the database file. */
+export class LedgerCheckpointError extends Error {
+  override readonly name = "LedgerCheckpointError";
+  constructor() {
+    super("ledger checkpoint was blocked");
+  }
+}
 
 /** A mutation on a ledger after `close()`. Nothing was written. */
 export class LedgerClosedError extends Error {
@@ -104,10 +160,49 @@ export interface FailedEntry {
   recipients?: RecipientProgress;
 }
 
+export type AlertKind = "budget-check" | "budget-component" | "expiry";
+
+const ALERT_KINDS: readonly AlertKind[] = ["budget-check", "budget-component", "expiry"];
+
+export type ExpiryStage = 14 | 3;
+
+/** The stored alert state of one subject. Budget rows use `lastEventAt`, expiry rows the rest. */
+export interface AlertState {
+  lastEventAt?: number | undefined;
+  /** `undefined` is the stage `none`. */
+  stage?: ExpiryStage | undefined;
+  episodeAt?: number | undefined;
+  observedAt?: number | undefined;
+  /** Epoch milliseconds of the commit of the last change. */
+  updatedAt: number;
+}
+
+/** A new value for the row of `kind`/`subjectId`; `updatedAt` is set at the commit. */
+export interface AlertUpsert {
+  kind: AlertKind;
+  subjectId: string;
+  state: Omit<AlertState, "updatedAt">;
+}
+
+/** A warning to store as `pending` on a channel that has no entry with its key. */
+export interface AlertDelivery {
+  channelId: string;
+  key: string;
+  notification: Notification;
+}
+
+/** The subjects of the last good read of each feed in this run; `undefined` before one. */
+export interface AlertFeedPresence {
+  checks?: ReadonlySet<string> | undefined;
+  components?: ReadonlySet<string> | undefined;
+}
+
+const WARNING_EVENTS: ReadonlySet<string> = new Set(["budget-low", "tls-expiry", "domain-expiry"]);
+
 export type ResendResult = "resent" | "no-payload" | "not-failed";
 
 export interface LedgerMigration {
-  from: 1 | 2;
+  from: 1 | 2 | 3;
   entries: number;
   backup: string;
 }
@@ -121,6 +216,8 @@ export interface LedgerOptions {
     beforeCommit?: () => void;
     /** Runs after the migration backup and before the rename; a throw simulates a crash. */
     beforePublish?: () => void;
+    /** Runs after the sidecars of the path are removed and before the rename; a throw simulates a crash. */
+    afterSidecars?: () => void;
   };
 }
 
@@ -287,6 +384,49 @@ function readEntryRow(row: Record<string, unknown>): [string, string, LedgerEntr
   return [channel_id, key, { status, at, payload, recipients }];
 }
 
+function isStage(raw: unknown): raw is ExpiryStage | null {
+  return raw === null || raw === 14 || raw === 3;
+}
+
+function isAlertKind(raw: unknown): raw is AlertKind {
+  return ALERT_KINDS.some((k) => k === raw);
+}
+
+function readAlertRow(row: Record<string, unknown>): [AlertKind, string, AlertState] | undefined {
+  const { kind, subject_id, last_event_at, stage, episode_at, observed_at, updated_at } = row;
+  if (!isAlertKind(kind) || typeof subject_id !== "string" || !isStage(stage)) return undefined;
+  if (!isOptionalInteger(last_event_at) || !isOptionalInteger(episode_at)) return undefined;
+  if (!isOptionalInteger(observed_at) || !isOptionalInteger(updated_at)) return undefined;
+  if (updated_at === null) return undefined;
+  return [
+    kind,
+    subject_id,
+    {
+      lastEventAt: last_event_at ?? undefined,
+      stage: stage ?? undefined,
+      episodeAt: episode_at ?? undefined,
+      observedAt: observed_at ?? undefined,
+      updatedAt: updated_at,
+    },
+  ];
+}
+
+type AlertMirror = Map<AlertKind, Map<string, AlertState>>;
+
+function emptyAlerts(): AlertMirror {
+  return new Map(ALERT_KINDS.map((k) => [k, new Map<string, AlertState>()]));
+}
+
+function loadAlerts(db: Database, path: string): AlertMirror {
+  const alerts = emptyAlerts();
+  for (const row of db.query("SELECT * FROM alert_state ORDER BY rowid").all()) {
+    const parsed = isRecord(row) ? readAlertRow(row) : undefined;
+    if (!parsed) throw unsupported(path);
+    alerts.get(parsed[0])?.set(parsed[1], parsed[2]);
+  }
+  return alerts;
+}
+
 function loadRows(db: Database, path: string): Map<string, ChannelState> {
   const channels = new Map<string, ChannelState>();
   for (const row of db.query("SELECT * FROM channels ORDER BY rowid").all()) {
@@ -346,6 +486,32 @@ function readHeader(path: string): string | undefined {
   }
 }
 
+function walSize(path: string): number {
+  try {
+    return statSync(`${path}-wal`).size;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw err;
+  }
+}
+
+/**
+ * Moves every committed WAL frame into the database file. Throws `LedgerCheckpointError` and
+ * deletes nothing unless the main file alone then holds every committed row.
+ */
+function checkpoint(path: string): void {
+  const db = new Database(path, { create: false, readwrite: true });
+  let isComplete = false;
+  try {
+    db.run("PRAGMA synchronous = FULL");
+    const row = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get();
+    isComplete = isRecord(row) && row.busy === 0 && row.log === row.checkpointed;
+  } finally {
+    db.close();
+  }
+  if (!isComplete || walSize(path) > 0) throw new LedgerCheckpointError();
+}
+
 function writeRows(db: Database, channels: Map<string, ChannelState>): void {
   const insertChannel = db.query(
     "INSERT INTO channels (id, reminders_from, manual_from, check_routing, component_routing) VALUES (?, ?, ?, ?, ?)",
@@ -374,13 +540,14 @@ function json(value: object | undefined): string | null {
 }
 
 /**
- * Builds a format-3 database at `<path>.migrating` in rollback-journal mode and renames it over
+ * Builds a format-4 database at `<path>.migrating` in rollback-journal mode and renames it over
  * `path`. Sidecars at `path` belong to an older database and would be replayed: they go first.
  */
 function publish(
   path: string,
   channels: Map<string, ChannelState>,
   beforeRename?: () => void,
+  afterSidecars?: () => void,
 ): void {
   const building = `${path}.migrating`;
   // SQLite creates a new file with the default mode and gives its journal, WAL and shm files
@@ -395,6 +562,7 @@ function publish(
   }
   beforeRename?.();
   removeDatabaseFiles(path, false);
+  afterSidecars?.();
   renameSync(building, path);
   syncDir(dirname(path));
 }
@@ -404,11 +572,12 @@ const INCIDENT_KEY = /^(\d+):/;
 const MANUAL_KEY = /^manual:(\d+):/;
 
 /**
- * Durable delivery ledger: a SQLite database (format 3) in WAL mode with `synchronous = FULL`.
+ * Durable delivery ledger: a SQLite database (format 4) in WAL mode with `synchronous = FULL`.
  *
  * Every mutation is one transaction that writes only the rows it changes; memory changes only
  * after the commit. A failed transaction rolls back, throws and leaves memory unchanged.
- * Reads come from a mirror loaded at open. A JSON ledger (format 1 or 2) is migrated at open.
+ * Reads come from a mirror loaded at open. A JSON ledger (format 1 or 2) and a format-3
+ * database are migrated at open.
  *
  * `manualFrom` marks a channel whose manual incidents were seeded on the first good manual read;
  * a channel without it gets the manual keys seeded quietly before manual detection runs.
@@ -419,8 +588,9 @@ export class Ledger {
   readonly #beforeCommit: (() => void) | undefined;
   readonly #db: Database;
   readonly #channels: Map<string, ChannelState>;
+  readonly #alerts: AlertMirror;
   #isClosed = false;
-  /** Set when this open migrated a JSON ledger. */
+  /** Set when this open migrated a JSON ledger or a format-3 database. */
   readonly migration: LedgerMigration | undefined;
 
   constructor(path: string, opts: LedgerOptions = {}) {
@@ -429,35 +599,66 @@ export class Ledger {
     this.#beforeCommit = opts.hooks?.beforeCommit;
     removeDatabaseFiles(`${path}.migrating`, true);
     const header = readHeader(path);
+    let loaded: LoadedRows | undefined;
     if (header === undefined) {
       mkdirSync(dirname(path), { recursive: true });
       publish(path, new Map());
+      loaded = { channels: new Map(), alerts: emptyAlerts() };
     } else if (header !== SQLITE_HEADER) {
-      this.migration = this.#migrateJson(opts.hooks?.beforePublish);
+      this.migration = this.#migrateJson(opts.hooks);
+    } else {
+      loaded = this.#probe();
+      if (loaded === undefined) this.migration = this.#migrateV3(opts.hooks);
     }
-    const opened = this.#open();
+    const opened = this.#open(loaded);
     this.#db = opened.db;
     this.#channels = opened.channels;
+    this.#alerts = opened.alerts;
   }
 
-  #migrateJson(beforePublish: (() => void) | undefined): LedgerMigration {
+  #migrateJson(hooks: LedgerOptions["hooks"]): LedgerMigration {
     const bytes = readFileSync(this.#path);
     const data = parseJson(JSON.parse(bytes.toString("utf8")), this.#now(), this.#path);
     const backup = `${this.#path}.v${data.version}.bak`;
-    publish(this.#path, data.channels, () => {
-      writeFileAtomicSync(backup, bytes);
-      beforePublish?.();
-    });
+    publish(
+      this.#path,
+      data.channels,
+      () => {
+        writeFileAtomicSync(backup, bytes);
+        hooks?.beforePublish?.();
+      },
+      hooks?.afterSidecars,
+    );
     return { from: data.version, entries: data.count, backup };
   }
 
-  #open(): { db: Database; channels: Map<string, ChannelState> } {
-    const channels = this.#validate();
+  /**
+   * Format 3 to 4. The order matters: a format-3 file in WAL mode can hold committed rows only
+   * in `<state>-wal`, and the publish removes that file. So the rows are first checkpointed into
+   * the main file, and only that file is copied and rebuilt.
+   */
+  #migrateV3(hooks: LedgerOptions["hooks"]): LedgerMigration {
+    this.#validate(PREVIOUS_VERSION);
+    checkpoint(this.#path);
+    const { channels } = this.#validate(PREVIOUS_VERSION);
+    const backup = `${this.#path}.v${PREVIOUS_VERSION}.bak`;
+    // The atomic write keeps the mode of an existing file and stats through a symlink.
+    unlinkIfPresent(backup);
+    writeFileAtomicSync(backup, readFileSync(this.#path), { mode: 0o600 });
+    publish(this.#path, channels, hooks?.beforePublish, hooks?.afterSidecars);
+    let count = 0;
+    for (const channel of channels.values()) count += channel.entries.size;
+    return { from: PREVIOUS_VERSION, entries: count, backup };
+  }
+
+  /** Validates the file after a migration, unless the caller has already loaded its rows. */
+  #open(loaded: LoadedRows | undefined): { db: Database } & LoadedRows {
+    const { channels, alerts } = loaded ?? this.#validate(LEDGER_VERSION);
     const db = new Database(this.#path, { create: false, readwrite: true });
     try {
       db.run("PRAGMA journal_mode = WAL");
       db.run("PRAGMA synchronous = FULL");
-      return { db, channels };
+      return { db, channels, alerts };
     } catch (err) {
       db.close();
       throw err;
@@ -465,21 +666,34 @@ export class Ledger {
   }
 
   /**
-   * Reads and validates every row on a read-only connection. A read/write connection would
-   * checkpoint a committed WAL on close and so change a refused file.
+   * One private copy for an existing SQLite file: `undefined` for format 3 (to migrate), the
+   * validated rows for format 4, and a refusal for any other version.
    */
-  #validate(): Map<string, ChannelState> {
-    const db = new Database(this.#path, { readonly: true });
-    try {
+  #probe(): LoadedRows | undefined {
+    return readSnapshot(this.#path, (db) => {
       const row = db.query("PRAGMA user_version").get();
-      if (!isRecord(row) || row.user_version !== LEDGER_VERSION) throw unsupported(this.#path);
-      try {
-        return loadRows(db, this.#path);
-      } catch (err) {
-        throw unsupported(this.#path, { cause: err });
-      }
-    } finally {
-      db.close();
+      if (isRecord(row) && row.user_version === PREVIOUS_VERSION) return undefined;
+      return this.#load(db, LEDGER_VERSION);
+    });
+  }
+
+  /**
+   * Reads and validates every row on a private copy of the file and its sidecars. Even a
+   * read-only connection rewrites `<state>-shm`, and a refused file must keep all its bytes.
+   */
+  #validate(version: number): LoadedRows {
+    return readSnapshot(this.#path, (db) => this.#load(db, version));
+  }
+
+  #load(db: Database, version: number): LoadedRows {
+    const row = db.query("PRAGMA user_version").get();
+    if (!isRecord(row) || row.user_version !== version) throw unsupported(this.#path);
+    try {
+      const channels = loadRows(db, this.#path);
+      const alerts = version === LEDGER_VERSION ? loadAlerts(db, this.#path) : emptyAlerts();
+      return { channels, alerts };
+    } catch (err) {
+      throw unsupported(this.#path, { cause: err });
     }
   }
 
@@ -502,7 +716,7 @@ export class Ledger {
   async flush(): Promise<void> {
     if (this.#isClosed) return;
     const row = this.#db.query("PRAGMA wal_checkpoint(TRUNCATE)").get();
-    if (isRecord(row) && row.busy !== 0) throw new Error("ledger checkpoint was blocked");
+    if (isRecord(row) && row.busy !== 0) throw new LedgerCheckpointError();
   }
 
   /** Closes the database. Every later mutation throws `LedgerClosedError`. */
@@ -773,6 +987,158 @@ export class Ledger {
     return "resent";
   }
 
+  /** The stored alert state of the subject; `undefined` when there is none. */
+  alertState(kind: AlertKind, subjectId: string): AlertState | undefined {
+    const state = this.#alerts.get(kind)?.get(subjectId);
+    return state ? { ...state } : undefined;
+  }
+
+  /** Every stored subject of `kind` with its alert state. */
+  alertStates(kind: AlertKind): [string, AlertState][] {
+    const rows = this.#alerts.get(kind) ?? new Map<string, AlertState>();
+    return [...rows].map(([id, state]) => [id, { ...state }]);
+  }
+
+  /**
+   * All alert changes of one poll in one transaction: every row upsert and a `pending` entry for
+   * every delivery whose channel has no entry with that key. Returns the added deliveries.
+   * An empty batch writes nothing. A failed write throws and changes nothing.
+   */
+  applyAlerts(rows: readonly AlertUpsert[], deliveries: readonly AlertDelivery[]): AlertDelivery[] {
+    this.#assertOpen();
+    const seen = new Set<string>();
+    const added = deliveries.filter((d) => {
+      const id = JSON.stringify([d.channelId, d.key]);
+      if (seen.has(id) || this.has(d.channelId, d.key)) return false;
+      seen.add(id);
+      return true;
+    });
+    if (rows.length === 0 && added.length === 0) return [];
+    const at = this.#now();
+    this.#transact(
+      () => {
+        const upsert = this.#db.query(
+          `INSERT INTO alert_state (kind, subject_id, last_event_at, stage, episode_at, observed_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (kind, subject_id) DO UPDATE SET last_event_at = excluded.last_event_at,
+             stage = excluded.stage, episode_at = excluded.episode_at,
+             observed_at = excluded.observed_at, updated_at = excluded.updated_at`,
+        );
+        for (const { kind, subjectId, state } of rows) {
+          upsert.run(
+            kind,
+            subjectId,
+            state.lastEventAt ?? null,
+            state.stage ?? null,
+            state.episodeAt ?? null,
+            state.observedAt ?? null,
+            at,
+          );
+        }
+        const insert = this.#db.query(
+          "INSERT INTO entries (channel_id, key, status, at, payload) VALUES (?, ?, 'pending', ?, ?)",
+        );
+        for (const d of added) {
+          this.#upsertChannel(d.channelId);
+          insert.run(d.channelId, d.key, at, JSON.stringify(d.notification));
+        }
+      },
+      () => {
+        for (const { kind, subjectId, state } of rows) {
+          this.#alerts.get(kind)?.set(subjectId, {
+            lastEventAt: state.lastEventAt,
+            stage: state.stage,
+            episodeAt: state.episodeAt,
+            observedAt: state.observedAt,
+            updatedAt: at,
+          });
+        }
+        for (const d of added) {
+          this.#channelState(d.channelId).entries.set(d.key, {
+            status: "pending",
+            at,
+            payload: d.notification,
+          });
+        }
+      },
+    );
+    return added;
+  }
+
+  /**
+   * Settles as `dropped`, in one transaction, every `pending` entry of the channels whose payload
+   * is an incident event or absent (a legacy key). Pending warnings and other statuses stay.
+   * Returns the dropped count per given channel. Writes nothing when there is nothing to drop.
+   */
+  dropPendingIncidents(channelIds: readonly string[]): Map<string, number> {
+    this.#assertOpen();
+    const targets = new Map<string, string[]>();
+    for (const channelId of new Set(channelIds)) {
+      const entries = this.#channels.get(channelId)?.entries ?? new Map<string, LedgerEntry>();
+      const keys = [...entries]
+        .filter(([, e]) => e.status === "pending" && !isWarningPayload(e.payload))
+        .map(([key]) => key);
+      targets.set(channelId, keys);
+    }
+    const counts = new Map([...targets].map(([id, keys]) => [id, keys.length]));
+    if ([...counts.values()].every((n) => n === 0)) return counts;
+    const at = this.#now();
+    this.#transact(
+      () => {
+        const drop = this.#db.query(
+          "UPDATE entries SET status = 'dropped', at = ?, payload = NULL, recipients = NULL WHERE channel_id = ? AND key = ?",
+        );
+        for (const [channelId, keys] of targets) {
+          for (const key of keys) drop.run(at, channelId, key);
+        }
+      },
+      () => {
+        for (const [channelId, keys] of targets) {
+          for (const key of keys) {
+            const entry = this.#entry(channelId, key);
+            if (entry)
+              Object.assign(entry, {
+                status: "dropped",
+                at,
+                payload: undefined,
+                recipients: undefined,
+              });
+          }
+        }
+      },
+    );
+    return counts;
+  }
+
+  /**
+   * Removes alert rows not changed for `maxAgeMs` whose subject was absent from the last good
+   * read of its feed. A kind whose feed had no good read in this run keeps every row.
+   * Returns the number of removed rows.
+   */
+  pruneAlerts(maxAgeMs: number, presence: AlertFeedPresence): number {
+    this.#assertOpen();
+    const cutoff = this.#now() - maxAgeMs;
+    const removed: [AlertKind, string][] = [];
+    for (const kind of ALERT_KINDS) {
+      const present = kind === "budget-component" ? presence.components : presence.checks;
+      if (present === undefined) continue;
+      for (const [id, state] of this.#alerts.get(kind) ?? []) {
+        if (state.updatedAt < cutoff && !present.has(id)) removed.push([kind, id]);
+      }
+    }
+    if (removed.length === 0) return 0;
+    this.#transact(
+      () => {
+        const del = this.#db.query("DELETE FROM alert_state WHERE kind = ? AND subject_id = ?");
+        for (const [kind, id] of removed) del.run(kind, id);
+      },
+      () => {
+        for (const [kind, id] of removed) this.#alerts.get(kind)?.delete(id);
+      },
+    );
+    return removed.length;
+  }
+
   /**
    * Removes settled entries (not `pending`) older than `maxAgeMs`, with their notifications.
    * A key of an incident in `visible` (or a manual one in `visibleManual`) stays, or it would look unhandled and be sent again.
@@ -810,6 +1176,10 @@ export class Ledger {
     );
     return count;
   }
+}
+
+function isWarningPayload(payload: Notification | undefined): boolean {
+  return payload !== undefined && WARNING_EVENTS.has(String(payload.event));
 }
 
 function isPrunable(

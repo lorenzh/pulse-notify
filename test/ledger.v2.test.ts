@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ledger, type LedgerOptions } from "../src/ledger.ts";
-import type { Notification } from "../src/types.ts";
+import type { IncidentNotification } from "../src/types.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-ledger2-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -35,7 +35,7 @@ function path(): string {
   return join(dir, `state-${counter++}.json`);
 }
 
-function note(key: string, incidentId = 1): Notification {
+function note(key: string, incidentId = 1): IncidentNotification {
   return {
     key,
     event: "opened",
@@ -209,6 +209,7 @@ INSERT INTO channels (id) VALUES ('c');
 test("hostile SQLite files are refused without a change", () => {
   const cases: [string, (db: Database) => void][] = [
     ["user_version 4", (db) => db.run(`${SCHEMA_V3} PRAGMA user_version = 4;`)],
+    ["user_version 5", (db) => db.run(`${SCHEMA_V3} PRAGMA user_version = 5;`)],
     [
       "missing entries table",
       (db) => db.run("CREATE TABLE channels (id TEXT) STRICT; PRAGMA user_version = 3;"),
@@ -403,7 +404,7 @@ test("a failed seed, claim, resend or setRecipients changes neither memory nor d
   const file = path();
   const f = fault();
   const ledger = ledgerAt(file, { hooks: f });
-  const reminder = (n: number): Notification => ({
+  const reminder = (n: number): IncidentNotification => ({
     ...note(`1:reminder:${n}`),
     event: "reminder",
   });

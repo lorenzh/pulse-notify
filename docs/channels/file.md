@@ -9,6 +9,7 @@ In Docker, only `/data` is writable: use `"path": "/data/incidents.jsonl"`.
 - Appends the [payload](../channels.md#payload) as one JSON line to `path`. The parent directory is created.
 - The file is never truncated or rotated by pulse-notify.
 - A write error is a failed attempt and is retried like any other.
+- Warning lines (`budget-low`, `tls-expiry`, `domain-expiry`) appear only for the kinds in the channel's `alerts`; their shape is in [Warnings](../channels.md#warnings).
 - `reminder` lines appear only when `remindEverySeconds` is set on the channel.
 
 Sample line:

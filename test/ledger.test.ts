@@ -92,7 +92,7 @@ test("settle removes the payload; a ledger without payloads loads", () => {
   assert.deepEqual(new Ledger(legacy).pending(), [{ channelId: "c", key: "9:opened" }]);
 });
 
-test("format 3 has the exact schema, user_version 3 and WAL mode", () => {
+test("format 4 has the exact schema, user_version 4 and WAL mode", () => {
   const path = tmpPath();
   const ledger = new Ledger(path);
   ledger.close();
@@ -106,10 +106,11 @@ test("format 3 has the exact schema, user_version 3 and WAL mode", () => {
         .trim(),
     );
   assert.deepEqual(sql, [
+    "CREATE TABLE alert_state ( kind TEXT NOT NULL CHECK (kind IN ('budget-check','budget-component','expiry')), subject_id TEXT NOT NULL, last_event_at INTEGER, stage INTEGER CHECK (stage IN (14, 3)), episode_at INTEGER, observed_at INTEGER, updated_at INTEGER NOT NULL, PRIMARY KEY (kind, subject_id) ) STRICT",
     "CREATE TABLE channels ( id TEXT PRIMARY KEY, reminders_from INTEGER, manual_from INTEGER, check_routing TEXT, component_routing TEXT ) STRICT",
     "CREATE TABLE entries ( channel_id TEXT NOT NULL, key TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('seeded','pending','delivered','failed','dropped')), at INTEGER NOT NULL, payload TEXT, recipients TEXT, PRIMARY KEY (channel_id, key) ) STRICT",
   ]);
-  assert.deepEqual(db.query("PRAGMA user_version").get(), { user_version: 3 });
+  assert.deepEqual(db.query("PRAGMA user_version").get(), { user_version: 4 });
   assert.deepEqual(db.query("PRAGMA journal_mode").get(), { journal_mode: "wal" });
   db.close();
 });

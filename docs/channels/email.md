@@ -58,3 +58,19 @@ Reason: HTTP 503
 Time: 2026-01-01T12:00:00.000Z
 Status: https://status.example.com
 ```
+
+A warning (see [Warnings](../channels.md#warnings)):
+
+```text
+Subject: [pulse] BUDGET LOW: Web
+
+BUDGET LOW: Web
+
+Component: Web
+Error budget left: 18.4% (alert below 25%)
+Availability: 99.881% (target 99.9%, 30 days)
+Time: 2026-01-01T12:00:00.000Z
+Status: https://status.example.com
+```
+
+An expiry warning has the subject `TLS EXPIRES SOON` or `DOMAIN EXPIRES SOON` and the lines `Check: <name>`, `Expires in: <n> days` and `Kind: ...`. The Message-ID derives from the warning key.

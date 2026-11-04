@@ -13,6 +13,7 @@
 - Headers: `content-type: application/json` and `idempotency-key: <key>`. Delivery is at least once, so use the key to drop duplicates.
 - A 2xx status is success. Any other status, a redirect (not followed), a timeout or a network error is a failure that is retried. The error text holds the status only, never the URL.
 - `url` stays inline. A `http:` URL to a host other than `127.0.0.1`/`localhost` is not rejected, but startup logs one warning that names the channel id.
+- Warnings (`budget-low`, `tls-expiry`, `domain-expiry`, see [Warnings](../channels.md#warnings)) are posted the same way, with their key as `idempotency-key` and the same signing.
 - Reminders are off unless `remindEverySeconds` is set, because an old receiver may not know `"event": "reminder"`.
 
 ## Signing

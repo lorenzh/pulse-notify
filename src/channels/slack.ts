@@ -14,6 +14,7 @@ export function slackText(parts: MessageParts): string {
     lines.push(`Impact: ${m.impact}`, `Status: ${m.status}`, escapeSlack(m.message));
     if (m.components !== "") lines.push(`Components: ${escapeSlack(m.components)}`);
   }
+  for (const fact of parts.warning?.facts ?? []) lines.push(`${fact.title}: ${fact.value}`);
   if (parts.reason !== undefined) lines.push(`Reason: ${escapeSlack(parts.reason)}`);
   lines.push(`Time: ${parts.time}`);
   if (parts.openFor !== undefined) lines.push(`Open for: ${parts.openFor}`);

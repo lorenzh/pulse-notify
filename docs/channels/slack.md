@@ -36,3 +36,15 @@ Status: https://status.example.com
 ```
 
 A reminder reads `*STILL DOWN*` and adds `Open for: 1h 5m`. A resolution reads `*RESOLVED*`.
+
+A warning (see [Warnings](../channels.md#warnings)):
+
+```text
+*BUDGET LOW*: API health
+Error budget left: 18.4% (alert below 25%)
+Availability: 99.881% (target 99.9%, 30 days)
+Time: 2026-01-01T12:00:00.000Z
+Status: https://status.example.com
+```
+
+An expiry warning reads `*TLS EXPIRES SOON*` or `*DOMAIN EXPIRES SOON*` with `Expires in: 13 days` and `Kind: TLS certificate` or `Kind: domain registration`. The name is escaped as for incidents.

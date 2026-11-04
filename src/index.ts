@@ -14,7 +14,13 @@ import {
   StartupError,
   startOpsServer,
 } from "@lorenzh/pulse-kit";
-import { ConfigError, loadConfigFile, loadLockLeaseSeconds, loadSettings } from "./config.ts";
+import {
+  ConfigError,
+  loadBudgetThreshold,
+  loadConfigFile,
+  loadLockLeaseSeconds,
+  loadSettings,
+} from "./config.ts";
 import { runFailed } from "./failed-cli.ts";
 import { Ledger } from "./ledger.ts";
 import {
@@ -157,6 +163,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
   };
 
   const settings = loadSettings(env);
+  const budgetThreshold = loadBudgetThreshold(env);
   const config = loadConfigFile(settings.configPath, {
     env,
     readFile: (path) => readFileSync(path, "utf8"),
@@ -200,8 +207,19 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
     stateRetentionDays: settings.stateRetentionDays,
     smtpClientName: settings.smtpClientName,
     hostname: deps.lock?.hostname ?? hostname,
+    budgetThreshold,
   };
-  const notifier = deps.createNotifier ? deps.createNotifier(options) : new Notifier(options);
+  let notifier: Stoppable;
+  try {
+    notifier = deps.createNotifier ? deps.createNotifier(options) : new Notifier(options);
+  } catch (err) {
+    // The constructor drops incidents of warning-only channels; a failure must leave no lock.
+    ledger.close();
+    state.ledger = undefined;
+    lock.release();
+    state.lock = undefined;
+    throw err;
+  }
   state.notifier = notifier;
   notifierRef.current = notifier;
   startHeartbeat(lock, settings.lockLeaseSeconds, deps.heartbeatSchedule ?? unrefSchedule, {

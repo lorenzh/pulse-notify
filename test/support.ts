@@ -1,6 +1,14 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { Check, Incident, ManualIncident } from "@lorenzh/pulse-contract";
+import type {
+  Check,
+  CheckStateFields,
+  CheckWithState,
+  ComponentWithState,
+  Incident,
+  ManualIncident,
+  Slo,
+} from "@lorenzh/pulse-contract";
 import {
   type AtomicWriteFs,
   type AtomicWriteSyncFs,
@@ -9,6 +17,8 @@ import {
   nodeAtomicWriteFs,
   nodeAtomicWriteSyncFs,
 } from "@lorenzh/pulse-kit";
+import type { AlertKind, AlertState, Ledger } from "../src/ledger.ts";
+import type { BudgetNotification, ExpiryNotification } from "../src/types.ts";
 
 export interface LogEntry {
   level: LogLevel;
@@ -71,6 +81,8 @@ export interface FakeApi {
   checks: Check[];
   /** `undefined` answers 404, like an older api. */
   manualIncidents: ManualIncident[] | undefined;
+  /** `undefined` (the default) answers 404, like an older api. */
+  components: ComponentWithState[] | undefined;
   failing: boolean;
   /** Answers 500 on `/manual-incidents` only. */
   failingManual: boolean;
@@ -95,6 +107,7 @@ export async function startFakeApi(): Promise<FakeApi> {
     incidents: [],
     checks: [],
     manualIncidents: [],
+    components: undefined,
     failing: false,
     failingManual: false,
     failingPaths: new Map(),
@@ -121,7 +134,9 @@ export async function startFakeApi(): Promise<FakeApi> {
     else if (req.url === "/manual-incidents" && api.manualIncidents) {
       res.end(JSON.stringify(api.manualIncidents));
     } else if (req.url === "/checks") res.end(JSON.stringify(api.checks));
-    else {
+    else if (req.url === "/components" && api.components) {
+      res.end(JSON.stringify(api.components));
+    } else {
       res.statusCode = 404;
       res.end("{}");
     }
@@ -335,4 +350,106 @@ export function recordingFs(): RecordingFs {
     },
   };
   return { steps, faults, sync, async };
+}
+
+/** An SLO with target 99.9; `availability` defaults to a value that fits `budgetRemaining`. */
+export function slo(budgetRemaining: number | null, availability: number | null = 99.95): Slo {
+  return {
+    target: 99.9,
+    windowDays: 30,
+    availability: budgetRemaining === null ? null : availability,
+    budgetRemaining,
+  };
+}
+
+/** A check with state; `readings` are `[timestamp, location]` results with `certDaysLeft`. */
+export function checkState(
+  check: Check,
+  over: Partial<CheckStateFields> = {},
+  readings: number[] = [],
+): CheckWithState {
+  const locations = readings.map((timestamp, i) => ({
+    location: `loc-${i}`,
+    stale: false,
+    result: {
+      checkId: check.id,
+      timestamp,
+      status: "up" as const,
+      statusCode: null,
+      latencyMs: 1,
+      reason: null,
+      location: `loc-${i}`,
+      attempts: 1,
+    },
+  }));
+  return {
+    ...check,
+    state: "up",
+    consecutiveDown: 0,
+    lastResultAt: readings.length === 0 ? null : Math.max(...readings),
+    lastReason: null,
+    locations,
+    ...over,
+  };
+}
+
+export function componentState(
+  id: string,
+  name: string,
+  over: Partial<ComponentWithState> = {},
+): ComponentWithState {
+  return { id, name, checkIds: ["a"], state: "up", uptime: null, incidentIds: [], ...over };
+}
+
+export const WARNING_TIME_MS = Date.UTC(2026, 0, 1, 12, 0, 0);
+
+export function budgetNote(over: Partial<BudgetNotification> = {}): BudgetNotification {
+  return {
+    key: `budget:check:${WARNING_TIME_MS}:${"a".repeat(32)}`,
+    event: "budget-low",
+    time: new Date(WARNING_TIME_MS).toISOString(),
+    timeMs: WARNING_TIME_MS,
+    subject: { kind: "check", id: "api-health", name: "API health" },
+    budget: { remaining: 18.4, threshold: 25, target: 99.9, availability: 99.8816, windowDays: 30 },
+    ...over,
+  };
+}
+
+export function expiryNote(over: Partial<ExpiryNotification> = {}): ExpiryNotification {
+  return {
+    key: `expiry:${WARNING_TIME_MS}:14:${"b".repeat(32)}`,
+    event: "tls-expiry",
+    time: new Date(WARNING_TIME_MS + 5000).toISOString(),
+    timeMs: WARNING_TIME_MS + 5000,
+    subject: { kind: "check", id: "site-tls", name: "Site TLS" },
+    expiry: { daysLeft: 13, milestone: 14, observedMs: WARNING_TIME_MS },
+    ...over,
+  };
+}
+
+/** The alert-state part of the ledger that the pure rules read and write. */
+export type AlertStore = Pick<Ledger, "alertState" | "alertStates" | "applyAlerts">;
+
+/**
+ * An in-memory alert store for rule tests that do not reopen the ledger. Like the ledger, an
+ * upsert replaces the whole row. Deliveries are not stored.
+ */
+export function memoryAlerts(): AlertStore {
+  const kinds = new Map<AlertKind, Map<string, AlertState>>();
+  const rowsOf = (kind: AlertKind): Map<string, AlertState> => {
+    const rows = kinds.get(kind) ?? new Map<string, AlertState>();
+    kinds.set(kind, rows);
+    return rows;
+  };
+  return {
+    alertState: (kind, id) => {
+      const row = rowsOf(kind).get(id);
+      return row ? { ...row } : undefined;
+    },
+    alertStates: (kind) => [...rowsOf(kind)].map(([id, row]) => [id, { ...row }]),
+    applyAlerts: (changes) => {
+      for (const c of changes) rowsOf(c.kind).set(c.subjectId, { ...c.state, updatedAt: 0 });
+      return [];
+    },
+  };
 }

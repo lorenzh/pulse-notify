@@ -1,8 +1,12 @@
 import type { Incident, ManualIncident } from "@lorenzh/pulse-contract";
 import type { Logger } from "@lorenzh/pulse-kit";
+import { type AlertInputs, isSubscribed, planAlerts } from "./alert-poll.ts";
 import {
   ApiReadError,
-  fetchChecks,
+  type ChecksResult,
+  type ComponentsResult,
+  fetchChecksWithState,
+  fetchComponents,
   fetchIncidents,
   fetchManualIncidents,
   type ManualIncidentsResult,
@@ -30,12 +34,13 @@ import {
   seedManualKeys,
 } from "./detector.ts";
 import { errorFields } from "./errors.ts";
-import type { Ledger } from "./ledger.ts";
+import type { AlertDelivery, Ledger } from "./ledger.ts";
 import type { FeedName, Metrics } from "./metrics.ts";
 import { defaultSchedule } from "./timeout.ts";
 import type {
   ChannelConfig,
   Config,
+  IncidentNotification,
   Notification,
   NotificationEvent,
   RecipientProgress,
@@ -73,6 +78,18 @@ export interface NotifierOptions {
   smtpClientName?: string | undefined;
   /** Machine host name, the EHLO name when nothing is set. */
   hostname?: (() => string) | undefined;
+  /** A budget-low warning fires below this percent of error budget left. Default 25. */
+  budgetThreshold?: number | undefined;
+}
+
+export class IncidentDropError extends Error {
+  constructor(options?: ErrorOptions) {
+    super(
+      "cannot drop pending incident notifications of channels with sendIncidents false",
+      options,
+    );
+    this.name = "IncidentDropError";
+  }
 }
 
 /** How a notifier polls: used for the health check. */
@@ -119,7 +136,7 @@ function buildNotification(
   incident: Incident,
   names: Map<string, string>,
   nowMs: number,
-): Notification {
+): IncidentNotification {
   const timeMs = eventTimeMs(event, incident, nowMs);
   return {
     key,
@@ -134,7 +151,7 @@ function buildNotification(
   };
 }
 
-function buildManualNotification(detected: DetectedManualEvent): Notification {
+function buildManualNotification(detected: DetectedManualEvent): IncidentNotification {
   const { incident, event, key, timeMs, updateIndex } = detected;
   const update = incident.updates[updateIndex];
   const message = event === "resolved" ? (incident.updates.at(-1)?.message ?? "") : update?.message;
@@ -185,6 +202,9 @@ export class Notifier {
   /** Failure kinds already logged per feed; cleared when the feed answers again. */
   readonly #feedFailures = new Map<FeedName, Set<string>>();
   #lastPruneMs: number | undefined;
+  #lastAlertPruneMs: number | undefined;
+  /** Subject ids of the last good `/checks` and `/components` reads, for alert pruning. */
+  readonly #alertPresence: { checks?: Set<string>; components?: Set<string> } = {};
   #cancelPoll: (() => void) | undefined;
   #running = false;
   #ticking: Promise<void> | undefined;
@@ -228,6 +248,29 @@ export class Notifier {
       };
       return state;
     });
+    this.#dropIncidentsOfWarningOnly();
+  }
+
+  /** Before any send: a channel with `sendIncidents: false` never sends a stored incident. */
+  #dropIncidentsOfWarningOnly(): void {
+    const ids = this.#opts.config.channels
+      .filter((c) => c.sendIncidents === false)
+      .map((c) => c.id);
+    if (ids.length === 0) return;
+    let counts: Map<string, number>;
+    try {
+      counts = this.#opts.ledger.dropPendingIncidents(ids);
+    } catch (err) {
+      throw new IncidentDropError({ cause: err });
+    }
+    for (const [channel, count] of counts) {
+      if (count > 0) {
+        this.#opts.logger.info("incident notifications dropped: channel sends no incidents", {
+          channel,
+          count,
+        });
+      }
+    }
   }
 
   /** True when a reminder of the same incident with a higher n is queued or in the ledger with any status except dropped. */
@@ -336,16 +379,25 @@ export class Notifier {
       schedule: this.#opts.schedule,
       onVersionAbsent: () => this.#reportVersionAbsent(),
       onInvalidCheck: (index: number) => this.#reportInvalidCheck(index),
+      onInvalidComponent: (index: number) => this.#reportInvalidComponent(index),
     };
-    const [incidentsRead, checksRead, manualRead] = await Promise.allSettled([
+    const channels = this.#opts.config.channels;
+    const hasAlerts = channels.some((c) => (c.alerts ?? []).length > 0);
+    const hasBudget = isSubscribed(channels, "budget-low");
+    const [incidentsRead, checksRead, manualRead, componentsRead] = await Promise.allSettled([
       fetchIncidents(api),
-      fetchChecks(api),
+      fetchChecksWithState(api, hasAlerts),
       fetchManualIncidents(api),
+      hasBudget ? fetchComponents(api) : Promise.resolve(undefined),
     ]);
     const result = this.#feedValue("incidents", incidentsRead);
-    const checks = this.#feedValue("checks", checksRead);
+    const checksResult = this.#feedValue("checks", checksRead);
+    const checks = checksResult?.checks;
     const manualResult = this.#feedValue("manual-incidents", manualRead);
-    const isOk = result !== undefined && checks !== undefined && manualResult !== undefined;
+    const components = hasBudget ? this.#feedValue("components", componentsRead) : undefined;
+    const isComponentsOk = !hasBudget || componentsRead.status === "fulfilled";
+    const isOk =
+      result !== undefined && checks !== undefined && manualResult !== undefined && isComponentsOk;
     this.#opts.metrics?.pollDone(isOk ? "ok" : "error");
     if (result) this.#reportRejected("incidents", result.rejected);
     if (manualResult) {
@@ -369,6 +421,10 @@ export class Notifier {
       this.#releaseHeld();
       this.#visible = new Set(incidents.map((i) => i.id));
       this.#pruneLedger(nowMs);
+    }
+    if (hasAlerts) {
+      this.#runAlerts(checksResult, components, nowMs);
+      this.#pruneAlerts(nowMs);
     }
     return isOk;
   }
@@ -406,6 +462,58 @@ export class Notifier {
     if (count > 0) this.#opts.logger.info("old ledger entries pruned", { count });
   }
 
+  /** One evaluation of all warning kinds, committed in one transaction, then enqueued. */
+  #runAlerts(
+    checksResult: ChecksResult | undefined,
+    componentsResult: ComponentsResult | undefined,
+    nowMs: number,
+  ): void {
+    const { ledger, logger } = this.#opts;
+    // Visibility for pruning counts every listed item, also one that cannot be evaluated.
+    if (checksResult) this.#alertPresence.checks = checksResult.listedIds;
+    if (componentsResult) this.#alertPresence.components = componentsResult.listedIds;
+    const inputs: AlertInputs = {
+      checks: checksResult?.states,
+      components: componentsResult?.components,
+    };
+    let added: AlertDelivery[];
+    try {
+      const plan = planAlerts(this.#opts.config.channels, inputs, {
+        lookup: (kind, id) => ledger.alertState(kind, id),
+        hasChannel: (id) => ledger.hasChannel(id),
+        threshold: this.#opts.budgetThreshold ?? 25,
+        nowMs,
+      });
+      added = ledger.applyAlerts(plan.changes, plan.deliveries);
+    } catch (err) {
+      logger.error("alert state write failed, the next poll retries", errorFields(err));
+      return;
+    }
+    for (const { channelId, key, notification } of added) {
+      const channel = this.#channels.find((c) => c.config.id === channelId);
+      if (!channel) continue;
+      channel.queued.add(key);
+      channel.delivery.enqueue(notification);
+    }
+  }
+
+  /** Hourly, like the entry prune; a kind is pruned only after a good read of its feed. */
+  #pruneAlerts(nowMs: number): void {
+    if (this.#lastAlertPruneMs !== undefined && nowMs - this.#lastAlertPruneMs < PRUNE_EVERY_MS) {
+      return;
+    }
+    this.#lastAlertPruneMs = nowMs;
+    const days = this.#opts.stateRetentionDays ?? 30;
+    let count: number;
+    try {
+      count = this.#opts.ledger.pruneAlerts(days * DAY_MS, this.#alertPresence);
+    } catch (err) {
+      this.#opts.logger.error("ledger prune failed, the next prune retries", errorFields(err));
+      return;
+    }
+    if (count > 0) this.#opts.logger.info("old alert state pruned", { count });
+  }
+
   #releaseHeld(): void {
     for (const channel of this.#channels) {
       const held = channel.held.splice(0);
@@ -428,6 +536,17 @@ export class Notifier {
     if (!this.#malformed.add(`checks:index:${index}`)) return;
     this.#opts.logger.warn("check skipped: malformed data", {
       feed: "checks",
+      index,
+      reason: "invalid",
+    });
+  }
+
+  /** Counted on every poll; logged once per index. */
+  #reportInvalidComponent(index: number): void {
+    this.#opts.metrics?.itemSkipped("components");
+    if (!this.#malformed.add(`components:index:${index}`)) return;
+    this.#opts.logger.warn("component skipped: malformed data", {
+      feed: "components",
       index,
       reason: "invalid",
     });
@@ -468,7 +587,9 @@ export class Notifier {
     }
     if (incidents && this.#syncCheckRouting(channel, incidents, reminders)) {
       if (!this.#syncReminderMark(channel.config.id, incidents, reminders, nowMs)) return;
-      this.#rebuildLegacyPending(channel, incidents, nowMs);
+      if (channel.config.sendIncidents !== false) {
+        this.#rebuildLegacyPending(channel, incidents, nowMs);
+      }
       this.#detectAutomatic(channel, incidents, reminders, nowMs);
     }
     // After automatic detection, so a failed manual seed does not hold back automatic events.
@@ -556,6 +677,13 @@ export class Notifier {
       (key) => ledger.has(id, key) || channel.queued.has(key),
       reminders,
     );
+    if (channel.config.sendIncidents === false) {
+      this.#seedIncidentKeys(
+        id,
+        events.map((e) => e.key),
+      );
+      return;
+    }
     for (const { key, event, incident } of events) {
       this.#enqueue(channel, key, () =>
         buildNotification(...buildArgs(key, event, incident, this.#checkNames, nowMs)),
@@ -568,8 +696,29 @@ export class Notifier {
     const id = channel.config.id;
     const isHandled = (key: string): boolean => ledger.has(id, key) || channel.queued.has(key);
     const relevantManual = manual.filter((i) => isManualRouted(channel.config, i.componentIds));
-    for (const detected of detectManualEvents(relevantManual, isHandled)) {
+    const detectedEvents = detectManualEvents(relevantManual, isHandled);
+    if (channel.config.sendIncidents === false) {
+      this.#seedIncidentKeys(
+        id,
+        detectedEvents.map((d) => d.key),
+      );
+      return;
+    }
+    for (const detected of detectedEvents) {
       this.#enqueue(channel, detected.key, () => buildManualNotification(detected));
+    }
+  }
+
+  /** A warning-only channel records the incident keys it would send as handled. */
+  #seedIncidentKeys(channelId: string, keys: string[]): void {
+    if (keys.length === 0) return;
+    try {
+      this.#opts.ledger.seed(channelId, keys);
+    } catch (err) {
+      this.#opts.logger.error("incident seed failed, the next poll retries", {
+        channel: channelId,
+        ...errorFields(err),
+      });
     }
   }
 

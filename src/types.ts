@@ -9,7 +9,11 @@ export interface ManualDetails {
   componentIds: string[];
 }
 
-export interface Notification {
+/** The warning events; a channel opts in with `alerts`. */
+export type AlertEvent = "budget-low" | "tls-expiry" | "domain-expiry";
+
+/** An incident event: opened, update, resolved or reminder, automatic or manual. */
+export interface IncidentNotification {
   key: string;
   event: NotificationEvent;
   incidentId: number;
@@ -25,6 +29,49 @@ export interface Notification {
   manual?: ManualDetails;
 }
 
+/** The check or component a warning is about. `name` is the api's name, not cleaned. */
+export interface AlertSubject {
+  kind: "check" | "component";
+  id: string;
+  name: string;
+}
+
+/** The error budget of an SLO is below the threshold. Values are the raw api values. */
+export interface BudgetNotification {
+  key: string;
+  event: "budget-low";
+  /** ISO 8601 UTC of the poll that generated the event. */
+  time: string;
+  timeMs: number;
+  subject: AlertSubject;
+  budget: {
+    remaining: number;
+    threshold: number;
+    target: number;
+    availability: number | null;
+    windowDays: number;
+  };
+}
+
+/** A TLS certificate or a domain registration expires soon. */
+export interface ExpiryNotification {
+  key: string;
+  event: "tls-expiry" | "domain-expiry";
+  time: string;
+  timeMs: number;
+  subject: AlertSubject;
+  expiry: { daysLeft: number; milestone: 14 | 3; observedMs: number };
+}
+
+export type WarningNotification = BudgetNotification | ExpiryNotification;
+
+export type Notification = IncidentNotification | WarningNotification;
+
+/** Whether the notification is about an incident (not a warning). */
+export function isIncidentNotification(n: Notification): n is IncidentNotification {
+  return n.event !== "budget-low" && n.event !== "tls-expiry" && n.event !== "domain-expiry";
+}
+
 interface ChannelBase {
   id: string;
   /** Check ids or `*` globs to notify about; absent or empty means all checks. */
@@ -37,6 +84,10 @@ interface ChannelBase {
   excludeComponents?: string[];
   /** Seconds between "still down" reminders for an open incident; absent means none. */
   remindEverySeconds?: number;
+  /** Warning kinds this channel gets; absent or empty means none. */
+  alerts?: AlertEvent[];
+  /** `false` makes a warning-only channel; absent means `true`. */
+  sendIncidents?: boolean;
 }
 
 export interface WebhookChannelConfig extends ChannelBase {

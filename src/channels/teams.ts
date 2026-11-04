@@ -16,6 +16,7 @@ export function teamsCard(parts: MessageParts): Record<string, unknown> {
     facts.push({ title: "Message", value: escapeTeams(m.message) });
     if (m.components !== "") facts.push({ title: "Components", value: escapeTeams(m.components) });
   }
+  for (const fact of parts.warning?.facts ?? []) facts.push({ ...fact });
   if (parts.reason !== undefined) facts.push({ title: "Reason", value: escapeTeams(parts.reason) });
   facts.push({ title: "Time", value: parts.time });
   if (parts.openFor !== undefined) facts.push({ title: "Open for", value: parts.openFor });
