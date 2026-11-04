@@ -1,16 +1,21 @@
 import { Database } from "bun:sqlite";
 import {
   closeSync,
+  copyFileSync,
+  existsSync,
   fsyncSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
   readSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { isRecord, writeFileAtomicSync } from "@lorenzh/pulse-kit";
 import type { Notification, RecipientProgress } from "./types.ts";
 
@@ -59,6 +64,30 @@ PRAGMA user_version = ${LEDGER_VERSION};
 `;
 
 const SQLITE_HEADER = "SQLite format 3\0";
+
+/**
+ * Runs `read` on a read-only connection to a private copy of `path` with its `-wal` and `-shm`
+ * files. SQLite rewrites the WAL index in `-shm` even on a read-only connection, so reading the
+ * original would change a file that is then refused. The copy lives in a 0700 temp directory.
+ */
+function readSnapshot<T>(path: string, read: (db: Database) => T): T {
+  const dir = mkdtempSync(join(tmpdir(), "notify-ledger-read-"));
+  try {
+    const copy = join(dir, "state");
+    copyFileSync(path, copy);
+    for (const suffix of ["-wal", "-shm"]) {
+      if (existsSync(`${path}${suffix}`)) copyFileSync(`${path}${suffix}`, `${copy}${suffix}`);
+    }
+    const db = new Database(copy, { readonly: true });
+    try {
+      return read(db);
+    } finally {
+      db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 /** A WAL checkpoint that could not move every committed frame into the database file. */
 export class LedgerCheckpointError extends Error {
@@ -629,22 +658,18 @@ export class Ledger {
 
   /** `PRAGMA user_version` read on a read-only connection. */
   #userVersion(): unknown {
-    const db = new Database(this.#path, { readonly: true });
-    try {
+    return readSnapshot(this.#path, (db) => {
       const row = db.query("PRAGMA user_version").get();
       return isRecord(row) ? row.user_version : undefined;
-    } finally {
-      db.close();
-    }
+    });
   }
 
   /**
-   * Reads and validates every row on a read-only connection. A read/write connection would
-   * checkpoint a committed WAL on close and so change a refused file.
+   * Reads and validates every row on a private copy of the file and its sidecars. Even a
+   * read-only connection rewrites `<state>-shm`, and a refused file must keep all its bytes.
    */
   #validate(version: number): { channels: Map<string, ChannelState>; alerts: AlertMirror } {
-    const db = new Database(this.#path, { readonly: true });
-    try {
+    return readSnapshot(this.#path, (db) => {
       const row = db.query("PRAGMA user_version").get();
       if (!isRecord(row) || row.user_version !== version) throw unsupported(this.#path);
       try {
@@ -654,9 +679,7 @@ export class Ledger {
       } catch (err) {
         throw unsupported(this.#path, { cause: err });
       }
-    } finally {
-      db.close();
-    }
+    });
   }
 
   /** Throws `LedgerClosedError` after `close()`. Runs first in every mutation, before any read. */

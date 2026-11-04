@@ -514,3 +514,40 @@ test("a recent alert row stays and pruning a budget entry keeps its alert row", 
     [],
   );
 });
+
+/** A WAL-mode file with `sql` committed only in its WAL, copied with its `-wal` and `-shm`. */
+function sidecarFixture(sql: string): string {
+  const source = path();
+  const writer = new Database(source, { create: true });
+  writer.run("PRAGMA journal_mode = WAL");
+  writer.run("PRAGMA wal_autocheckpoint = 0");
+  writer.run(sql);
+  const file = path();
+  for (const suffix of ["", "-wal", "-shm"]) {
+    writeFileSync(`${file}${suffix}`, readFileSync(`${source}${suffix}`));
+  }
+  writer.close();
+  return file;
+}
+
+test("a refused file keeps the bytes of its main file, WAL and SHM", () => {
+  const cases: [string, string][] = [
+    [
+      "format 3 with status sent",
+      `${SCHEMA_V3} INSERT INTO channels (id) VALUES ('c'); INSERT INTO entries VALUES ('c', 'k', 'sent', 1, NULL, NULL);`,
+    ],
+    ["format 4 without alert_state", `${SCHEMA_V3} PRAGMA user_version = 4;`],
+    ["user_version 5", `${SCHEMA_V3} PRAGMA user_version = 5;`],
+    ["stage 7", `${LOOSE_V4} INSERT INTO alert_state VALUES ('expiry', 'x', NULL, 7, 1, 1, 1);`],
+    ["kind x", `${LOOSE_V4} INSERT INTO alert_state VALUES ('x', 'a', 1, NULL, NULL, NULL, 1);`],
+  ];
+  for (const [name, sql] of cases) {
+    const file = sidecarFixture(sql);
+    const before = ["", "-wal", "-shm"].map((s) => readFileSync(`${file}${s}`));
+    assert.throws(() => new Ledger(file), /unsupported format/, name);
+    ["", "-wal", "-shm"].forEach((s, i) => {
+      assert.deepEqual(readFileSync(`${file}${s}`), before[i], `${name} ${s || "main"}`);
+    });
+    assert.equal(existsSync(`${file}.v3.bak`), false, name);
+  }
+});
