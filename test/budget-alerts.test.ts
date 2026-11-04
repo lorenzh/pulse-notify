@@ -7,7 +7,7 @@ import { type BudgetSubject, budgetAlerts } from "../src/budget-alerts.ts";
 import { isAlertRouted } from "../src/channels/routing.ts";
 import { Ledger } from "../src/ledger.ts";
 import type { BudgetNotification, ChannelConfig } from "../src/types.ts";
-import { slo } from "./support.ts";
+import { type AlertStore, memoryAlerts, slo } from "./support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-budget-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -39,7 +39,7 @@ function check(budget: number | null, id = "a"): BudgetSubject {
 
 /** Evaluates the checks at `nowMs` and commits the changes, as one poll does. */
 function poll(
-  ledger: Ledger,
+  ledger: AlertStore,
   subjects: BudgetSubject[],
   nowMs: number,
   threshold = 25,
@@ -66,13 +66,13 @@ test("only a budget strictly below the threshold fires, without rounding", () =>
     ["-50", check(-50), 1],
   ];
   for (const [name, subject, expected] of cases) {
-    const ledger = ledgerAt(newFile());
+    const ledger = memoryAlerts();
     assert.equal(poll(ledger, [subject], T0).length, expected, name);
   }
 });
 
 test("0 and -50 on separate checks give one event each", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   const events = poll(ledger, [check(0, "a"), check(-50, "b")], T0);
   assert.deepEqual(
     events.map((e) => e.subject.id),
@@ -81,14 +81,14 @@ test("0 and -50 on separate checks give one event each", () => {
 });
 
 test("an event is due again after exactly 24 elapsed hours, not on a calendar day", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   assert.equal(poll(ledger, [check(10)], T0).length, 1);
   assert.equal(poll(ledger, [check(10)], T0 + 86_399_999).length, 0);
   assert.equal(poll(ledger, [check(10)], T0 + 86_400_000).length, 1);
 });
 
 test("a recovery and a new drop inside 24 hours send nothing", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   assert.equal(poll(ledger, [check(10)], T0).length, 1);
   assert.equal(poll(ledger, [check(80)], T0 + HOUR).length, 0);
   assert.equal(poll(ledger, [check(10)], T0 + 2 * HOUR).length, 0);
@@ -107,20 +107,20 @@ test("the suppression survives a ledger reopen and a threshold change", () => {
 });
 
 test("a clock that steps back sends nothing", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   assert.equal(poll(ledger, [check(10)], T0).length, 1);
   assert.equal(poll(ledger, [check(10)], T0 - 1000).length, 0);
 });
 
 test("missed days during downtime give exactly one event", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   assert.equal(poll(ledger, [check(10)], T0).length, 1);
   assert.equal(poll(ledger, [check(10)], T0 + 72 * HOUR).length, 1);
   assert.equal(poll(ledger, [check(10)], T0 + 72 * HOUR + 1000).length, 0);
 });
 
 test("a check and a component with the same id are two SLOs with two keys", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   const [c] = poll(ledger, [check(10)], T0);
   const [k] = poll(ledger, [check(10)], T0, 25, "component");
   assert.equal(c?.key, `budget:check:${T0}:${HASH_A}`);
@@ -131,7 +131,7 @@ test("a check and a component with the same id are two SLOs with two keys", () =
 });
 
 test("the payload carries the raw api values and the threshold in force", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   const subject: BudgetSubject = {
     id: "api-health",
     name: "API health",
@@ -156,7 +156,7 @@ test("the payload carries the raw api values and the threshold in force", () => 
 });
 
 test("threshold 0: budget 0 sends nothing, -0.1 sends one event", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   assert.equal(poll(ledger, [check(0, "a")], T0, 0).length, 0);
   assert.equal(poll(ledger, [check(-0.1, "b")], T0, 0).length, 1);
 });
@@ -183,4 +183,9 @@ test("one event on two channels: one alert row and one entry per channel with th
       ["w2", `budget:check:${T0}:${HASH_A}`],
     ],
   );
+});
+
+test("an id with a colon and a newline only reaches the key as a 32-hex hash", () => {
+  const [note] = poll(memoryAlerts(), [check(10, "a:b\nc")], T0);
+  assert.equal(note?.key, `budget:check:${T0}:af48efebd01d334bf450f00585e3acd6`);
 });

@@ -7,7 +7,7 @@ import type { CheckWithState } from "@lorenzh/pulse-contract";
 import { expiryAlerts } from "../src/expiry-alerts.ts";
 import { Ledger } from "../src/ledger.ts";
 import type { ExpiryNotification } from "../src/types.ts";
-import { checkState, domainCheck, tlsCheck } from "./support.ts";
+import { type AlertStore, checkState, domainCheck, memoryAlerts, tlsCheck } from "./support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-expiry-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -42,7 +42,7 @@ function domain(days: number | null, readings: number[], id = "x"): CheckWithSta
 }
 
 /** Evaluates at `nowMs` and commits the changes, as one poll does. */
-function poll(ledger: Ledger, checks: CheckWithState[], nowMs: number): ExpiryNotification[] {
+function poll(ledger: AlertStore, checks: CheckWithState[], nowMs: number): ExpiryNotification[] {
   const result = expiryAlerts(checks, (k, id) => ledger.alertState(k, id), BOTH, nowMs);
   ledger.applyAlerts(result.changes, []);
   return result.notifications;
@@ -50,7 +50,7 @@ function poll(ledger: Ledger, checks: CheckWithState[], nowMs: number): ExpiryNo
 
 /** Feeds the readings in order, each fresh and newer, and returns the milestones. */
 function sequence(
-  ledger: Ledger,
+  ledger: AlertStore,
   days: (number | null)[],
   make = tls,
   start = T0,
@@ -78,15 +78,15 @@ test("the expiry sequences give the literal milestones", () => {
     ["small increase", [14, 13, 14, 12], [14]],
   ];
   for (const [name, days, expected] of cases) {
-    const ledger = ledgerAt(newFile());
+    const ledger = memoryAlerts();
     assert.deepEqual(milestones(sequence(ledger, days)), expected, name);
   }
 });
 
 test("TLS and domain checks both give [14, 3] with their own event", () => {
   const days = [15, 14, 14, 13, 4, 3, 3, 2, 0, -1];
-  const tlsEvents = sequence(ledgerAt(newFile()), days, tls);
-  const domainEvents = sequence(ledgerAt(newFile()), days, domain);
+  const tlsEvents = sequence(memoryAlerts(), days, tls);
+  const domainEvents = sequence(memoryAlerts(), days, domain);
   assert.deepEqual(
     tlsEvents.map((e) => [e.event, e.expiry.milestone]),
     [
@@ -104,7 +104,7 @@ test("TLS and domain checks both give [14, 3] with their own event", () => {
 });
 
 test("a reading above 14 rearms: a new episode gives [14, 3] with a new episode time", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   const days = [15, 14, 14, 13, 4, 3, 3, 2, 0, -1, 90, 14, 3];
   const events = sequence(ledger, days);
   assert.deepEqual(
@@ -119,7 +119,7 @@ test("a reading above 14 rearms: a new episode gives [14, 3] with a new episode 
 });
 
 test("the payload carries the days, the milestone and the observation time", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   const check = checkState(tlsCheck("site-tls", "Site TLS"), { certDaysLeft: 13 }, [T0]);
   assert.deepEqual(poll(ledger, [check], T0 + 5000), [
     {
@@ -167,7 +167,7 @@ test("older, equal, stale and future readings are not used and change nothing", 
     ["equal", 1000, 1000, false],
   ];
   for (const [name, observedMs, nowMs, used] of cases) {
-    const ledger = ledgerAt(newFile());
+    const ledger = memoryAlerts();
     assert.deepEqual(milestones(poll(ledger, [tls(3, [1000])], 1000)), [3]);
     const before = ledger.alertState("expiry", "x");
     poll(ledger, [tls(20, [observedMs])], nowMs);
@@ -181,7 +181,7 @@ test("older, equal, stale and future readings are not used and change nothing", 
     ["future at the limit", -60_000, 1],
   ];
   for (const [name, age, expected] of fresh) {
-    const ledger = ledgerAt(newFile());
+    const ledger = memoryAlerts();
     const nowMs = T0 + 1_000_000;
     assert.equal(poll(ledger, [tls(14, [nowMs - age])], nowMs).length, expected, name);
     assert.equal(ledger.alertStates("expiry").length, expected, name);
@@ -189,14 +189,14 @@ test("older, equal, stale and future readings are not used and change nothing", 
 });
 
 test("a reading without days or locations is not used", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   assert.deepEqual(poll(ledger, [tls(null, [T0])], T0), []);
   assert.deepEqual(poll(ledger, [tls(10, [])], T0), []);
   assert.deepEqual(ledger.alertStates("expiry"), []);
 });
 
 test("the newest location gives the observation time: one event at 2000", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   const events = poll(ledger, [tls(10, [1000, 2000])], 2000);
   assert.deepEqual(
     events.map((e) => e.expiry),
@@ -205,7 +205,7 @@ test("the newest location gives the observation time: one event at 2000", () => 
 });
 
 test("only subscribed kinds are evaluated, and a type change keeps the row", () => {
-  const ledger = ledgerAt(newFile());
+  const ledger = memoryAlerts();
   const tlsOnly = expiryAlerts(
     [domain(13, [T0])],
     () => undefined,

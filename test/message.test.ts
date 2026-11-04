@@ -138,6 +138,15 @@ test("hostile warning names cannot inject slack mentions or teams markup", () =>
   );
 });
 
+test("a 10000-character warning name with control characters and markup is cleaned and cut", () => {
+  const name = `<b>\u0007${"y".repeat(10000)}`;
+  const slack = slackText(
+    messageParts(budgetNote({ subject: { kind: "check", id: "a", name } }), {}),
+  );
+  const first = slack.split("\n")[0] ?? "";
+  assert.equal(first, `*BUDGET LOW*: &lt;b&gt; ${"y".repeat(295)}…`);
+});
+
 test("teams card for a warning lists the warning facts and the status action", () => {
   const card = teamsCard(messageParts(budgetNote(), LINK));
   const json = JSON.stringify(card);

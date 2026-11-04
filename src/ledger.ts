@@ -89,6 +89,11 @@ function readSnapshot<T>(path: string, read: (db: Database) => T): T {
   }
 }
 
+interface LoadedRows {
+  channels: Map<string, ChannelState>;
+  alerts: AlertMirror;
+}
+
 /** A WAL checkpoint that could not move every committed frame into the database file. */
 export class LedgerCheckpointError extends Error {
   override readonly name = "LedgerCheckpointError";
@@ -594,15 +599,18 @@ export class Ledger {
     this.#beforeCommit = opts.hooks?.beforeCommit;
     removeDatabaseFiles(`${path}.migrating`, true);
     const header = readHeader(path);
+    let loaded: LoadedRows | undefined;
     if (header === undefined) {
       mkdirSync(dirname(path), { recursive: true });
       publish(path, new Map());
+      loaded = { channels: new Map(), alerts: emptyAlerts() };
     } else if (header !== SQLITE_HEADER) {
       this.migration = this.#migrateJson(opts.hooks);
-    } else if (this.#userVersion() === PREVIOUS_VERSION) {
-      this.migration = this.#migrateV3(opts.hooks);
+    } else {
+      loaded = this.#probe();
+      if (loaded === undefined) this.migration = this.#migrateV3(opts.hooks);
     }
-    const opened = this.#open();
+    const opened = this.#open(loaded);
     this.#db = opened.db;
     this.#channels = opened.channels;
     this.#alerts = opened.alerts;
@@ -643,8 +651,9 @@ export class Ledger {
     return { from: PREVIOUS_VERSION, entries: count, backup };
   }
 
-  #open(): { db: Database; channels: Map<string, ChannelState>; alerts: AlertMirror } {
-    const { channels, alerts } = this.#validate(LEDGER_VERSION);
+  /** Validates the file after a migration, unless the caller has already loaded its rows. */
+  #open(loaded: LoadedRows | undefined): { db: Database } & LoadedRows {
+    const { channels, alerts } = loaded ?? this.#validate(LEDGER_VERSION);
     const db = new Database(this.#path, { create: false, readwrite: true });
     try {
       db.run("PRAGMA journal_mode = WAL");
@@ -656,11 +665,15 @@ export class Ledger {
     }
   }
 
-  /** `PRAGMA user_version` read on a read-only connection. */
-  #userVersion(): unknown {
+  /**
+   * One private copy for an existing SQLite file: `undefined` for format 3 (to migrate), the
+   * validated rows for format 4, and a refusal for any other version.
+   */
+  #probe(): LoadedRows | undefined {
     return readSnapshot(this.#path, (db) => {
       const row = db.query("PRAGMA user_version").get();
-      return isRecord(row) ? row.user_version : undefined;
+      if (isRecord(row) && row.user_version === PREVIOUS_VERSION) return undefined;
+      return this.#load(db, LEDGER_VERSION);
     });
   }
 
@@ -668,18 +681,20 @@ export class Ledger {
    * Reads and validates every row on a private copy of the file and its sidecars. Even a
    * read-only connection rewrites `<state>-shm`, and a refused file must keep all its bytes.
    */
-  #validate(version: number): { channels: Map<string, ChannelState>; alerts: AlertMirror } {
-    return readSnapshot(this.#path, (db) => {
-      const row = db.query("PRAGMA user_version").get();
-      if (!isRecord(row) || row.user_version !== version) throw unsupported(this.#path);
-      try {
-        const channels = loadRows(db, this.#path);
-        const alerts = version === LEDGER_VERSION ? loadAlerts(db, this.#path) : emptyAlerts();
-        return { channels, alerts };
-      } catch (err) {
-        throw unsupported(this.#path, { cause: err });
-      }
-    });
+  #validate(version: number): LoadedRows {
+    return readSnapshot(this.#path, (db) => this.#load(db, version));
+  }
+
+  #load(db: Database, version: number): LoadedRows {
+    const row = db.query("PRAGMA user_version").get();
+    if (!isRecord(row) || row.user_version !== version) throw unsupported(this.#path);
+    try {
+      const channels = loadRows(db, this.#path);
+      const alerts = version === LEDGER_VERSION ? loadAlerts(db, this.#path) : emptyAlerts();
+      return { channels, alerts };
+    } catch (err) {
+      throw unsupported(this.#path, { cause: err });
+    }
   }
 
   /** Throws `LedgerClosedError` after `close()`. Runs first in every mutation, before any read. */

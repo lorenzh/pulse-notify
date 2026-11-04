@@ -17,6 +17,7 @@ import {
   nodeAtomicWriteFs,
   nodeAtomicWriteSyncFs,
 } from "@lorenzh/pulse-kit";
+import type { AlertKind, AlertState, Ledger } from "../src/ledger.ts";
 import type { BudgetNotification, ExpiryNotification } from "../src/types.ts";
 
 export interface LogEntry {
@@ -423,5 +424,32 @@ export function expiryNote(over: Partial<ExpiryNotification> = {}): ExpiryNotifi
     subject: { kind: "check", id: "site-tls", name: "Site TLS" },
     expiry: { daysLeft: 13, milestone: 14, observedMs: WARNING_TIME_MS },
     ...over,
+  };
+}
+
+/** The alert-state part of the ledger that the pure rules read and write. */
+export type AlertStore = Pick<Ledger, "alertState" | "alertStates" | "applyAlerts">;
+
+/**
+ * An in-memory alert store for rule tests that do not reopen the ledger. Like the ledger, an
+ * upsert replaces the whole row. Deliveries are not stored.
+ */
+export function memoryAlerts(): AlertStore {
+  const kinds = new Map<AlertKind, Map<string, AlertState>>();
+  const rowsOf = (kind: AlertKind): Map<string, AlertState> => {
+    const rows = kinds.get(kind) ?? new Map<string, AlertState>();
+    kinds.set(kind, rows);
+    return rows;
+  };
+  return {
+    alertState: (kind, id) => {
+      const row = rowsOf(kind).get(id);
+      return row ? { ...row } : undefined;
+    },
+    alertStates: (kind) => [...rowsOf(kind)].map(([id, row]) => [id, { ...row }]),
+    applyAlerts: (changes) => {
+      for (const c of changes) rowsOf(c.kind).set(c.subjectId, { ...c.state, updatedAt: 0 });
+      return [];
+    },
   };
 }
