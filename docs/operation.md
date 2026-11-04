@@ -152,7 +152,7 @@ The listener binds before polling starts. If the bind fails, the service prints 
 | `pulse_notify_consecutive_failed_polls`                             | gauge           |
 | `pulse_notify_skipped_items_total{feed}`                            | counter         |
 
-`pulse_notify_polls_total` counts `ok` only when all three feeds answered. `pulse_notify_feed_polls_total` counts each read once per poll; `feed` is `incidents`, `checks` or `manual-incidents`, and a 404 on `manual-incidents` is `ok`. `channel` is the channel id. Webhook URLs, paths and secrets never appear.
+`pulse_notify_polls_total` counts the feed reads of a poll, before detection and enqueue: `ok` when all three feeds answered (a 404 on `manual-incidents` included), `error` when any read failed; the feeds that answered are still used. It does not measure delivery: an `error` poll can still send events, and an `ok` poll can send none. A detection failure after the reads leaves the outcome `ok` but adds 1 to `pulse_notify_consecutive_failed_polls`; each `error` poll also adds 1, and a fully good poll resets it to 0. `/readyz` fails when the streak reaches `PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS` (default 5, minimum 1). At the default of 5, starting from zero failures, one failed poll keeps it ready and the fifth failure in a row fails it; with `PULSE_NOTIFY_HEALTH_MAX_FAILED_POLLS=1` the first failed poll fails it. Monitor delivery with `pulse_notify_deliveries_total` and `pulse_notify_pending_deliveries`, and feed health with `pulse_notify_feed_polls_total`, `pulse_notify_consecutive_failed_polls` and `/readyz`. `pulse_notify_feed_polls_total` counts each read once per poll; `feed` is `incidents`, `checks` or `manual-incidents`, and a 404 on `manual-incidents` is `ok`. `channel` is the channel id. Webhook URLs, paths and secrets never appear.
 
 ## API validation and version check
 
@@ -172,6 +172,7 @@ From a version without `manualFrom` in the ledger:
 - Update keys change from `manual:<id>:update:<n>` to `manual:<id>:update:<32 hex>`. Old positional entries stay until pruned. Pending and failed ones are still resent.
 - A downgrade after this upgrade resends the manual updates of known channels once.
 - `/healthz` no longer reflects feed health; monitor `/readyz` or `pulse_notify_consecutive_failed_polls`.
+- `pulse_notify_polls_total{outcome="error"}` no longer means that nothing was delivered: the feeds that answered are still used. Alert on delivery with `pulse_notify_deliveries_total` and `pulse_notify_pending_deliveries`, see [Health and metrics](#health-and-metrics).
 
 From a version with a JSON state file (format 1 or 2):
 
