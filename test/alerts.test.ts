@@ -243,15 +243,15 @@ test("a failed alert commit stores nothing and the next poll sends once", async 
 
 test("a crash after the commit resends the same key and makes no new one", async () => {
   api.checks = [checkState(httpCheck("api-1", "API one"), { slo: slo(24) }, [T0])];
-  rx.up = false;
+  // The first run posts to a separate receiver that is down, so a late request of the
+  // stopped notifier can never reach the receiver that the second run is judged on.
+  other.up = false;
   const first = make(open(), {
-    channels: [{ id: "a", type: "webhook", url: rx.url, alerts: ["budget-low"] }],
+    channels: [{ id: "a", type: "webhook", url: other.url, alerts: ["budget-low"] }],
   });
   await first.tick();
   await first.stop();
   ledgers.pop()?.close();
-  rx.up = true;
-  rx.requests.length = 0;
   nowMs += 1000;
   const second = make(open(), {
     channels: [{ id: "a", type: "webhook", url: rx.url, alerts: ["budget-low"] }],
