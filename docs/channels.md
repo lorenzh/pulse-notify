@@ -13,7 +13,7 @@ pulse-notify polls `GET /incidents` and `GET /checks` of pulse-api in parallel o
 
 Incidents of heartbeat checks (cron jobs and workers that ping pulse-api) are delivered like all others.
 
-The event key is `<incidentId>:<event>`, for example `12:opened`. When an incident opens is decided by pulse-api, see [quorum and incidents](https://github.com/lorenzh/pulse-api/blob/main/docs/concepts.md#quorum-and-incidents).
+The key of an automatic `opened` or `resolved` event is `<incidentId>:<event>`, for example `12:opened`. Reminders and manual incidents use other forms, see [Reminders](#reminders) and [Manual incidents](#manual-incidents). Treat every key as an opaque string. When an incident opens is decided by pulse-api, see [quorum and incidents](https://github.com/lorenzh/pulse-api/blob/main/docs/concepts.md#quorum-and-incidents).
 
 ## Payload
 
@@ -33,17 +33,17 @@ The webhook body and each line of the file channel are the same JSON object:
 }
 ```
 
-| Field        | Meaning                                                                                  |
-| ------------ | ---------------------------------------------------------------------------------------- |
-| `key`        | `<incidentId>:<event>`. Unique per channel.                                              |
-| `event`      | `opened`, `resolved` or `reminder`                                                       |
-| `incidentId` | Incident id in pulse-api                                                                 |
-| `checkId`    | Check id                                                                                 |
-| `checkName`  | Name from `GET /checks`. If the check is unknown there, the check id.                    |
-| `reason`     | The incident's opening reason, or `null` if it has none                                  |
-| `time`       | ISO 8601 UTC time of the event: `openedAt`, `resolvedAt`, or the send time of a reminder |
-| `timeMs`     | The same time in epoch milliseconds                                                      |
-| `openedMs`   | Epoch milliseconds when the incident opened                                              |
+| Field        | Meaning                                                                                                                                                                                                       |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `key`        | Opaque event key, unique per channel: `<incidentId>:opened`, `<incidentId>:resolved`, `<incidentId>:reminder:<n>`, `manual:<id>:opened`, `manual:<id>:update:<d>` or `manual:<id>:resolved`. Do not parse it. |
+| `event`      | `opened`, `resolved` or `reminder`                                                                                                                                                                            |
+| `incidentId` | Incident id in pulse-api                                                                                                                                                                                      |
+| `checkId`    | Check id                                                                                                                                                                                                      |
+| `checkName`  | Name from `GET /checks`. If the check is unknown there, the check id.                                                                                                                                         |
+| `reason`     | The incident's opening reason, or `null` if it has none                                                                                                                                                       |
+| `time`       | ISO 8601 UTC time of the event: `openedAt`, `resolvedAt`, or the send time of a reminder                                                                                                                      |
+| `timeMs`     | The same time in epoch milliseconds                                                                                                                                                                           |
+| `openedMs`   | Epoch milliseconds when the incident opened                                                                                                                                                                   |
 
 The types `Incident` and `Check` come from [pulse-contract](https://github.com/lorenzh/pulse-contract/blob/main/docs/index.md).
 
@@ -120,7 +120,7 @@ The reason is untrusted text: it is cut to 300 characters, control characters ar
 ## Delivery and retries
 
 - At least once per event and channel. This holds while the process runs, within the retry schedule below, and across restarts for unfinished (`pending`) events. Before the first send, `(channel, key)` is recorded as `pending` in the ledger together with the notification, then `delivered` or `failed`.
-- Duplicates are possible: a retry, a crash after a send, or a failed ledger write can deliver an event twice. Receivers must deduplicate by the key `<incident id>:<event>` (for example `12:opened`), sent as the `idempotency-key` header.
+- Duplicates are possible: a retry, a crash after a send, or a failed ledger write can deliver an event twice. Receivers must deduplicate by the exact value of the `idempotency-key` header (the payload `key`). Treat it as an opaque string and do not parse it; its form differs by event, see [Payload](#payload).
 - Retry schedule: the delay before retry n is `min(initial * 2^(n-1), max)`, without jitter. The initial delay is `PULSE_NOTIFY_RETRY_DELAY_MS` (default 1000 ms), the cap is `PULSE_NOTIFY_RETRY_MAX_DELAY_MS` (default 60000 ms), and `PULSE_NOTIFY_RETRY_ATTEMPTS` (default 12) is the total number of attempts per event. With the defaults:
 
   | Retry | 1   | 2   | 3   | 4   | 5    | 6    | 7-11 |
