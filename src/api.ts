@@ -7,7 +7,9 @@ import {
   type FetchJsonOptions,
   fetchJson,
   type Incident,
+  isPublicManualIncident,
   type ManualIncident,
+  publicManualIncident,
   type Validation,
   validateCheck,
   validateCheckWithState,
@@ -283,12 +285,14 @@ export async function fetchManualIncidents(opts: ApiOptions): Promise<ManualInci
   const items = await getArray(opts, "manual-incidents", true);
   if (items === undefined) return { ...result, isAbsent: true };
   for (const [i, raw] of items.entries()) {
+    // A draft or internal incident is skipped before validation: never rejected, logged or counted.
+    if (!isPublicManualIncident(raw)) continue;
     const path = `manual-incidents[${i}]`;
     const validated = validateManualIncident(raw, path);
     const isValid =
       validated.ok && isDateMs(validated.value.createdAt) && updatesHaveDates(validated.value);
     if (validated.ok && isValid) {
-      result.incidents.push(validated.value);
+      result.incidents.push(publicManualIncident(validated.value));
     } else {
       result.rejected.push({
         index: i,

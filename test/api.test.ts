@@ -1,8 +1,8 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { validateCheck, WIRE_VERSION, WIRE_VERSION_HEADER } from "@lorenzh/pulse-contract";
-import { fetchChecks, fetchIncidents } from "../src/api.ts";
-import { fakeFetch, httpCheck, incident, startFakeApi } from "./support.ts";
+import { fetchChecks, fetchIncidents, fetchManualIncidents } from "../src/api.ts";
+import { fakeFetch, httpCheck, incident, manualIncident, startFakeApi } from "./support.ts";
 
 async function check(over: Record<string, unknown>) {
   const body = [{ ...incident({ id: 1 }), ...over }];
@@ -196,4 +196,24 @@ test("a check with a username or password in its url is dropped without leaking 
   } finally {
     await api.close();
   }
+});
+
+test("private manual incidents are skipped without a rejection; public ones lose private fields", async () => {
+  const at = Date.UTC(2026, 0, 1, 12, 0, 0);
+  const items = [
+    { ...manualIncident({ id: 1 }), visibility: "internal", publishedAt: at },
+    { ...manualIncident({ id: 2 }), visibility: "public", publishedAt: null },
+    { ...manualIncident({ id: 3 }), visibility: "Public" },
+    {
+      ...manualIncident({ id: 4 }),
+      visibility: "public",
+      publishedAt: at,
+      notes: [{ id: 1, at, author: "ops", message: "secret note" }],
+      draft: { status: "identified", message: "secret draft" },
+    },
+    { ...manualIncident({ id: 5 }), title: undefined },
+  ];
+  const out = await fetchManualIncidents({ baseUrl: base, fetch: respond(items) });
+  assert.deepEqual(out.rejected, [{ index: 4, id: 5, reason: "invalid" }]);
+  assert.deepEqual(out.incidents, [manualIncident({ id: 4 })]);
 });
