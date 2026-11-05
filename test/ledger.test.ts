@@ -157,3 +157,18 @@ test("on an open ledger an equal reminder mark and a prune without candidate wri
   assert.equal(ledger.remindersFrom("c"), 500);
   ledger.close();
 });
+
+test("prune keeps listed manual ids, negative and 0 included", () => {
+  const day = 86_400_000;
+  const t0 = Date.UTC(2026, 0, 1);
+  let clock = t0;
+  const ledger = new Ledger(tmpPath(), { now: () => clock });
+  ledger.seed("c", ["manual:-9:opened", "manual:0:opened", "manual:9:opened", "manual:-90:opened"]);
+  clock = t0 + 2 * day;
+  assert.equal(ledger.prune(day, new Set(), new Set([-9, 0])), 2);
+  assert.deepEqual(
+    ledger.entries("c").map(([key]) => key),
+    ["manual:-9:opened", "manual:0:opened"],
+  );
+  ledger.close();
+});

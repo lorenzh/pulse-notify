@@ -277,14 +277,26 @@ export interface ManualIncidentsResult {
   rejected: RejectedIncident[];
   /** True when the api answered 404: an older api without manual incidents. */
   isAbsent: boolean;
+  /**
+   * The id of every listed item, public or not, valid or not: a listed incident keeps its
+   * ledger keys. Only safe integer ids; empty on 404.
+   */
+  listedIds: Set<number>;
 }
 
 /** Reads `/manual-incidents`. A 404 means "none" (`isAbsent`); other failures throw. */
 export async function fetchManualIncidents(opts: ApiOptions): Promise<ManualIncidentsResult> {
-  const result: ManualIncidentsResult = { incidents: [], rejected: [], isAbsent: false };
+  const result: ManualIncidentsResult = {
+    incidents: [],
+    rejected: [],
+    isAbsent: false,
+    listedIds: new Set(),
+  };
   const items = await getArray(opts, "manual-incidents", true);
   if (items === undefined) return { ...result, isAbsent: true };
   for (const [i, raw] of items.entries()) {
+    const id = safeId(raw);
+    if (id !== undefined) result.listedIds.add(id);
     // A draft or internal incident is skipped before validation: never rejected, logged or counted.
     if (!isPublicManualIncident(raw)) continue;
     const path = `manual-incidents[${i}]`;
@@ -293,10 +305,11 @@ export async function fetchManualIncidents(opts: ApiOptions): Promise<ManualInci
       validated.ok && isDateMs(validated.value.createdAt) && updatesHaveDates(validated.value);
     if (validated.ok && isValid) {
       result.incidents.push(publicManualIncident(validated.value));
+      result.listedIds.add(validated.value.id);
     } else {
       result.rejected.push({
         index: i,
-        id: safeId(raw),
+        id,
         reason: validated.ok ? "time is not a valid date" : "invalid",
       });
     }

@@ -212,8 +212,10 @@ test("private manual incidents are skipped without a rejection; public ones lose
       draft: { status: "identified", message: "secret draft" },
     },
     { ...manualIncident({ id: 5 }), title: undefined },
+    { ...manualIncident({ id: 1 }), id: "6", visibility: "internal" },
   ];
   const out = await fetchManualIncidents({ baseUrl: base, fetch: respond(items) });
   assert.deepEqual(out.rejected, [{ index: 4, id: 5, reason: "invalid" }]);
   assert.deepEqual(out.incidents, [manualIncident({ id: 4 })]);
+  assert.deepEqual(out.listedIds, new Set([1, 2, 3, 4, 5]));
 });

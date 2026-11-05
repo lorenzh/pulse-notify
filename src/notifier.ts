@@ -195,7 +195,7 @@ export class Notifier {
   #failedPolls = 0;
   /** Ids of the incidents in the last successful poll; `undefined` before the first one. */
   #visible: Set<number> | undefined;
-  /** Ids of the manual incidents in the last successful read; kept on 404 or a failed read. */
+  /** Ids listed by the last successful read, private or invalid ones too; kept on 404 or a failed read. */
   #visibleManual: Set<number> | undefined;
   /** Check names from the last good `/checks` read; kept while that read fails. */
   #checkNames = new Map<string, string>();
@@ -403,7 +403,7 @@ export class Notifier {
     if (manualResult) {
       this.#reportRejected("manual-incidents", manualResult.rejected);
       if (!manualResult.isAbsent) {
-        this.#visibleManual = new Set(manualResult.incidents.map((i) => i.id));
+        this.#visibleManual = manualResult.listedIds;
       }
     }
     if (checks) this.#checkNames = new Map(checks.map((c) => [c.id, c.name]));

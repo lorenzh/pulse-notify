@@ -569,7 +569,7 @@ function publish(
 
 const REMINDER_KEY = /^(\d+):reminder:(\d+)$/;
 const INCIDENT_KEY = /^(\d+):/;
-const MANUAL_KEY = /^manual:(\d+):/;
+const MANUAL_KEY = /^manual:(-?\d+):/;
 
 /**
  * Durable delivery ledger: a SQLite database (format 4) in WAL mode with `synchronous = FULL`.
