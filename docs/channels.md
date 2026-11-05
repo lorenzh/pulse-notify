@@ -80,6 +80,7 @@ Notify also reads `GET /manual-incidents` and announces each manual incident: on
 - The payload has `incidentId` (the manual id), `checkName` (the title), an empty `checkId` and `reason: null`, plus `manual`: `{ impact, status, message, componentIds }`. `message` is the text of the update the event is about. `time` is the update time.
 - Chat and email messages show title, impact, status, the message and the component ids; control characters are cleaned and chat markup is escaped.
 - On the first start of a channel, existing manual incidents are recorded without sending.
+- Only public, published incidents are sent. An item with `visibility` other than `"public"` (an internal-only incident) or with `publishedAt` that is not a number (a draft) is dropped on read, before validation, seeding and routing. Notes and a pending draft update of a public incident are removed before detection. So no channel, also not a catch-all one, ever gets a draft, a note or an internal incident; there is no setting to opt in. A draft that is published later is announced once as a new incident. Older apis send neither field, so their items count as public. This needs pulse-contract `2.1.0`.
 - An api that answers 404 for `/manual-incidents` (older version) counts as having none. Other failures fail the poll, but automatic incidents are still delivered; see [operation.md](operation.md#failing-feeds).
 
 ## Reminders
