@@ -1133,19 +1133,10 @@ export class Ledger {
           ? "UPDATE entries SET status = ?, at = ? WHERE channel_id = ? AND key = ?"
           : "UPDATE entries SET status = ?, at = ?, payload = NULL, recipients = NULL WHERE channel_id = ? AND key = ?";
         this.#db.query(sql).run(status, at, channelId, key);
-        this.#db
-          .query(
-            "UPDATE resend_commands SET state = ?, updated_at = ? WHERE channel_id = ? AND key = ? AND state = 'admitted'",
-          )
-          .run(status, at, channelId, key);
+        this.#finishCommandRows(channelId, key, status, at);
       },
       () => {
-        for (const row of this.#resendCommands.values()) {
-          if (row.channelId === channelId && row.key === key && row.state === "admitted") {
-            row.state = status;
-            row.updatedAt = at;
-          }
-        }
+        this.#finishCommandsInMemory(channelId, key, status, at);
         entry.status = status;
         entry.at = at;
         if (!isKept) {
@@ -1154,6 +1145,29 @@ export class Ledger {
         }
       },
     );
+  }
+
+  // Every terminal entry write calls these in its own transaction (Decision 14).
+  #finishCommandRows(channelId: string, key: string, state: ResendCommandState, at: number): void {
+    this.#db
+      .query(
+        "UPDATE resend_commands SET state = ?, updated_at = ? WHERE channel_id = ? AND key = ? AND state = 'admitted'",
+      )
+      .run(state, at, channelId, key);
+  }
+
+  #finishCommandsInMemory(
+    channelId: string,
+    key: string,
+    state: ResendCommandState,
+    at: number,
+  ): void {
+    for (const row of this.#resendCommands.values()) {
+      if (row.channelId === channelId && row.key === key && row.state === "admitted") {
+        row.state = state;
+        row.updatedAt = at;
+      }
+    }
   }
 
   /** Stores the recipient progress of a pending or failed key. */
@@ -1407,12 +1421,16 @@ export class Ledger {
           "UPDATE entries SET status = 'dropped', at = ?, payload = NULL, recipients = NULL WHERE channel_id = ? AND key = ?",
         );
         for (const [channelId, keys] of targets) {
-          for (const key of keys) drop.run(at, channelId, key);
+          for (const key of keys) {
+            drop.run(at, channelId, key);
+            this.#finishCommandRows(channelId, key, "dropped", at);
+          }
         }
       },
       () => {
         for (const [channelId, keys] of targets) {
           for (const key of keys) {
+            this.#finishCommandsInMemory(channelId, key, "dropped", at);
             const entry = this.#entry(channelId, key);
             if (entry)
               Object.assign(entry, {
