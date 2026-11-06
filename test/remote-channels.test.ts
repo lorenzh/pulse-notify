@@ -17,6 +17,10 @@ import {
   validateServiceNotifyChannels,
 } from "@lorenzh/pulse-contract";
 import { ApiReadError, fetchChecks, getService, SERVICE_MAX_BYTES } from "../src/api.ts";
+import { ChannelSync, type ChannelSyncOptions } from "../src/channel-sync.ts";
+import { parseConfig } from "../src/config.ts";
+import { Ledger } from "../src/ledger.ts";
+import { Notifier } from "../src/notifier.ts";
 import {
   type ChannelsAnswer,
   canonicalDefinition,
@@ -25,7 +29,16 @@ import {
   resolveDatabaseChannel,
   type SecretContext,
 } from "../src/remote-channels.ts";
-import { startFakeApi } from "./support.ts";
+import type { Schedule } from "../src/types.ts";
+import {
+  type FakeApi,
+  incident,
+  type Receiver,
+  type SpyLogger,
+  spyLogger,
+  startFakeApi,
+  startReceiver,
+} from "./support.ts";
 
 const REV = `sha256-${"1".repeat(64)}`;
 const TOKEN = "sentinel-service-token-0123456789";
@@ -349,4 +362,429 @@ test("service reads refuse oversized, wrong-wire, malformed and redirected answe
   } finally {
     await api.close();
   }
+});
+
+const R1 = `sha256-${"a".repeat(64)}`;
+const R2 = `sha256-${"b".repeat(64)}`;
+const R3 = `sha256-${"c".repeat(64)}`;
+const R4 = `sha256-${"d".repeat(64)}`;
+const SYNC_NOW = Date.UTC(2026, 0, 1, 13, 0, 0);
+
+interface Harness {
+  api: FakeApi;
+  ledger: Ledger;
+  notifier: Notifier;
+  sync: ChannelSync;
+  receivers: Record<"a" | "b1" | "b4" | "c", Receiver>;
+  /** The status of every channels read, in order. */
+  statuses: number[];
+  logger: SpyLogger;
+  clock: { now: number };
+  close(): Promise<void>;
+}
+
+async function harness(
+  statePath = join(mkdtempSync(join(dir, "sync-")), "state.sqlite"),
+): Promise<Harness> {
+  const api = await startFakeApi();
+  const receivers = {
+    a: await startReceiver(),
+    b1: await startReceiver(),
+    b4: await startReceiver(),
+    c: await startReceiver(),
+  };
+  const env = {
+    PULSE_NOTIFY_SECRET_A: receivers.a.url,
+    PULSE_NOTIFY_SECRET_B: receivers.b1.url,
+    PULSE_NOTIFY_SECRET_B4: receivers.b4.url,
+    PULSE_NOTIFY_SECRET_C: receivers.c.url,
+  };
+  const clock = { now: SYNC_NOW };
+  const ledger = new Ledger(statePath, { now: () => clock.now });
+  const logger = spyLogger();
+  const notifier = new Notifier({
+    config: { channels: [] },
+    apiUrl: api.url,
+    ledger,
+    logger,
+    now: () => clock.now,
+    sleep: () => Promise.resolve(),
+    schedule: () => () => {},
+  });
+  const statuses: number[] = [];
+  const recording: typeof fetch = Object.assign(
+    async (input: string | URL | Request, init?: RequestInit) => {
+      const response = await fetch(input, init);
+      statuses.push(response.status);
+      return response;
+    },
+    { preconnect: fetch.preconnect },
+  );
+  const sync = new ChannelSync({
+    ledger,
+    install: (channels) => notifier.reconcile(channels),
+    parseFile: () => [],
+    fetchChannels: (etag) =>
+      getService(
+        { baseUrl: api.url, token: TOKEN, fetch: recording },
+        "service/notify/channels",
+        (raw) => ({ ok: true, value: raw }),
+        etag,
+      ),
+    secrets: { env, secretDir: undefined, realpath: realpathSync, readFile: () => "" },
+    now: () => clock.now,
+    logger,
+  });
+  const h: Harness = {
+    api,
+    ledger,
+    notifier,
+    sync,
+    receivers,
+    statuses,
+    logger,
+    clock,
+    close: async () => {
+      await sync.stop();
+      await notifier.stop();
+      ledger.close();
+      await api.close();
+      for (const r of Object.values(receivers)) await r.close();
+    },
+  };
+  return h;
+}
+
+const SA = { id: "a", type: "webhook", urlEnv: "PULSE_NOTIFY_SECRET_A", ...stamps };
+const SB1 = { id: "b", type: "slack", urlEnv: "PULSE_NOTIFY_SECRET_B", ...stamps };
+const SC1 = { id: "c", type: "webhook", urlEnv: "PULSE_NOTIFY_SECRET_C", ...stamps };
+const SC2 = { ...SC1, checks: ["api"] };
+const SB2 = { ...sized("b", 16_385), ...stamps };
+const SB4 = { id: "b", type: "webhook", urlEnv: "PULSE_NOTIFY_SECRET_B4", ...stamps };
+
+function serve(h: Harness, etag: string, revision: string, channels: unknown[]): void {
+  h.api.raw.delete("/service/notify/channels");
+  h.api.notifyChannels = { etag, body: { revision, channels } };
+}
+
+function installed(h: Harness): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const c of h.notifier.channels()) out[c.id] = "url" in c ? `${c.type} ${c.url}` : c.type;
+  return out;
+}
+
+function rows(h: Harness): Record<string, string> {
+  return Object.fromEntries(h.ledger.remoteChannels().map((r) => [r.id, r.revision]));
+}
+
+/** Whole-envelope failures: each keeps every worker, row, ETag and revision of r2. */
+const envelopeCases: [string, (h: Harness) => void, RegExp][] = [
+  [
+    "r3 with 101 elements",
+    (h) =>
+      serve(
+        h,
+        '"r3"',
+        R3,
+        Array.from({ length: 101 }, (_, i) => ({ ...SA, id: `x${i}` })),
+      ),
+    /^channels answer/,
+  ],
+  ["r3 with a duplicate a", (h) => serve(h, '"r3"', R3, [SA, SA]), /^channels answer/],
+  [
+    "a body of 1048577 bytes",
+    (h) => h.api.raw.set("/service/notify/channels", { body: "x".repeat(1_048_577) }),
+    /^$/,
+  ],
+  [
+    "a wire mismatch",
+    (h) =>
+      h.api.raw.set("/service/notify/channels", {
+        headers: { "x-pulse-contract": "9" },
+        body: JSON.stringify({ revision: R3, channels: [] }),
+      }),
+    /^$/,
+  ],
+  ["invalid JSON", (h) => h.api.raw.set("/service/notify/channels", { body: "{" }), /^$/],
+];
+
+test("the r1-r4 table: whole envelope rollback, per-element last good, 304 and recovery", async () => {
+  const h = await harness();
+  try {
+    // r1: three valid channels install.
+    serve(h, '"r1"', R1, [SA, SB1, SC1]);
+    await h.sync.poll();
+    await h.notifier.idle();
+    const { a, b1, b4, c } = h.receivers;
+    assert.deepEqual(installed(h), {
+      a: `webhook ${a.url}`,
+      b: `slack ${b1.url}`,
+      c: `webhook ${c.url}`,
+    });
+    assert.equal(h.sync.state().appliedRevision, R1);
+    assert.deepEqual(h.sync.state().rejected, []);
+    const bRow = h.ledger.remoteChannels().find((r) => r.id === "b");
+
+    // r2: b is too large and keeps r1; c's routing changes.
+    h.clock.now = SYNC_NOW + 60_000;
+    serve(h, '"r2"', R2, [SA, SB2, SC2]);
+    await h.sync.poll();
+    await h.notifier.idle();
+    const r2Rejected = [
+      { channelId: "b", reason: "channels[1]: must be at most 16384 bytes as JSON" },
+    ];
+    assert.deepEqual(installed(h), {
+      a: `webhook ${a.url}`,
+      b: `slack ${b1.url}`,
+      c: `webhook ${c.url}`,
+    });
+    assert.deepEqual(h.notifier.channels().find((x) => x.id === "c")?.checks, ["api"]);
+    assert.deepEqual(h.sync.state().rejected, r2Rejected);
+    assert.equal(h.sync.state().appliedRevision, R2);
+    assert.deepEqual(rows(h), { a: R2, b: R1, c: R2 });
+    assert.deepEqual(
+      h.ledger.remoteChannels().find((r) => r.id === "b"),
+      bRow,
+    );
+    assert.equal(h.ledger.remoteChannels().find((r) => r.id === "a")?.appliedAt, SYNC_NOW + 60_000);
+
+    // A new incident reaches b at its r1 destination.
+    await h.notifier.tick();
+    h.api.incidents = [incident({ id: 1, checkId: "api" })];
+    await h.notifier.tick();
+    await h.notifier.idle();
+    assert.equal(b1.requests.length, 1);
+    assert.equal(a.requests.length, 1);
+    assert.equal(c.requests.length, 1);
+
+    // The next poll sends the r2 ETag, gets 304 and keeps the rejection.
+    h.statuses.length = 0;
+    await h.sync.poll();
+    assert.deepEqual(h.statuses, [304]);
+    assert.deepEqual(h.sync.state().rejected, r2Rejected);
+    assert.equal(h.notifier.channels().find((x) => x.id === "b")?.type, "slack");
+
+    // r3 and broken answers change nothing; the stored ETag stays r2.
+    for (const [name, arrange, reason] of envelopeCases) {
+      arrange(h);
+      await h.sync.poll();
+      assert.deepEqual(rows(h), { a: R2, b: R1, c: R2 }, name);
+      assert.equal(h.sync.state().appliedRevision, R2, name);
+      assert.equal(
+        Object.keys(installed(h))
+          .sort((x, y) => x.localeCompare(y))
+          .join(","),
+        "a,b,c",
+        name,
+      );
+      const rejected = h.sync.state().rejected;
+      if (reason.source !== "^$") {
+        assert.equal(rejected.length, 1, name);
+        assert.equal(rejected[0]?.channelId, null, name);
+        assert.match(rejected[0]?.reason ?? "", reason, name);
+      }
+      serve(h, '"r2"', R2, [SA, SB2, SC2]);
+      h.statuses.length = 0;
+      await h.sync.poll();
+      assert.deepEqual(h.statuses, [304], name);
+    }
+
+    // r4: a valid b installs and clears the rejection.
+    serve(h, '"r4"', R4, [SA, SB4, SC2]);
+    await h.sync.poll();
+    await h.notifier.idle();
+    assert.equal(installed(h).b, `webhook ${b4.url}`);
+    assert.deepEqual(h.sync.state().rejected, []);
+    assert.deepEqual(rows(h), { a: R4, b: R4, c: R4 });
+    assert.equal(
+      h.logger.entries.some((e) => JSON.stringify(e).includes(TOKEN)),
+      false,
+    );
+  } finally {
+    await h.close();
+  }
+});
+
+test("a cold r2 installs only a and c and persists no b", async () => {
+  const h = await harness();
+  try {
+    serve(h, '"r2"', R2, [SA, SB2, SC2]);
+    await h.sync.poll();
+    assert.deepEqual(Object.keys(installed(h)), ["a", "c"]);
+    assert.deepEqual(rows(h), { a: R2, c: R2 });
+  } finally {
+    await h.close();
+  }
+});
+
+test("a missing secret keeps the last good version or installs nothing; neighbors apply", async () => {
+  const h = await harness();
+  try {
+    serve(h, '"r1"', R1, [SA, SC1]);
+    await h.sync.poll();
+    const missing = { urlEnv: "PULSE_NOTIFY_SECRET_MISSING" };
+    serve(h, '"r2"', R2, [{ ...SA, ...missing }, SC2, { ...SB4, ...missing }]);
+    await h.sync.poll();
+    assert.deepEqual(installed(h), {
+      a: `webhook ${h.receivers.a.url}`,
+      c: `webhook ${h.receivers.c.url}`,
+    });
+    assert.deepEqual(h.notifier.channels().find((x) => x.id === "c")?.checks, ["api"]);
+    assert.deepEqual(rows(h), { a: R1, c: R2 });
+    assert.deepEqual(
+      h.sync.state().rejected.map((r) => r.channelId),
+      ["a", "b"],
+    );
+    assert.equal(h.sync.state().appliedRevision, R2);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a cold start while the api is down resolves the stored definitions locally", async () => {
+  const path = join(mkdtempSync(join(dir, "cold-")), "state.sqlite");
+  const first = await harness(path);
+  serve(first, '"r1"', R1, [SA, SC1]);
+  await first.sync.poll();
+  await first.close();
+  const h = await harness(path);
+  try {
+    h.api.failing = true;
+    await h.notifier.reconcile(h.sync.restore());
+    await h.sync.poll();
+    assert.deepEqual(installed(h), {
+      a: `webhook ${h.receivers.a.url}`,
+      c: `webhook ${h.receivers.c.url}`,
+    });
+    assert.deepEqual(rows(h), { a: R1, c: R1 });
+  } finally {
+    await h.close();
+  }
+});
+
+test("an api without channels gives an empty remote layer and logs once", async () => {
+  const h = await harness();
+  try {
+    serve(h, '"r1"', R1, [SA]);
+    await h.sync.poll();
+    h.api.notifyChannels = undefined;
+    await h.sync.poll();
+    await h.sync.poll();
+    assert.deepEqual(installed(h), {});
+    const lines = h.logger.entries.filter((e) => /no database channels/.test(e.msg));
+    assert.equal(lines.length, 1);
+  } finally {
+    await h.close();
+  }
+});
+
+test("the file is re-read at every poll, also on 304 and without a token", async () => {
+  const api = await startFakeApi();
+  const fileDir = mkdtempSync(join(dir, "file-"));
+  const path = join(fileDir, "notify.json");
+  const ledger = new Ledger(join(fileDir, "state.sqlite"));
+  const logger = spyLogger();
+  const installs: string[][] = [];
+  let parses = 0;
+  const file = (channels: unknown[]): void => writeFileSync(path, JSON.stringify({ channels }));
+  const options = (fetchChannels: ChannelSyncOptions["fetchChannels"]): ChannelSyncOptions => ({
+    ledger,
+    install: (channels) => {
+      installs.push(channels.map((c) => `${c.id}:${c.type}`));
+    },
+    readFile: () => readFileSync(path, "utf8"),
+    parseFile: (text) => {
+      parses++;
+      return parseConfig(
+        JSON.parse(text),
+        path,
+        { env: { SLACK_A: "https://hooks.invalid/a" }, readFile: () => "" },
+        {
+          allowEmpty: true,
+        },
+      ).channels;
+    },
+    fetchChannels,
+    secrets: ctx({ env: { PULSE_NOTIFY_SECRET_A: SECRET } }),
+    now: () => 1,
+    logger,
+  });
+  try {
+    // Token mode: a file Slack "a" shadows the database webhook "a" as a whole.
+    api.notifyChannels = { etag: '"e"', body: { revision: REV, channels: [SA] } };
+    const sync = new ChannelSync(
+      options((etag) =>
+        getService(
+          { baseUrl: api.url, token: TOKEN },
+          "service/notify/channels",
+          (raw) => ({ ok: true, value: raw }),
+          etag,
+        ),
+      ),
+    );
+    file([{ id: "a", type: "slack", urlEnv: "SLACK_A" }]);
+    await sync.poll();
+    assert.deepEqual(installs.at(-1), ["a:slack"]);
+    assert.deepEqual(sync.state().shadowedIds, ["a"]);
+    await sync.poll();
+    assert.equal(parses, 1);
+    // An invalid file, then a deleted one, keep the last good channels.
+    writeFileSync(path, "{");
+    await sync.poll();
+    rmSync(path);
+    await sync.poll();
+    assert.deepEqual(installs.at(-1), ["a:slack"]);
+    // A valid empty file removes the file channel and restores the database copy.
+    file([]);
+    await sync.poll();
+    assert.deepEqual(installs.at(-1), ["a:webhook"]);
+    assert.deepEqual(sync.state().shadowedIds, []);
+
+    // Without a token: the file reloads and no service request is made.
+    const before = api.requested.filter((p) => p.startsWith("/service/")).length;
+    const tokenless = new ChannelSync(options(undefined));
+    file([{ id: "t", type: "webhook", url: "https://hooks.invalid/t" }]);
+    await tokenless.poll();
+    file([{ id: "u", type: "webhook", url: "https://hooks.invalid/u" }]);
+    await tokenless.poll();
+    assert.deepEqual(installs.at(-1), ["u:webhook"]);
+    assert.equal(api.requested.filter((p) => p.startsWith("/service/")).length, before);
+  } finally {
+    ledger.close();
+    await api.close();
+  }
+});
+
+test("the loop polls on its schedule until stopped", async () => {
+  const timers: { fn: () => void; ms: number }[] = [];
+  const schedule: Schedule = (fn, ms) => {
+    const timer = { fn, ms };
+    timers.push(timer);
+    return () => timers.splice(timers.indexOf(timer), 1);
+  };
+  let installs = 0;
+  const sync = new ChannelSync({
+    ledger: { remoteChannels: () => [], replaceRemoteChannels: () => {} },
+    install: () => {
+      installs++;
+    },
+    parseFile: () => [],
+    secrets: ctx(),
+    now: () => 1,
+    logger: spyLogger(),
+  });
+  sync.start(schedule, 15_000);
+  assert.deepEqual(
+    timers.map((t) => t.ms),
+    [0],
+  );
+  timers.shift()?.fn();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(installs, 1);
+  assert.deepEqual(
+    timers.map((t) => t.ms),
+    [15_000],
+  );
+  await sync.stop();
+  assert.deepEqual(timers, []);
 });
