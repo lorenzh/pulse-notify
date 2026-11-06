@@ -66,6 +66,8 @@ export class ChannelDelivery {
   /** The running job of each key, from enqueue until it ends. */
   readonly #jobs = new Map<string, Promise<void>>();
   readonly #abort = new AbortController();
+  /** Aborts the retry timers only; `retire` uses it so an in-flight send can finish. */
+  readonly #sleepAbort = new AbortController();
   readonly #aborted: Promise<void>;
   #isSending = false;
   #stopped = false;
@@ -73,7 +75,7 @@ export class ChannelDelivery {
   constructor(opts: ChannelDeliveryOptions) {
     this.#opts = opts;
     this.#aborted = new Promise((resolve) => {
-      this.#abort.signal.addEventListener("abort", () => resolve(), { once: true });
+      this.#sleepAbort.signal.addEventListener("abort", () => resolve(), { once: true });
     });
   }
 
@@ -104,7 +106,18 @@ export class ChannelDelivery {
   stop(): void {
     this.#stopped = true;
     for (const grant of this.#ready.splice(0)) grant(false);
+    this.#sleepAbort.abort();
     this.#abort.abort();
+  }
+
+  /**
+   * Takes no new job and ends every ready or waiting job, but lets the send in flight finish or
+   * time out. Unfinished keys stay `pending` in the ledger for the replacement worker.
+   */
+  retire(): void {
+    this.#stopped = true;
+    for (const grant of this.#ready.splice(0)) grant(false);
+    this.#sleepAbort.abort();
   }
 
   /**
@@ -252,7 +265,7 @@ export class ChannelDelivery {
   }
 
   async #wait(ms: number): Promise<void> {
-    await Promise.race([this.#opts.sleep(ms, this.#abort.signal), this.#aborted]);
+    await Promise.race([this.#opts.sleep(ms, this.#sleepAbort.signal), this.#aborted]);
   }
 
   #settle(notification: Notification, outcome: Exclude<Outcome, { kind: "stopped" }>): void {

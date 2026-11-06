@@ -49,13 +49,16 @@ export class Metrics {
       for (const outcome of POLL_OUTCOMES) this.#feedPolls.inc({ feed, outcome }, 0);
       this.#skipped.inc({ feed }, 0);
     }
-    for (const channel of channelIds) {
-      for (const outcome of DELIVERY_OUTCOMES) this.#deliveries.inc({ channel, outcome }, 0);
-    }
+    for (const channel of channelIds) this.installChannel(channel);
     this.#registry.collect(() => {
       pendingGauge.set(pending());
       failedGauge.set(failedPolls());
     });
+  }
+
+  /** Creates the delivery series of a channel at zero; a second call changes nothing. */
+  installChannel(channel: string): void {
+    for (const outcome of DELIVERY_OUTCOMES) this.#deliveries.inc({ channel, outcome }, 0);
   }
 
   pollDone(outcome: PollOutcome): void {
