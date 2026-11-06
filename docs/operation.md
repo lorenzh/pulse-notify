@@ -41,6 +41,7 @@ bun src/index.ts failed resend --all --channel ops-hook
 
 - `failed list` prints one tab-separated line per failed entry: channel, key, failure time (UTC), event, and `payload` or `no payload`. With no entries it prints `no failed notifications` and exits 0.
 - `failed resend` sets the entry back to `pending` with the same key and stored notification. The service sends it at its next start through the normal pending path, with the same `idempotency-key`. Reminders go through the same stale check, so a resent reminder of a resolved incident is dropped.
+- Live resend: with `PULSE_NOTIFY_API_TOKEN`, a resend started in the console reaches the running service, see [Live resend](#live-resend). The offline command stays for a stopped service.
 - The command needs only `PULSE_NOTIFY_STATE` (and `PULSE_NOTIFY_LOCK_LEASE_SECONDS` if set). It does not read the config file and starts no service, listener or poller. It takes the state lock, so it refuses while the service runs.
 - An entry written by an older version has no payload: it is listed as `no payload` and cannot be resent. A single `resend` of it exits 1; with `--all` it is skipped and reported, and the exit code is 1.
 
@@ -49,6 +50,18 @@ bun src/index.ts failed resend --all --channel ops-hook
 | `0`       | Done (also: nothing to list or resend)                              |
 | `1`       | Unknown key, no payload, skipped entries with `--all`, or bad usage |
 | `2`       | State file in use by a live process, or the state file is unusable  |
+
+### Live resend
+
+With `PULSE_NOTIFY_API_TOKEN`, notify claims up to 20 queued resend commands every `PULSE_NOTIFY_COMMAND_POLL_MS` (default 5000) with `POST /service/notify/resends/claim`. Without a token it makes no such call.
+
+- A command id seen before is never run again; notify posts its stored state once more.
+- A new command is admitted in one SQLite transaction: the channel must be installed (else `channel-unavailable`), the key must be `failed` (else `not-failed`) and have a stored notification (else `no-payload`). An admitted key is set back to `pending` with refused email recipients cleared, and the command row is written. The send starts only after this commit. A crash after the commit sends the key at the next start.
+- The send uses the normal path: the same `idempotency-key` and Message-ID, delivered email recipients get nothing again, and a stale reminder is dropped. Its final state (`delivered`, `failed` or `dropped`) and every `admitted` command of that channel and key are written in one transaction.
+- Each poll posts at most 20 results that the api has not acknowledged, oldest first, to `POST /service/notify/resends/<id>/result`. A `204` acknowledges the state. A `404` or `409` also ends the post and logs `resend result refused by the api` once (`command`, `state`, `postedState`). A timeout, a network error or another status leaves the result for the next poll.
+- A successfully resent key leaves the `failed` list of the next report.
+- The calls send the token as Bearer only to `/service/*`, follow no redirect, time out after 5000 ms and read at most 1048576 bytes.
+- `failed list|resend` still exits 2 while the service holds the lock.
 
 Backup: stop pulse-notify, then copy `<state>`. A clean stop checkpoints, so `<state>-wal` is empty. A copy of the live file is not safe. Restore: stop pulse-notify, remove `<state>-wal` and `<state>-shm`, put the file back, start.
 
@@ -97,6 +110,11 @@ Logs are JSON lines on stderr. Each line has `time` (ISO 8601 UTC), `level` (`de
 | `warn`  | `delivery attempt partly refused`                                   | `channel`, `key`, `attempt`, `delivered`, `refused`, `remaining` (counts), `codes` (sorted reply codes)         |
 | `error` | `ledger recipient write failed`                                     | `channel`, `key`, `error`, `code`, `cause`                                                                      |
 | `error` | `notification delivery failed`                                      | `channel`, `key`, `attempts`, `error`, `code`, `cause`; for a permanent error also `permanent: true` and `note` |
+| `info`  | `resend command admitted`                                           | `command`, `channel`, `state`                                                                                   |
+| `warn`  | `resend claim failed, the next poll retries`                        | `error`, `code`, `cause`                                                                                        |
+| `warn`  | `resend result post failed, the next poll retries`                  | `command`, `error`, `code`, `cause`                                                                             |
+| `warn`  | `resend result refused by the api`                                  | `command`, `state`, `postedState`                                                                               |
+| `error` | `resend admission failed`                                           | `command`, `error`, `code`, `cause`                                                                             |
 | `info`  | `old ledger entries pruned`                                         | `count`                                                                                                         |
 | `info`  | `old alert state pruned`                                            | `count`                                                                                                         |
 | `info`  | `incident notifications dropped: channel sends no incidents`        | `channel`, `count` (once per channel with `sendIncidents: false` and count above 0, at start)                   |

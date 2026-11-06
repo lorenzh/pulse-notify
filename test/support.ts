@@ -98,6 +98,12 @@ export interface FakeApi {
   notifyChannels: { etag: string; body: unknown } | undefined;
   /** Bodies of `PUT /service/notify/report`, parsed, in order; each answers 204. */
   reports: unknown[];
+  /** Answers of `POST /service/notify/resends/claim`, one per claim; empty answers no commands. */
+  resendClaims: unknown[][];
+  /** Bodies of `POST /service/notify/resends/:id/result`, with the id and the answered status. */
+  resendResults: { id: string; state: unknown; status: number }[];
+  /** Status of each result post, in order; `204` when the list is used up. */
+  resendStatuses: number[];
   close(): Promise<void>;
 }
 
@@ -133,6 +139,32 @@ function recordReport(req: IncomingMessage, res: ServerResponse, reports: unknow
   });
 }
 
+const RESULT_PATH = /^\/service\/notify\/resends\/([^/]+)\/result$/;
+
+/** Answers the resend claim and result posts of Decision 14; `false` for any other request. */
+function answerResends(req: IncomingMessage, res: ServerResponse, api: FakeApi): boolean {
+  if (req.method !== "POST") return false;
+  if (req.url === "/service/notify/resends/claim") {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ commands: api.resendClaims.shift() ?? [] }));
+    return true;
+  }
+  const match = RESULT_PATH.exec(req.url ?? "");
+  if (match === null) return false;
+  let text = "";
+  req.on("data", (chunk: Buffer) => {
+    text += chunk.toString("utf8");
+  });
+  req.on("end", () => {
+    const status = api.resendStatuses.shift() ?? 204;
+    const body = asRecord(JSON.parse(text));
+    api.resendResults.push({ id: decodeURIComponent(match[1] ?? ""), state: body.state, status });
+    res.statusCode = status;
+    res.end();
+  });
+  return true;
+}
+
 export async function startFakeApi(): Promise<FakeApi> {
   const api: FakeApi = {
     url: "",
@@ -148,6 +180,9 @@ export async function startFakeApi(): Promise<FakeApi> {
     authorizations: [],
     notifyChannels: undefined,
     reports: [],
+    resendClaims: [],
+    resendResults: [],
+    resendStatuses: [],
     close: () => close(server),
   };
   const server = createServer((req, res) => {
@@ -163,6 +198,7 @@ export async function startFakeApi(): Promise<FakeApi> {
       recordReport(req, res, api.reports);
       return;
     }
+    if (answerResends(req, res, api)) return;
     const failStatus = api.failingPaths.get(req.url ?? "");
     if (api.failing || (api.failingManual && req.url === "/manual-incidents") || failStatus) {
       res.statusCode = failStatus ?? 500;

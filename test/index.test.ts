@@ -630,3 +630,132 @@ test("an old api that answers 404 on the channels gives file channels only, logg
     await api.close();
   }
 });
+
+const RESEND_ID = "AAAAAAAAAAAAAAAAAAAAAAA9";
+
+/** A state file whose database channel `db` holds `1:opened` as failed, with its payload. */
+function failedState(file: string): void {
+  const ledger = new Ledger(file, { now: () => Date.now() });
+  ledger.claim("db", "1:opened", {
+    key: "1:opened",
+    event: "opened",
+    incidentId: 1,
+    checkId: "example",
+    checkName: "Example site",
+    reason: null,
+    time: "2026-01-01T00:00:00.000Z",
+    timeMs: 0,
+    openedMs: 0,
+  });
+  ledger.settle("db", "1:opened", "failed");
+  ledger.close();
+}
+
+function failedKeys(report: unknown): unknown[] {
+  const failed = (report as { failed: { channelId: string; key: string }[] }).failed;
+  return failed.map((f) => `${f.channelId}/${f.key}`);
+}
+
+test("token mode: a claimed resend sends once over HTTP, posts its results with Bearer, and leaves the report", async () => {
+  const api = await startFakeApi();
+  const receiver = await startReceiver();
+  api.notifyChannels = {
+    etag: '"r1"',
+    body: {
+      revision: REVISION,
+      channels: [
+        {
+          id: "db",
+          type: "webhook",
+          urlEnv: "PULSE_NOTIFY_SECRET_HOOK",
+          createdAt: 1,
+          updatedAt: 2,
+        },
+      ],
+    },
+  };
+  const state = join(dir, "token-resend.db");
+  failedState(state);
+  const lines: string[] = [];
+  const channelTimers = fakeTimers();
+  const commandTimers = fakeTimers();
+  try {
+    const running = main(
+      {
+        PULSE_NOTIFY_API_TOKEN: TOKEN,
+        PULSE_NOTIFY_STATE: state,
+        PULSE_API_URL: api.url,
+        PULSE_NOTIFY_SECRET_HOOK: `${receiver.url}/${HOOK_SECRET}`,
+      },
+      {
+        write: (line) => lines.push(line),
+        channelSchedule: channelTimers.schedule,
+        commandSchedule: commandTimers.schedule,
+        now: () => 1_000,
+      },
+    );
+    await running.listening;
+    channelTimers.fire(0);
+    await until(() => api.reports.length === 1);
+    assert.deepEqual(failedKeys(api.reports[0]), ["db/1:opened"]);
+
+    // Claim: admitted and sent once; the admitted post gets a 503 and stays due.
+    api.resendClaims.push([
+      {
+        id: RESEND_ID,
+        channelId: "db",
+        key: "1:opened",
+        requestId: "request-0000000001",
+        state: "claimed",
+        createdAt: 900,
+        updatedAt: 900,
+      },
+    ]);
+    api.resendStatuses.push(503, 409);
+    assert.equal(commandTimers.fire(0), true);
+    await until(() => receiver.requests.length === 1 && api.resendResults.length === 1);
+    assert.equal(receiver.requests[0]?.headers["idempotency-key"], "1:opened");
+    assert.deepEqual(api.resendResults[0], { id: RESEND_ID, state: "admitted", status: 503 });
+
+    // The next poll posts the stored final state; the api answers 409 and it is never posted again.
+    await until(() => commandTimers.timers.some((t) => t.ms === 5_000 && !t.isCancelled));
+    commandTimers.fire(5_000);
+    await until(() => api.resendResults.length === 2);
+    assert.deepEqual(api.resendResults[1], { id: RESEND_ID, state: "delivered", status: 409 });
+    await until(() => commandTimers.timers.filter((t) => t.ms === 5_000).length === 2);
+    commandTimers.fire(5_000);
+    await until(() => commandTimers.timers.filter((t) => t.ms === 5_000).length === 3);
+    assert.equal(api.resendResults.length, 2);
+    assert.equal(lines.filter((l) => l.includes("resend result refused by the api")).length, 1);
+
+    // The next report no longer lists the resent key.
+    await until(() => channelTimers.timers.some((t) => t.ms === 15_000 && !t.isCancelled));
+    channelTimers.fire(15_000);
+    await until(() => api.reports.length === 2);
+    assert.deepEqual(failedKeys(api.reports[1]), []);
+    await running.stop();
+    assert.equal(receiver.requests.length, 1);
+
+    for (const { path, authorization } of api.authorizations) {
+      const expected = path.startsWith("/service/") ? `Bearer ${TOKEN}` : undefined;
+      assert.equal(authorization, expected, path);
+    }
+    assert.ok(api.authorizations.some((a) => a.path === "/service/notify/resends/claim"));
+    assert.ok(api.authorizations.some((a) => !a.path.startsWith("/service/")));
+    const seen = JSON.stringify(api.reports) + JSON.stringify(api.resendResults) + lines.join("\n");
+    assert.equal(seen.includes(TOKEN), false);
+    assert.equal(seen.includes(HOOK_SECRET), false);
+    const ledger = new Ledger(state);
+    try {
+      assert.deepEqual(
+        ledger.resendCommands().map((r) => [r.id, r.channelId, r.key, r.state, r.postedState]),
+        [[RESEND_ID, "db", "1:opened", "delivered", "delivered"]],
+      );
+    } finally {
+      ledger.close();
+    }
+  } finally {
+    await api.close();
+    await receiver.close();
+  }
+});

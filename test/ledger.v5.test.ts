@@ -341,3 +341,83 @@ PRAGMA user_version = 5;`);
     ["unposted", "admitted", "edge"],
   );
 });
+
+const RESEND_NOTE = {
+  key: "1:opened",
+  event: "opened" as const,
+  incidentId: 1,
+  checkId: "example",
+  checkName: "Example site",
+  reason: null,
+  time: "2026-01-01T00:00:00.000Z",
+  timeMs: 0,
+  openedMs: 0,
+};
+
+/** A failed `a/1:opened`, admitted by `cmd-1`, plus a second admitted row `cmd-2` of the same key. */
+function twoAdmitted(file: string): void {
+  const ledger = new Ledger(file, { now: () => 5 });
+  ledger.claim("a", "1:opened", RESEND_NOTE);
+  ledger.settle("a", "1:opened", "failed");
+  assert.equal(
+    ledger.admitResendCommand({ id: "cmd-1", channelId: "a", key: "1:opened" }, true).row.state,
+    "admitted",
+  );
+  ledger.close();
+  const db = new Database(file);
+  db.run("INSERT INTO resend_commands VALUES ('cmd-2', 'a', '1:opened', 'admitted', NULL, 6)");
+  db.close();
+}
+
+test("the terminal write of an entry and of every admitted command of its key share one transaction", () => {
+  for (const status of ["delivered", "failed", "dropped"] as const) {
+    const file = path();
+    twoAdmitted(file);
+    let isBroken = true;
+    const ledger = ledgerAt(file, {
+      now: () => 9,
+      hooks: {
+        beforeCommit: () => {
+          if (isBroken) throw new Error("disk full");
+        },
+      },
+    });
+    assert.throws(() => ledger.settle("a", "1:opened", status), /disk full/);
+    assert.equal(ledger.status("a", "1:opened"), "pending");
+    assert.deepEqual(
+      ledger.resendCommands().map((r) => [r.id, r.state]),
+      [
+        ["cmd-1", "admitted"],
+        ["cmd-2", "admitted"],
+      ],
+    );
+    isBroken = false;
+    ledger.settle("a", "1:opened", status);
+    ledger.close();
+    const again = ledgerAt(file);
+    assert.equal(again.status("a", "1:opened"), status);
+    assert.deepEqual(
+      again.resendCommands().map((r) => [r.id, r.state, r.updatedAt]),
+      [
+        ["cmd-1", status, 9],
+        ["cmd-2", status, 9],
+      ],
+    );
+  }
+});
+
+test("a stale reminder resend is admitted, then dropped, and its command ends dropped", () => {
+  const ledger = ledgerAt(path(), { now: () => 5 });
+  const key = "1:reminder:2";
+  ledger.claim("a", key, { ...RESEND_NOTE, key, event: "reminder" as const });
+  ledger.settle("a", key, "failed");
+  const admitted = ledger.admitResendCommand({ id: "cmd-r", channelId: "a", key }, true);
+  assert.deepEqual([admitted.isNew, admitted.row.state], [true, "admitted"]);
+  assert.equal(ledger.status("a", key), "pending");
+  ledger.settle("a", key, "dropped");
+  assert.deepEqual(
+    ledger.resendCommands().map((r) => [r.id, r.state]),
+    [["cmd-r", "dropped"]],
+  );
+  assert.deepEqual(ledger.failed(), []);
+});
