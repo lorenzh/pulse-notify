@@ -227,9 +227,11 @@ export class ChannelSync {
         this.#useOldApi();
         return;
       }
-      const reason = err instanceof ApiReadError ? ANSWER_FAILURES.get(err.kind) : undefined;
-      // Decision 6: a refused whole answer changes nothing but is reported, like a bad envelope.
-      if (reason !== undefined) this.#rejected = [{ channelId: null, reason }];
+      const reason =
+        (err instanceof ApiReadError ? ANSWER_FAILURES.get(err.kind) : undefined) ??
+        "channels answer: api unreachable or failed";
+      // Decision 6: every failed read changes nothing but is reported, like a bad envelope.
+      this.#rejected = [{ channelId: null, reason }];
       this.#opts.logger.warn("channels read failed, keeping the last good channels", {
         ...errorFields(err),
       });

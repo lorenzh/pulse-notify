@@ -11,6 +11,50 @@ import { spyLogger } from "./support.ts";
 
 const REVISION = `sha256-${"1".repeat(64)}`;
 
+const OUTAGES: { name: string; answer: () => Promise<Response> }[] = [
+  { name: "503", answer: () => Promise.resolve(new Response("unavailable", { status: 503 })) },
+  { name: "500", answer: () => Promise.resolve(new Response("boom", { status: 500 })) },
+  { name: "401", answer: () => Promise.resolve(new Response("no", { status: 401 })) },
+  { name: "network error", answer: () => Promise.reject(new TypeError("connect refused")) },
+];
+
+for (const outage of OUTAGES) {
+  test(`a failed channels read (${outage.name}) keeps the revision and reports one rejection`, async () => {
+    let isDown = false;
+    const serviceFetch: typeof fetch = Object.assign(
+      () =>
+        isDown
+          ? outage.answer()
+          : Promise.resolve(
+              Response.json({ revision: REVISION, channels: [] }, { headers: { etag: '"r1"' } }),
+            ),
+      { preconnect: fetch.preconnect },
+    );
+    const sync = new ChannelSync({
+      ledger: { remoteChannels: () => [], replaceRemoteChannels: () => {} },
+      install: () => {},
+      parseFile: () => [],
+      fetchChannels: (etag) =>
+        getService(
+          { baseUrl: "http://127.0.0.1:1/", token: "review-token", fetch: serviceFetch },
+          "service/notify/channels",
+          (raw) => ({ ok: true, value: raw }),
+          etag,
+        ),
+      secrets: { env: {}, secretDir: undefined, realpath: (p) => p, readFile: () => "" },
+      now: () => 1_000,
+      logger: spyLogger(),
+    });
+    await sync.poll();
+    isDown = true;
+    await sync.poll();
+    assert.equal(sync.state().appliedRevision, REVISION);
+    assert.deepEqual(sync.state().rejected, [
+      { channelId: null, reason: "channels answer: api unreachable or failed" },
+    ]);
+  });
+}
+
 test("an API outage keeps the applied revision and reports the rejected poll", async () => {
   let isDown = false;
   const serviceFetch: typeof fetch = Object.assign(

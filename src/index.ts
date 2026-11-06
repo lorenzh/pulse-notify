@@ -477,6 +477,7 @@ function startChannelLoop(sources: ChannelSources, deps: LoopDeps): ChannelLoop 
   let cancelPoll: (() => void) | undefined;
   let cancelBeat: (() => void) | undefined;
   let running: Promise<void> | undefined;
+  const beats = new Set<Promise<void>>();
   const report = async (): Promise<void> => {
     if (service === undefined) return;
     const view = sync.state();
@@ -520,7 +521,11 @@ function startChannelLoop(sources: ChannelSources, deps: LoopDeps): ChannelLoop 
   const nextBeat = (): void => {
     if (!isRunning || service === undefined) return;
     cancelBeat = deps.schedule(() => {
-      void report().finally(nextBeat);
+      const beat = report().finally(() => {
+        beats.delete(beat);
+        nextBeat();
+      });
+      beats.add(beat);
     }, REPORT_HEARTBEAT_MS);
   };
   return {
@@ -534,7 +539,8 @@ function startChannelLoop(sources: ChannelSources, deps: LoopDeps): ChannelLoop 
       isRunning = false;
       cancelPoll?.();
       cancelBeat?.();
-      await running;
+      // A heartbeat report in flight must end before the ledger closes and the lock is released.
+      await Promise.all([running, ...beats]);
     },
   };
 }
