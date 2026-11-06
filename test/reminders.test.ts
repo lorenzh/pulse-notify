@@ -146,7 +146,7 @@ test("older reminder keys are pruned from the ledger", async () => {
     Object.keys(state.channels.hook ?? {}).sort((a, b) => a.localeCompare(b)),
     ["1:opened", "1:reminder:2"],
   );
-  assert.equal(state.version, 4);
+  assert.equal(state.version, 5);
 });
 
 test("a resolved incident gets no reminder", async () => {
