@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { hostname } from "node:os";
 import {
   createLogger,
@@ -14,13 +14,18 @@ import {
   StartupError,
   startOpsServer,
 } from "@lorenzh/pulse-kit";
+import { getService, type ServiceOptions, sendService } from "./api.ts";
+import { ChannelSync } from "./channel-sync.ts";
 import {
   ConfigError,
   loadBudgetThreshold,
   loadConfigFile,
   loadLockLeaseSeconds,
   loadSettings,
+  parseConfig,
+  type Settings,
 } from "./config.ts";
+import { errorFields } from "./errors.ts";
 import { runFailed } from "./failed-cli.ts";
 import { Ledger } from "./ledger.ts";
 import {
@@ -33,7 +38,8 @@ import {
 import { Metrics } from "./metrics.ts";
 import { Notifier, type NotifierOptions, type PollHealth } from "./notifier.ts";
 import { redactUrl } from "./redact.ts";
-import type { Schedule } from "./types.ts";
+import { buildServiceReport, type FileChannelSource } from "./service-report.ts";
+import type { ChannelConfig, Config, Schedule } from "./types.ts";
 
 export const name = "pulse-notify";
 
@@ -45,6 +51,8 @@ export interface Stoppable {
   stop(): Promise<void>;
   /** Absent in test fakes: `/readyz` then never reports failing polls. `/healthz` never reads it. */
   pollHealth?(): PollHealth;
+  /** Installs a new effective channel set; absent in test fakes, which then keep their channels. */
+  reconcile?(channels: readonly ChannelConfig[]): Promise<void>;
 }
 
 /** The real clock, host, pid check and token for the state lock. */
@@ -93,6 +101,12 @@ export interface MainDeps {
   lock?: Partial<LockEnv>;
   /** Timer for the lock heartbeat; defaults to an unreferenced real timer. */
   heartbeatSchedule?: Schedule;
+  /** Timer for the channel poll and the report heartbeat; defaults to an unreferenced real timer. */
+  channelSchedule?: Schedule;
+  /** `fetch` for the `/service/*` calls; defaults to the global one. */
+  serviceFetch?: typeof fetch;
+  /** Clock for the report and the applied stamps; defaults to `Date.now`. */
+  now?: () => number;
 }
 
 export interface Running extends Stoppable {
@@ -140,6 +154,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
   const logRef: { logger?: Logger } = {};
   const state: {
     notifier?: Stoppable;
+    channelLoop?: ChannelLoop;
     health?: OpsServer;
     ledger?: Ledger | undefined;
     lock?: LedgerLock | undefined;
@@ -149,6 +164,8 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
   let finishing: Promise<void> | undefined;
   const finish = (): Promise<void> => {
     finishing ??= (async () => {
+      // The channel loop stops first, so no install or report races the notifier stop.
+      await state.channelLoop?.stop();
       await state.notifier?.stop().catch(() => {});
       await state.ledger?.flush().catch((err: unknown) => {
         logRef.logger?.error("ledger flush failed, pending keys are resent", {
@@ -166,14 +183,11 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
   const budgetThreshold = loadBudgetThreshold(env);
   // Token mode (Decision 11): the file is optional and may list no channel.
   const isTokenMode = settings.apiToken !== undefined;
-  const config =
+  const source = { env, readFile: (path: string) => readFileSync(path, "utf8") };
+  const fileConfig: Config =
     settings.configPath === undefined
       ? { channels: [] }
-      : loadConfigFile(
-          settings.configPath,
-          { env, readFile: (path) => readFileSync(path, "utf8") },
-          { allowEmpty: isTokenMode },
-        );
+      : loadConfigFile(settings.configPath, source, { allowEmpty: isTokenMode });
   const write = deps.write ?? ((line: string) => process.stderr.write(`${line}\n`));
   const logger =
     deps.logger ?? createLogger({ level: settings.logLevel, write: (_level, line) => write(line) });
@@ -192,7 +206,19 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
   }
   state.ledger = ledger;
   if (ledger.migration) logger.info("ledger migrated", { ...ledger.migration });
+  const now = deps.now ?? Date.now;
   const notifierRef: { current?: Stoppable } = {};
+  const channels = createChannelSync(settings, env, {
+    ledger,
+    logger,
+    now,
+    fileChannels: fileConfig.channels,
+    // The notifier exists only after the cold-start set below; a test fake may not reconcile.
+    install: (next) => notifierRef.current?.reconcile?.(next),
+    ...(deps.serviceFetch ? { fetch: deps.serviceFetch } : {}),
+  });
+  // Cold start: the last applied database channels work while the api is down.
+  const config: Config = { channels: channels.sync.restore() };
   const metrics = new Metrics(
     config.channels.map((c) => c.id),
     () => ledger.pending().length,
@@ -227,6 +253,14 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
     throw err;
   }
   state.notifier = notifier;
+  const loop = startChannelLoop(channels, {
+    ledger,
+    now,
+    logger,
+    intervalMs: settings.channelsPollMs,
+    schedule: deps.channelSchedule ?? unrefSchedule,
+  });
+  state.channelLoop = loop;
   notifierRef.current = notifier;
   startHeartbeat(lock, settings.lockLeaseSeconds, deps.heartbeatSchedule ?? unrefSchedule, {
     logger,
@@ -237,6 +271,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
       state.lock = undefined;
       ledger.close();
       state.ledger = undefined;
+      void loop.stop();
       void notifier.stop().catch(() => {});
       exit(2);
     },
@@ -244,6 +279,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
   let isStarted = false;
   const startNotifier = (): void => {
     notifier.start();
+    loop.start();
     isStarted = true;
     logger.info("pulse-notify started", {
       channels: config.channels.map((c) => c.id),
@@ -310,6 +346,197 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
     running.pollHealth = () => notifier.pollHealth?.() ?? { consecutiveFailedPolls: 0 };
   }
   return running;
+}
+
+/** Longest time between two service reports (R1). */
+export const REPORT_HEARTBEAT_MS = 60_000;
+
+interface ChannelSources {
+  sync: ChannelSync;
+  /** The raw file channels by id, for the report refs; updated with each applied file. */
+  files: { raw: Map<string, Readonly<Record<string, unknown>>> };
+  /** `undefined` without a token: then notify makes no service call at all. */
+  service: ServiceOptions | undefined;
+  startedAt: number;
+}
+
+interface SyncDeps {
+  ledger: Ledger;
+  logger: Logger;
+  now: () => number;
+  fileChannels: readonly ChannelConfig[];
+  install: (channels: readonly ChannelConfig[]) => Promise<void> | void;
+  fetch?: typeof fetch;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The raw channel objects of a file by id; an unparsable file gives none. */
+function rawFileChannels(text: string): Map<string, Readonly<Record<string, unknown>>> {
+  const out = new Map<string, Readonly<Record<string, unknown>>>();
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    // parseConfig reports the same text as invalid; the report then shows no refs.
+    return out;
+  }
+  const list = isRecord(json) ? json.channels : undefined;
+  if (!Array.isArray(list)) return out;
+  for (const item of list) {
+    if (isRecord(item) && typeof item.id === "string") out.set(item.id, item);
+  }
+  return out;
+}
+
+function createChannelSync(settings: Settings, env: Env, deps: SyncDeps): ChannelSources {
+  const { configPath, apiToken } = settings;
+  const readFile = configPath === undefined ? undefined : () => readFileSync(configPath, "utf8");
+  const service: ServiceOptions | undefined =
+    apiToken === undefined
+      ? undefined
+      : { baseUrl: settings.apiUrl, token: apiToken, fetch: deps.fetch };
+  const files = {
+    raw: readFile === undefined ? new Map() : rawFileChannels(safeRead(readFile)),
+  };
+  const source = { env, readFile: (path: string) => readFileSync(path, "utf8") };
+  const sync = new ChannelSync(
+    {
+      ledger: deps.ledger,
+      install: deps.install,
+      readFile,
+      parseFile: (text) => {
+        let json: unknown;
+        try {
+          json = JSON.parse(text);
+        } catch (err) {
+          throw new ConfigError(`config file ${configPath} is not valid JSON`, { cause: err });
+        }
+        const parsed = parseConfig(json, configPath, source, {
+          allowEmpty: apiToken !== undefined,
+        });
+        files.raw = rawFileChannels(text);
+        return parsed.channels;
+      },
+      fetchChannels:
+        service === undefined
+          ? undefined
+          : (etag) =>
+              getService(
+                service,
+                "service/notify/channels",
+                (raw) => ({ ok: true, value: raw }),
+                etag,
+              ),
+      secrets: {
+        env,
+        secretDir: settings.secretDir,
+        realpath: realpathSync,
+        readFile: (path) => readFileSync(path, "utf8"),
+      },
+      now: deps.now,
+      logger: deps.logger,
+    },
+    deps.fileChannels,
+  );
+  return { sync, files, service, startedAt: deps.now() };
+}
+
+function safeRead(read: () => string): string {
+  try {
+    return read();
+  } catch {
+    // The startup load already read this file; a race here only empties the report refs.
+    return "";
+  }
+}
+
+export interface ChannelLoop {
+  start(): void;
+  stop(): Promise<void>;
+}
+
+interface LoopDeps {
+  ledger: Ledger;
+  now: () => number;
+  logger: Logger;
+  intervalMs: number;
+  schedule: Schedule;
+}
+
+/**
+ * Polls the channel file and the database channels, installs the effective set, and reports
+ * after every attempt plus at most every `REPORT_HEARTBEAT_MS`. Without a token it only re-reads
+ * the file.
+ */
+function startChannelLoop(sources: ChannelSources, deps: LoopDeps): ChannelLoop {
+  const { sync, service } = sources;
+  let isRunning = false;
+  let cancelPoll: (() => void) | undefined;
+  let cancelBeat: (() => void) | undefined;
+  let running: Promise<void> | undefined;
+  const report = async (): Promise<void> => {
+    if (service === undefined) return;
+    const view = sync.state();
+    const fileChannels: FileChannelSource[] = view.fileChannels.map((c) => ({
+      id: c.id,
+      type: c.type,
+      raw: sources.files.raw.get(c.id) ?? {},
+    }));
+    const body = buildServiceReport({
+      at: deps.now(),
+      startedAt: sources.startedAt,
+      appliedRevision: view.appliedRevision,
+      fileChannels,
+      shadowedIds: view.shadowedIds,
+      rejected: view.rejected,
+      failed: deps.ledger.failed(),
+    });
+    try {
+      const result = await sendService(service, "PUT", "service/notify/report", body, (raw) => ({
+        ok: true,
+        value: raw,
+      }));
+      if (!result.ok) deps.logger.warn("service report failed", { reason: result.error.kind });
+    } catch (err) {
+      deps.logger.warn("service report failed", errorFields(err));
+    }
+  };
+  const cycle = async (): Promise<void> => {
+    await sync.poll();
+    await report();
+  };
+  const nextPoll = (ms: number): void => {
+    if (!isRunning) return;
+    cancelPoll = deps.schedule(() => {
+      running = cycle().finally(() => {
+        running = undefined;
+        nextPoll(deps.intervalMs);
+      });
+    }, ms);
+  };
+  const nextBeat = (): void => {
+    if (!isRunning || service === undefined) return;
+    cancelBeat = deps.schedule(() => {
+      void report().finally(nextBeat);
+    }, REPORT_HEARTBEAT_MS);
+  };
+  return {
+    start: () => {
+      if (isRunning) return;
+      isRunning = true;
+      nextPoll(0);
+      nextBeat();
+    },
+    stop: async () => {
+      isRunning = false;
+      cancelPoll?.();
+      cancelBeat?.();
+      await running;
+    },
+  };
 }
 
 interface HeartbeatOptions {

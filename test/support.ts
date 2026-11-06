@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type {
   Check,
@@ -96,6 +96,8 @@ export interface FakeApi {
   authorizations: { path: string; authorization: string | undefined }[];
   /** The answer of `GET /service/notify/channels`; `undefined` answers 404. */
   notifyChannels: { etag: string; body: unknown } | undefined;
+  /** Bodies of `PUT /service/notify/report`, parsed, in order; each answers 204. */
+  reports: unknown[];
   close(): Promise<void>;
 }
 
@@ -103,6 +105,32 @@ export interface RawAnswer {
   status?: number;
   headers?: Record<string, string>;
   body?: string;
+}
+
+/** Answers the channels with their ETag, or 304 when the request names it. */
+function answerChannels(
+  req: IncomingMessage,
+  res: ServerResponse,
+  channels: { etag: string; body: unknown },
+): void {
+  res.setHeader("etag", channels.etag);
+  if (req.headers["if-none-match"] === channels.etag) {
+    res.statusCode = 304;
+    res.end();
+  } else res.end(JSON.stringify(channels.body));
+}
+
+/** Stores the parsed body of a report and answers 204, like the api. */
+function recordReport(req: IncomingMessage, res: ServerResponse, reports: unknown[]): void {
+  let text = "";
+  req.on("data", (chunk: Buffer) => {
+    text += chunk.toString("utf8");
+  });
+  req.on("end", () => {
+    reports.push(JSON.parse(text));
+    res.statusCode = 204;
+    res.end();
+  });
 }
 
 export async function startFakeApi(): Promise<FakeApi> {
@@ -119,6 +147,7 @@ export async function startFakeApi(): Promise<FakeApi> {
     raw: new Map(),
     authorizations: [],
     notifyChannels: undefined,
+    reports: [],
     close: () => close(server),
   };
   const server = createServer((req, res) => {
@@ -130,6 +159,10 @@ export async function startFakeApi(): Promise<FakeApi> {
       res.end(raw.body ?? "");
       return;
     }
+    if (req.method === "PUT" && req.url === "/service/notify/report") {
+      recordReport(req, res, api.reports);
+      return;
+    }
     const failStatus = api.failingPaths.get(req.url ?? "");
     if (api.failing || (api.failingManual && req.url === "/manual-incidents") || failStatus) {
       res.statusCode = failStatus ?? 500;
@@ -138,12 +171,7 @@ export async function startFakeApi(): Promise<FakeApi> {
     }
     res.setHeader("content-type", "application/json");
     if (req.url === "/service/notify/channels" && api.notifyChannels) {
-      const { etag, body } = api.notifyChannels;
-      res.setHeader("etag", etag);
-      if (req.headers["if-none-match"] === etag) {
-        res.statusCode = 304;
-        res.end();
-      } else res.end(JSON.stringify(body));
+      answerChannels(req, res, api.notifyChannels);
     } else if (req.url === "/incidents") res.end(JSON.stringify(api.incidents));
     else if (req.url === "/manual-incidents" && api.manualIncidents) {
       res.end(JSON.stringify(api.manualIncidents));
