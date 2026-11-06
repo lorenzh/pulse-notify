@@ -189,6 +189,8 @@ export async function startFakeApi(): Promise<FakeApi> {
 
 export interface ReceivedRequest {
   method: string | undefined;
+  /** The request path and query. */
+  url?: string | undefined;
   headers: IncomingMessage["headers"];
   body: unknown;
   /** The body bytes as text, for signature checks. */
@@ -229,7 +231,14 @@ export async function startReceiver(): Promise<Receiver> {
         // Non-JSON payloads are recorded with a null body.
         body = null;
       }
-      receiver.requests.push({ method: req.method, headers: req.headers, body, raw, status });
+      receiver.requests.push({
+        method: req.method,
+        url: req.url,
+        headers: req.headers,
+        body,
+        raw,
+        status,
+      });
       res.statusCode = status;
       res.end();
     });
