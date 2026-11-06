@@ -62,7 +62,7 @@ function failureOf(err: unknown, attempt: number, limit: number): Outcome | unde
 export class ChannelDelivery {
   readonly #opts: ChannelDeliveryOptions;
   /** Turn grants of the ready jobs, in FIFO order. */
-  readonly #ready: Array<(isGranted: boolean) => void> = [];
+  readonly #ready: Array<{ notification: Notification; grant: (isGranted: boolean) => void }> = [];
   /** The running job of each key, from enqueue until it ends. */
   readonly #jobs = new Map<string, Promise<void>>();
   readonly #abort = new AbortController();
@@ -105,18 +105,22 @@ export class ChannelDelivery {
   /** Drops the ready jobs and aborts the send in flight and every retry timer. */
   stop(): void {
     this.#stopped = true;
-    for (const grant of this.#ready.splice(0)) grant(false);
+    for (const { grant } of this.#ready.splice(0)) grant(false);
     this.#sleepAbort.abort();
     this.#abort.abort();
   }
 
   /**
    * Takes no new job and ends every ready or waiting job, but lets the send in flight finish or
-   * time out. Unfinished keys stay `pending` in the ledger for the replacement worker.
+   * time out. Unfinished keys stay `pending` in the ledger for the replacement worker; a ready job
+   * that was never claimed is claimed first, so the handover finds it.
    */
   retire(): void {
     this.#stopped = true;
-    for (const grant of this.#ready.splice(0)) grant(false);
+    for (const { notification, grant } of this.#ready.splice(0)) {
+      this.#claim(notification);
+      grant(false);
+    }
     this.#sleepAbort.abort();
   }
 
@@ -131,20 +135,20 @@ export class ChannelDelivery {
   }
 
   /** Waits at the end of the ready queue; false when the channel stopped first. */
-  #waitTurn(): Promise<boolean> {
+  #waitTurn(notification: Notification): Promise<boolean> {
     if (this.#stopped) return Promise.resolve(false);
-    return new Promise((resolve) => this.#ready.push(resolve));
+    return new Promise((grant) => this.#ready.push({ notification, grant }));
   }
 
   #endTurn(): void {
     const next = this.#ready.shift();
     this.#isSending = next !== undefined;
-    next?.(true);
+    next?.grant(true);
   }
 
   async #run(notification: Notification, progress: RecipientProgress): Promise<void> {
     try {
-      if (!this.#takeTurn() && !(await this.#waitTurn())) return;
+      if (!this.#takeTurn() && !(await this.#waitTurn(notification))) return;
       let isClaimed = false;
       try {
         isClaimed = this.#claim(notification);
@@ -200,7 +204,7 @@ export class ChannelDelivery {
         });
       }
       await this.#wait(retryDelay(attempt, initial, max));
-      if (!this.#takeTurn() && !(await this.#waitTurn())) return { kind: "stopped" };
+      if (!this.#takeTurn() && !(await this.#waitTurn(notification))) return { kind: "stopped" };
     }
   }
 
@@ -217,11 +221,12 @@ export class ChannelDelivery {
       await this.#opts.send(notification, this.#abort.signal, progress);
       return { outcome: { kind: "delivered", attempts: attempt } };
     } catch (err) {
-      if (this.#stopped) return { outcome: { kind: "stopped" } };
+      // Partial progress is stored before a stop check, so a replacement skips those recipients.
       const partial =
         err instanceof PartialDeliveryError
           ? this.#recordPartial(notification, err, attempt)
           : undefined;
+      if (this.#stopped) return { outcome: { kind: "stopped" } };
       const failed = failureOf(err, attempt, limit);
       return failed ? { outcome: failed, progress: partial } : { error: err, progress: partial };
     } finally {

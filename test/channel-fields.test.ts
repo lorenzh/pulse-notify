@@ -13,14 +13,18 @@ import { Notifier } from "../src/notifier.ts";
 import { buildServiceReport } from "../src/service-report.ts";
 import { makeCert, type SmtpStub, startSmtpStub, type TestCert } from "./smtp-stub.ts";
 import {
+  checkState,
   type FakeApi,
+  httpCheck,
   incident,
   manualIncident,
   type ReceivedRequest,
   type Receiver,
+  slo,
   spyLogger,
   startFakeApi,
   startReceiver,
+  tlsCheck,
 } from "./support.ts";
 
 /*
@@ -102,6 +106,8 @@ interface Row {
   checks?: string[];
   /** Component ids of the manual incidents opened in each step, one incident each. */
   components?: string[];
+  /** Add one low-budget check and one expiring TLS check in each step. */
+  isAlertStep?: boolean;
   /** Advance the clock and tick once more, so a reminder can fall due. */
   isReminderStep?: boolean;
   /** The observations of the steps V1, V2, V3 and V2 again. */
@@ -138,7 +144,7 @@ function httpView(name: string, req: ReceivedRequest): string {
   if (typeof body.event === "string") {
     const manual = body.manual as { componentIds?: string[] } | undefined;
     parts.push(
-      `${body.event}:${manual ? "manual/" + (manual.componentIds ?? []).join("+") : body.checkId}`,
+      `${body.event}:${manual ? "manual/" + (manual.componentIds ?? []).join("+") : String(body.checkId ?? (body.subject as { id?: string } | undefined)?.id)}`,
     );
     const signature = req.headers["x-pulse-signature"];
     if (signature === undefined) parts.push("unsigned");
@@ -220,6 +226,7 @@ async function runRow(row: Row): Promise<{ seen: string[]; shadowed: string[][];
   const metrics = new Metrics([], () => 0);
   api.incidents = [];
   api.manualIncidents = [];
+  api.checks = [];
   const notifier = new Notifier({
     config: { channels: [] },
     apiUrl: api.url,
@@ -277,6 +284,13 @@ async function runRow(row: Row): Promise<{ seen: string[]; shadowed: string[][];
     }
     for (const checkId of row.checks ?? ["api"]) {
       api.incidents.push(incident({ id: next++, checkId, openedAt: clock.now }));
+    }
+    if (row.isAlertStep === true) {
+      const n = next++;
+      api.checks.push(
+        checkState(httpCheck(`slo-${n}`, "SLO"), { slo: slo(24) }, [clock.now]),
+        checkState(tlsCheck(`tls-${n}`, "TLS"), { certDaysLeft: 13 }, [clock.now]),
+      );
     }
     for (const component of row.components ?? []) {
       api.manualIncidents?.push(
@@ -536,6 +550,20 @@ function earlyRows(): LazyRow[] {
       expect: ["r1/hook-r1 opened:api unsigned", "none", "r3/hook-r3 opened:api unsigned", "none"],
     },
     {
+      name: "alerts",
+      v1: hook(),
+      v2: hook({ alerts: ["budget-low"] }),
+      v3: hook({ ...R3, alerts: ["tls-expiry"] }),
+      checks: [],
+      isAlertStep: true,
+      expect: [
+        "none",
+        "r1/hook-r1 budget-low:slo-2 unsigned",
+        "r3/hook-r3 tls-expiry:tls-3 unsigned",
+        "r1/hook-r1 budget-low:slo-4 unsigned",
+      ],
+    },
+    {
       name: "remindEverySeconds",
       v1: hook(),
       v2: hook({ remindEverySeconds: 60 }),
@@ -552,11 +580,11 @@ function earlyRows(): LazyRow[] {
       name: "email smtp.host",
       v1: mail("x", {}, { host: "unresolvable.invalid" }),
       v2: mail("x"),
-      v3: mail("x", { from: "file@example.org" }),
+      v3: mail("x", {}, { host: "unresolvable.invalid" }),
       expect: [
         "none",
         "smtpA ehlo:notify.test plain no-auth from:pulse@example.org to:ops@example.org subject:DOWN: api",
-        "smtpA ehlo:notify.test plain no-auth from:file@example.org to:ops@example.org subject:DOWN: api",
+        "none",
         "smtpA ehlo:notify.test plain no-auth from:pulse@example.org to:ops@example.org subject:DOWN: api",
       ],
     },
@@ -564,11 +592,11 @@ function earlyRows(): LazyRow[] {
       name: "email smtp.port",
       v1: mail("x"),
       v2: mail("x", {}, { port: smtpPort(() => smtpB) }),
-      v3: () => mail("x", {}, { port: smtpB.port, clientName: "file.example" })(),
+      v3: mail("x"),
       expect: [
         "smtpA ehlo:notify.test plain no-auth from:pulse@example.org to:ops@example.org subject:DOWN: api",
         "smtpB ehlo:notify.test plain no-auth from:pulse@example.org to:ops@example.org subject:DOWN: api",
-        "smtpB ehlo:file.example plain no-auth from:pulse@example.org to:ops@example.org subject:DOWN: api",
+        "smtpA ehlo:notify.test plain no-auth from:pulse@example.org to:ops@example.org subject:DOWN: api",
         "smtpB ehlo:notify.test plain no-auth from:pulse@example.org to:ops@example.org subject:DOWN: api",
       ],
     },

@@ -50,6 +50,14 @@ export interface ChannelSyncState {
   shadowedIds: string[];
 }
 
+/** Fixed reasons for a refused whole answer; no answer text reaches the report. */
+const ANSWER_FAILURES: ReadonlyMap<string, string> = new Map([
+  ["too-large", "channels answer: larger than 1048576 bytes"],
+  ["invalid-json", "channels answer: invalid JSON"],
+  ["wire-mismatch", "channels answer: wire version mismatch"],
+  ["validation", "channels answer: invalid answer"],
+]);
+
 function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
@@ -84,6 +92,8 @@ export class ChannelSync {
   #etag: string | undefined;
   #appliedRevision: string | null = null;
   #rejected: NotifyRejectedChannel[] = [];
+  /** The rejection of the channel file while its last good channels stay. */
+  #fileRejected: NotifyRejectedChannel | undefined;
   #shadowedIds: string[] = [];
   #isOldApi = false;
   #cancel: (() => void) | undefined;
@@ -100,6 +110,8 @@ export class ChannelSync {
    * the api is down. A row that no longer resolves is left out and rejected.
    */
   restore(): ChannelConfig[] {
+    // Tokenless mode has no database layer, so rows from an earlier token-mode run stay unused.
+    if (this.#opts.fetchChannels === undefined) return this.#effective();
     for (const row of this.#opts.ledger.remoteChannels()) {
       const record = storedRecord(row);
       if (record === undefined) continue;
@@ -116,7 +128,10 @@ export class ChannelSync {
   state(): ChannelSyncState {
     return {
       appliedRevision: this.#appliedRevision,
-      rejected: this.#rejected.map((r) => ({ ...r })),
+      rejected: [
+        ...(this.#fileRejected ? [{ ...this.#fileRejected }] : []),
+        ...this.#rejected.map((r) => ({ ...r })),
+      ],
       fileChannels: this.#fileChannels.map((c) => c.config),
       shadowedIds: [...this.#shadowedIds],
     };
@@ -183,8 +198,10 @@ export class ChannelSync {
     this.#fileSha = sha;
     try {
       this.#fileChannels = this.#opts.parseFile(text).map(installedChannel);
+      this.#fileRejected = undefined;
       this.#opts.logger.info("channel file applied", { channels: this.#fileChannels.length });
     } catch (err) {
+      this.#fileRejected = { channelId: null, reason: "channel file: invalid, last good kept" };
       this.#opts.logger.warn("channel file is invalid, keeping the last good channels", {
         ...errorFields(err),
       });
@@ -193,6 +210,7 @@ export class ChannelSync {
 
   /** Logs an unreadable file once until it reads again. */
   #fileProblem(kind: string, message: string, err: unknown): void {
+    this.#fileRejected = { channelId: null, reason: "channel file: unreadable, last good kept" };
     if (this.#fileSha === kind) return;
     this.#fileSha = kind;
     this.#opts.logger.warn(message, errorFields(err));
@@ -209,6 +227,9 @@ export class ChannelSync {
         this.#useOldApi();
         return;
       }
+      const reason = err instanceof ApiReadError ? ANSWER_FAILURES.get(err.kind) : undefined;
+      // Decision 6: a refused whole answer changes nothing but is reported, like a bad envelope.
+      if (reason !== undefined) this.#rejected = [{ channelId: null, reason }];
       this.#opts.logger.warn("channels read failed, keeping the last good channels", {
         ...errorFields(err),
       });

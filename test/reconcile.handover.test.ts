@@ -28,7 +28,7 @@ function email(prefix: string): ChannelConfig {
 }
 
 async function mailHandover(isPartial: boolean): Promise<void> {
-  const dir = mkdtempSync(join(tmpdir(), "notify-review-handover-"));
+  const dir = mkdtempSync(join(tmpdir(), "notify-handover-handover-"));
   const api = await startFakeApi();
   const ledger = new Ledger(join(dir, "state.sqlite"), { now: () => NOW });
   const started = Promise.withResolvers<void>();
@@ -86,11 +86,11 @@ async function mailHandover(isPartial: boolean): Promise<void> {
   }
 }
 
-test("review: replacement retains progress from a partial SMTP send in flight", async () => {
+test("replacement retains progress from a partial SMTP send in flight", async () => {
   await mailHandover(true);
 });
 
-test("review: replacement transfers a ready event behind the send in flight", async () => {
+test("replacement transfers a ready event behind the send in flight", async () => {
   await mailHandover(false);
 });
 
@@ -101,7 +101,7 @@ const brokenAnswers = [
 ];
 
 for (const broken of brokenAnswers) {
-  test(`review: ${broken.name} reports one whole-answer rejection`, async () => {
+  test(`${broken.name} reports one whole-answer rejection`, async () => {
     let isBroken = false;
     const fetchAnswer: typeof fetch = Object.assign(
       async () =>
@@ -138,32 +138,49 @@ for (const broken of brokenAnswers) {
   });
 }
 
-test("review: an invalid channel file is reported while its last good channel stays", async () => {
-  let text = JSON.stringify({
-    channels: [{ id: "local", type: "webhook", url: "http://127.0.0.1/hook" }],
-  });
-  const sync = new ChannelSync({
-    ledger: { remoteChannels: () => [], replaceRemoteChannels: () => {} },
-    install: () => {},
-    readFile: () => text,
-    parseFile: (raw) =>
-      parseConfig(JSON.parse(raw), "channels.json", undefined, { allowEmpty: true }).channels,
-    secrets: { env: {}, secretDir: undefined, realpath: (p) => p, readFile: () => "" },
-    now: () => NOW,
-    logger: spyLogger(),
-  });
-  await sync.poll();
-  text = "{";
-  await sync.poll();
-  assert.deepEqual(
-    sync.state().fileChannels.map((c) => c.id),
-    ["local"],
-  );
-  assert.equal(sync.state().rejected.length, 1);
-});
+const brokenFiles = [
+  { name: "invalid", read: () => "{", reason: "channel file: invalid, last good kept" },
+  {
+    name: "deleted",
+    read: (): string => {
+      throw new Error("ENOENT");
+    },
+    reason: "channel file: unreadable, last good kept",
+  },
+];
 
-test("review: tokenless startup uses only file channels even after a token-mode run", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "notify-review-tokenless-"));
+for (const broken of brokenFiles) {
+  test(`an ${broken.name} channel file is reported while its last good channel stays`, async () => {
+    let isBroken = false;
+    const good = JSON.stringify({
+      channels: [{ id: "local", type: "webhook", url: "http://127.0.0.1/hook" }],
+    });
+    const sync = new ChannelSync({
+      ledger: { remoteChannels: () => [], replaceRemoteChannels: () => {} },
+      install: () => {},
+      readFile: () => (isBroken ? broken.read() : good),
+      parseFile: (raw) =>
+        parseConfig(JSON.parse(raw), "channels.json", undefined, { allowEmpty: true }).channels,
+      secrets: { env: {}, secretDir: undefined, realpath: (p) => p, readFile: () => "" },
+      now: () => NOW,
+      logger: spyLogger(),
+    });
+    await sync.poll();
+    isBroken = true;
+    await sync.poll();
+    assert.deepEqual(
+      sync.state().fileChannels.map((c) => c.id),
+      ["local"],
+    );
+    assert.deepEqual(sync.state().rejected, [{ channelId: null, reason: broken.reason }]);
+    isBroken = false;
+    await sync.poll();
+    assert.deepEqual(sync.state().rejected, []);
+  });
+}
+
+test("tokenless startup uses only file channels even after a token-mode run", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "notify-handover-tokenless-"));
   const state = join(dir, "state.sqlite");
   const config = join(dir, "notify.json");
   const ledger = new Ledger(state, { now: () => NOW });
