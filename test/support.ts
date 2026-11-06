@@ -92,6 +92,10 @@ export interface FakeApi {
   requested: string[];
   /** Paths that answer with this raw status, headers and body text, before any other rule. */
   raw: Map<string, RawAnswer>;
+  /** The `authorization` header of each request, in order, with its path. */
+  authorizations: { path: string; authorization: string | undefined }[];
+  /** The answer of `GET /service/notify/channels`; `undefined` answers 404. */
+  notifyChannels: { etag: string; body: unknown } | undefined;
   close(): Promise<void>;
 }
 
@@ -113,10 +117,13 @@ export async function startFakeApi(): Promise<FakeApi> {
     failingPaths: new Map(),
     requested: [],
     raw: new Map(),
+    authorizations: [],
+    notifyChannels: undefined,
     close: () => close(server),
   };
   const server = createServer((req, res) => {
     api.requested.push(req.url ?? "");
+    api.authorizations.push({ path: req.url ?? "", authorization: req.headers.authorization });
     const raw = api.raw.get(req.url ?? "");
     if (raw) {
       res.writeHead(raw.status ?? 200, raw.headers ?? {});
@@ -130,7 +137,14 @@ export async function startFakeApi(): Promise<FakeApi> {
       return;
     }
     res.setHeader("content-type", "application/json");
-    if (req.url === "/incidents") res.end(JSON.stringify(api.incidents));
+    if (req.url === "/service/notify/channels" && api.notifyChannels) {
+      const { etag, body } = api.notifyChannels;
+      res.setHeader("etag", etag);
+      if (req.headers["if-none-match"] === etag) {
+        res.statusCode = 304;
+        res.end();
+      } else res.end(JSON.stringify(body));
+    } else if (req.url === "/incidents") res.end(JSON.stringify(api.incidents));
     else if (req.url === "/manual-incidents" && api.manualIncidents) {
       res.end(JSON.stringify(api.manualIncidents));
     } else if (req.url === "/checks") res.end(JSON.stringify(api.checks));

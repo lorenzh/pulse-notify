@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeEach, test } from "bun:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -306,4 +307,26 @@ test("failed list and resend work for the three warning events and keep their ke
   const reopened = new Ledger(state);
   assert.deepEqual(reopened.pending(), [{ channelId: "hook", key, notification: warnings[1] }]);
   reopened.close();
+});
+
+test("the offline CLI opens a format-4 file as format 5 and keeps its failed entries", async () => {
+  const db = new Database(state, { create: true });
+  db.run(`
+CREATE TABLE channels (id TEXT PRIMARY KEY, reminders_from INTEGER, manual_from INTEGER,
+  check_routing TEXT, component_routing TEXT) STRICT;
+CREATE TABLE entries (channel_id TEXT NOT NULL, key TEXT NOT NULL, status TEXT NOT NULL,
+  at INTEGER NOT NULL, payload TEXT, recipients TEXT, PRIMARY KEY (channel_id, key)) STRICT;
+CREATE TABLE alert_state (kind TEXT NOT NULL, subject_id TEXT NOT NULL, last_event_at INTEGER,
+  stage INTEGER, episode_at INTEGER, observed_at INTEGER, updated_at INTEGER NOT NULL,
+  PRIMARY KEY (kind, subject_id)) STRICT;
+INSERT INTO channels (id) VALUES ('hook');
+INSERT INTO entries VALUES ('hook', '1:opened', 'failed', 1767312000000, '${JSON.stringify(note("1:opened"))}', NULL);
+PRAGMA user_version = 4;`);
+  db.close();
+  const listed = await cli(["list"]);
+  assert.equal(listed.code, 0);
+  assert.equal(listed.out, "hook\t1:opened\t2026-01-02T00:00:00.000Z\topened\tpayload\n");
+  const check = new Database(state, { readonly: true });
+  assert.deepEqual(check.query("PRAGMA user_version").get(), { user_version: 5 });
+  check.close();
 });

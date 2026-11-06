@@ -6,7 +6,12 @@ pulse-notify reads environment variables and one JSON config file. Both are read
 
 | Variable                               | Default                 | Meaning                                                                                                                                                                                                                     |
 | -------------------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PULSE_NOTIFY_CONFIG`                  | required                | Path to the channel config file                                                                                                                                                                                             |
+| `PULSE_NOTIFY_CONFIG`                  | required                | Path to the channel config file. Optional with a service token: then the file may be absent or list `"channels": []` (database-only mode).                                                                                  |
+| `PULSE_NOTIFY_API_TOKEN`               | unset                   | The notify service token of the api, sent as `Bearer` on `/service/*` only, never on the public reads. Set only one of it and `PULSE_NOTIFY_API_TOKEN_FILE`; both stop startup with exit code 2.                            |
+| `PULSE_NOTIFY_API_TOKEN_FILE`          | unset                   | File that holds the service token (trimmed). An unreadable or empty file stops startup with exit code 2; the message never shows the token. An empty value counts as unset.                                                 |
+| `PULSE_NOTIFY_SECRET_DIR`              | unset                   | Directory of the secret files of database channels. Unset refuses their `urlFile`, `secretFile` and `smtp.passwordFile` with `secret files are not enabled`.                                                                |
+| `PULSE_NOTIFY_CHANNELS_POLL_MS`        | `15000`                 | Poll interval of the database channels and of the channel file, at least 1000                                                                                                                                               |
+| `PULSE_NOTIFY_COMMAND_POLL_MS`         | `5000`                  | Poll interval of the resend commands, at least 1000                                                                                                                                                                         |
 | `PULSE_API_URL`                        | `http://localhost:3000` | pulse-api base URL                                                                                                                                                                                                          |
 | `PULSE_NOTIFY_STATE`                   | `./notify-state.json`   | Delivery ledger, a SQLite database with `-wal` and `-shm` files beside it (the name keeps `.json`), see [operation.md](operation.md)                                                                                        |
 | `PULSE_NOTIFY_POLL_MS`                 | `5000`                  | Poll interval in milliseconds, from 1 to 2147483647                                                                                                                                                                         |
@@ -31,6 +36,7 @@ The schedule is in [channels.md](channels.md#delivery-and-retries).
 - `PULSE_API_URL` must be an `http:` or `https:` URL. The startup log and every log line or error that carries it show the URL without user info, query and fragment; an error about it never repeats the value.
 - An empty value counts as unset, so the default applies.
 - Example: `PULSE_NOTIFY_POLL_MS=30000` polls every 30 seconds.
+- Service reads (`/service/*`) use a timeout of 5000 ms, follow no redirect and read at most 1048576 bytes, whatever `PULSE_NOTIFY_API_MAX_BYTES` says.
 
 ## Channel config file
 
@@ -74,13 +80,13 @@ Every channel:
 
 Per type:
 
-| Type             | Key                        | Required | Meaning                                                                                                                                                |
-| ---------------- | -------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `webhook`        | `url`                      | yes      | A valid `http:` or `https:` URL. `http:` to a remote host logs a warning.                                                                              |
-| `webhook`        | `secretEnv` / `secretFile` | no       | Signing secret, see [webhook.md](channels/webhook.md#signing)                                                                                          |
-| `file`           | `path`                     | yes      | Non-empty file path. The parent directory is created.                                                                                                  |
-| `slack`, `teams` | `urlEnv` / `urlFile`       | one of   | Where the `https:` webhook URL is read from; `statusUrl`, `hideReason` are optional. See [slack.md](channels/slack.md), [teams.md](channels/teams.md). |
-| `email`          | `smtp`, `from`, `to`       | yes      | See [email.md](channels/email.md).`subjectPrefix`, `statusUrl`, `hideReason` are optional.                                                             |
+| Type             | Key                          | Required | Meaning                                                                                                                                                |
+| ---------------- | ---------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `webhook`        | `url` / `urlEnv` / `urlFile` | one of   | A valid `http:` or `https:` URL, inline or read from an env variable or a file. `http:` to a remote host logs a warning.                               |
+| `webhook`        | `secretEnv` / `secretFile`   | no       | Signing secret, see [webhook.md](channels/webhook.md#signing)                                                                                          |
+| `file`           | `path`                       | yes      | Non-empty file path. The parent directory is created.                                                                                                  |
+| `slack`, `teams` | `urlEnv` / `urlFile`         | one of   | Where the `https:` webhook URL is read from; `statusUrl`, `hideReason` are optional. See [slack.md](channels/slack.md), [teams.md](channels/teams.md). |
+| `email`          | `smtp`, `from`, `to`         | yes      | See [email.md](channels/email.md).`subjectPrefix`, `statusUrl`, `hideReason` are optional.                                                             |
 
 Unknown keys are rejected at startup, for example `notify.json: unknown key "check" in channels[0]`. Check the spelling of `checks`. The place is a path, so an unknown key inside the SMTP block reads `notify.json: unknown key "extra" in channels[0].smtp`. Details of each channel are in [channels.md](channels.md).
 

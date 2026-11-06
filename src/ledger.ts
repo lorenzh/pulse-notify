@@ -768,8 +768,8 @@ export class Ledger {
       this.migration = this.#migrateJson(opts.hooks);
     } else {
       const probed = this.#probe();
-      if (typeof probed === "number") this.migration = this.#migrateSqlite(probed, opts.hooks);
-      else loaded = probed;
+      if ("from" in probed) this.migration = this.#migrateSqlite(probed.from, opts.hooks);
+      else loaded = probed.rows;
     }
     const opened = this.#open(loaded);
     this.#db = opened.db;
@@ -834,12 +834,12 @@ export class Ledger {
    * One private copy for an existing SQLite file: the version for format 3 or 4 (to migrate),
    * the validated rows for format 5, and a refusal for any other version.
    */
-  #probe(): LoadedRows | 3 | 4 {
+  #probe(): { from: 3 | 4 } | { rows: LoadedRows } {
     return readSnapshot(this.#path, (db) => {
       const row = db.query("PRAGMA user_version").get();
       const version = isRecord(row) ? row.user_version : undefined;
-      if (version === 3 || version === 4) return version;
-      return this.#load(db, LEDGER_VERSION);
+      if (version === 3 || version === 4) return { from: version };
+      return { rows: this.#load(db, LEDGER_VERSION) };
     });
   }
 

@@ -397,3 +397,76 @@ test("PULSE_NOTIFY_BUDGET_THRESHOLD outside 0..100 stops startup", () => {
     );
   }
 });
+
+const TOKEN = "sentinel-notify-token-0123456789";
+const fakeNotifier = { createNotifier: (): Stoppable => ({ start() {}, async stop() {} }) };
+
+test("token mode starts without a config file; without a token the file stays required", async () => {
+  const state = join(dir, "token-mode.db");
+  const running = main({ PULSE_NOTIFY_API_TOKEN: TOKEN, PULSE_NOTIFY_STATE: state }, fakeNotifier);
+  await running.stop();
+  const empty = join(dir, "c-empty.json");
+  writeFileSync(empty, JSON.stringify({ channels: [] }));
+  const withEmpty = main(
+    { PULSE_NOTIFY_API_TOKEN: TOKEN, PULSE_NOTIFY_CONFIG: empty, PULSE_NOTIFY_STATE: state },
+    fakeNotifier,
+  );
+  await withEmpty.stop();
+  assert.throws(
+    () => main({ PULSE_NOTIFY_STATE: state }, fakeNotifier),
+    /PULSE_NOTIFY_CONFIG is required/,
+  );
+  assert.throws(
+    () => main({ PULSE_NOTIFY_CONFIG: empty, PULSE_NOTIFY_STATE: state }, fakeNotifier),
+    (err) => err instanceof ConfigError && /non-empty array/.test(err.message),
+  );
+});
+
+test("bad token settings stop startup without the token in the message", () => {
+  const tokenFile = join(dir, "token");
+  writeFileSync(tokenFile, `${TOKEN}\n`);
+  const emptyFile = join(dir, "token-empty");
+  writeFileSync(emptyFile, "  \n");
+  const state = join(dir, "token-bad.db");
+  const cases: [string, Record<string, string>, RegExp][] = [
+    [
+      "both sources",
+      { PULSE_NOTIFY_API_TOKEN: TOKEN, PULSE_NOTIFY_API_TOKEN_FILE: tokenFile },
+      /set only one of PULSE_NOTIFY_API_TOKEN and PULSE_NOTIFY_API_TOKEN_FILE/,
+    ],
+    ["empty file", { PULSE_NOTIFY_API_TOKEN_FILE: emptyFile }, /file is empty/],
+    ["missing file", { PULSE_NOTIFY_API_TOKEN_FILE: join(dir, "nope") }, /cannot read \(ENOENT\)/],
+  ];
+  for (const [name, env, message] of cases) {
+    assert.throws(
+      () => main({ ...env, PULSE_NOTIFY_STATE: state }, fakeNotifier),
+      (err) =>
+        err instanceof StartupError && message.test(err.message) && !err.message.includes(TOKEN),
+      name,
+    );
+  }
+});
+
+test("entry point: two token sources exit 2 with one line that holds no token", async () => {
+  const tokenFile = join(dir, "token-entry");
+  writeFileSync(tokenFile, TOKEN);
+  const child = spawn(process.execPath, [join(import.meta.dirname, "../src/index.ts")], {
+    env: {
+      ...process.env,
+      PULSE_NOTIFY_API_TOKEN: TOKEN,
+      PULSE_NOTIFY_API_TOKEN_FILE: tokenFile,
+      PULSE_NOTIFY_STATE: join(dir, "state-entry.db"),
+    },
+  });
+  let output = "";
+  child.stdout.on("data", (d) => {
+    output += d;
+  });
+  child.stderr.on("data", (d) => {
+    output += d;
+  });
+  const code = await new Promise((resolve) => child.once("close", resolve));
+  assert.equal(code, 2);
+  assert.match(output, /set only one of PULSE_NOTIFY_API_TOKEN and PULSE_NOTIFY_API_TOKEN_FILE/);
+  assert.equal(output.includes(TOKEN), false);
+});

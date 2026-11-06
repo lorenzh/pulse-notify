@@ -68,13 +68,31 @@ const chatShape = {
   ...messageShape,
 };
 
-const webhookSchema = z.strictObject({
-  ...baseShape,
-  type: z.literal("webhook"),
-  url: httpUrl("webhook needs a valid http(s) url"),
-  secretEnv: secretRef("secretEnv"),
-  secretFile: secretRef("secretFile"),
-});
+/** A webhook takes its url as a literal or as a reference; it needs exactly one of the three. */
+const webhookSchema = z
+  .strictObject({
+    ...baseShape,
+    type: z.literal("webhook"),
+    url: httpUrl("webhook needs a valid http(s) url").optional(),
+    urlEnv: secretRef("urlEnv"),
+    urlFile: secretRef("urlFile"),
+    secretEnv: secretRef("secretEnv"),
+    secretFile: secretRef("secretFile"),
+  })
+  .superRefine((raw, ctx) => {
+    const count = [raw.url, raw.urlEnv, raw.urlFile].filter((v) => v !== undefined).length;
+    if (count === 0) {
+      ctx.addIssue({
+        code: "custom",
+        message: "webhook needs a valid http(s) url or one of urlEnv, urlFile",
+      });
+    } else if (count > 1) {
+      ctx.addIssue({
+        code: "custom",
+        message: "webhook needs exactly one of url, urlEnv, urlFile",
+      });
+    }
+  });
 
 const fileSchema = z.strictObject({
   ...baseShape,

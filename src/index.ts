@@ -164,10 +164,16 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
 
   const settings = loadSettings(env);
   const budgetThreshold = loadBudgetThreshold(env);
-  const config = loadConfigFile(settings.configPath, {
-    env,
-    readFile: (path) => readFileSync(path, "utf8"),
-  });
+  // Token mode (Decision 11): the file is optional and may list no channel.
+  const isTokenMode = settings.apiToken !== undefined;
+  const config =
+    settings.configPath === undefined
+      ? { channels: [] }
+      : loadConfigFile(
+          settings.configPath,
+          { env, readFile: (path) => readFileSync(path, "utf8") },
+          { allowEmpty: isTokenMode },
+        );
   const write = deps.write ?? ((line: string) => process.stderr.write(`${line}\n`));
   const logger =
     deps.logger ?? createLogger({ level: settings.logLevel, write: (_level, line) => write(line) });

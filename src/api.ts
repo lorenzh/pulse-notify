@@ -1,4 +1,5 @@
 import {
+  ADMIN_MAX_BODY_BYTES,
   type Check,
   type CheckWithState,
   type ComponentWithState,
@@ -10,6 +11,8 @@ import {
   isPublicManualIncident,
   type ManualIncident,
   publicManualIncident,
+  type RequestJsonResult,
+  requestJson,
   type Validation,
   validateCheck,
   validateCheckWithState,
@@ -322,4 +325,101 @@ function updatesHaveDates(incident: ManualIncident): boolean {
     incident.updates.every((u) => isDateMs(u.at)) &&
     (incident.resolvedAt === null || isDateMs(incident.resolvedAt))
   );
+}
+
+/** Timeout of every `/service/*` request (Decision 6). */
+export const SERVICE_TIMEOUT_MS = 5000;
+
+/** Body limit of every `/service/*` answer, independent of `PULSE_NOTIFY_API_MAX_BYTES`. */
+export const SERVICE_MAX_BYTES = ADMIN_MAX_BODY_BYTES;
+
+export interface ServiceOptions {
+  baseUrl: string;
+  /** The notify service token; sent as `Bearer` on `/service/*` only. */
+  token: string;
+  fetch?: typeof fetch | undefined;
+  schedule?: Schedule | undefined;
+}
+
+/** A conditional service read: `not-modified` for a `304` to the stored ETag. */
+export type ServiceRead<T> =
+  | { status: "not-modified" }
+  | { status: "ok"; value: T; etag: string | undefined };
+
+function serviceUrl(baseUrl: string, path: string): string {
+  return new URL(path, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
+}
+
+function serviceHeaders(token: string, extra: Record<string, string> = {}): Headers {
+  const headers = new Headers({ accept: "application/json", ...extra });
+  headers.set("authorization", `Bearer ${token}`);
+  return headers;
+}
+
+/**
+ * GETs a `/service/*` path with the token and an optional `If-None-Match`. It follows no
+ * redirect, reads at most `SERVICE_MAX_BYTES` and checks the wire version and `validate`.
+ * Errors carry fixed text and the redacted path only, never the token or the answer.
+ */
+export async function getService<T>(
+  opts: ServiceOptions,
+  path: `service/${string}`,
+  validate: (raw: unknown) => Validation<T>,
+  etag?: string,
+): Promise<ServiceRead<T>> {
+  const base = opts.fetch ?? fetch;
+  let responseEtag: string | undefined;
+  const capture: FetchJsonOptions<T>["fetch"] = async (input, init) => {
+    const response = await base(input, { ...init, redirect: "manual" });
+    responseEtag = response.headers.get("etag") ?? undefined;
+    return response;
+  };
+  const options: FetchJsonOptions<T> = {
+    fetch: capture,
+    validate,
+    timeoutMs: SERVICE_TIMEOUT_MS,
+    maxBytes: SERVICE_MAX_BYTES,
+    headers: serviceHeaders(opts.token, etag === undefined ? {} : { "if-none-match": etag }),
+  };
+  if (opts.schedule) options.schedule = opts.schedule;
+  const result = await fetchJson(serviceUrl(opts.baseUrl, path), options);
+  if (result.ok) return { status: "ok", value: result.value, etag: responseEtag };
+  if (result.error.kind === "http" && result.error.status === 304 && etag !== undefined) {
+    return { status: "not-modified" };
+  }
+  throw redactedError(
+    serviceError(result.error, "GET", path),
+    opts.baseUrl,
+    failureKind(result.error),
+  );
+}
+
+/** Sends a JSON body to a `/service/*` path with the token; same limits as `getService`. */
+export async function sendService<T>(
+  opts: ServiceOptions,
+  method: "POST" | "PUT",
+  path: `service/${string}`,
+  body: unknown,
+  validate: (raw: unknown) => Validation<T>,
+): Promise<RequestJsonResult<T>> {
+  const result = await requestJson(serviceUrl(opts.baseUrl, path), {
+    method,
+    fetch: opts.fetch ?? fetch,
+    validate,
+    timeoutMs: SERVICE_TIMEOUT_MS,
+    maxBytes: SERVICE_MAX_BYTES,
+    headers: serviceHeaders(opts.token),
+    body: JSON.stringify(body),
+    ...(opts.schedule ? { schedule: opts.schedule } : {}),
+  });
+  return result;
+}
+
+/** Fixed text per failure: no answer text reaches a log line. */
+function serviceError(error: FetchJsonError, method: string, path: string): Error {
+  if (error.kind === "validation") {
+    return new Error(`${method} ${path} returned an invalid answer`);
+  }
+  const mapped = apiError(error, path);
+  return mapped instanceof Error ? mapped : new Error(`${method} ${path} failed`);
 }
