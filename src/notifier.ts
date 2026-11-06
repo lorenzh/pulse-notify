@@ -273,6 +273,24 @@ export class Notifier {
     return this.#channels.map((c) => c.config);
   }
 
+  /** True when a worker for the id is installed (a resend command needs one). */
+  hasChannel(id: string): boolean {
+    return this.#channels.some((c) => c.config.id === id);
+  }
+
+  /**
+   * Enqueues a key that a resend command set back to pending. Without a running worker the key
+   * stays pending, and `start()` or the next handover sends it.
+   */
+  enqueueResent(channelId: string, key: string): void {
+    if (!this.#running) return;
+    const state = this.#channels.find((c) => c.config.id === channelId);
+    if (!state?.isReady) return;
+    this.#enqueuePending(
+      this.#opts.ledger.pending().filter((p) => p.channelId === channelId && p.key === key),
+    );
+  }
+
   /**
    * Decision 13: installs the next channel set by id. An unchanged channel keeps its worker. A
    * changed or removed one takes no new job; its in-flight send finishes, then its pending keys go
@@ -538,6 +556,14 @@ export class Notifier {
       return;
     }
     if (count > 0) this.#opts.logger.info("old ledger entries pruned", { count });
+    let commands = 0;
+    try {
+      commands = this.#opts.ledger.pruneResendCommands();
+    } catch (err) {
+      this.#opts.logger.error("ledger prune failed, the next prune retries", errorFields(err));
+      return;
+    }
+    if (commands > 0) this.#opts.logger.info("old resend commands pruned", { count: commands });
   }
 
   /** One evaluation of all warning kinds, committed in one transaction, then enqueued. */

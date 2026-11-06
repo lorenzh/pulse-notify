@@ -1133,8 +1133,19 @@ export class Ledger {
           ? "UPDATE entries SET status = ?, at = ? WHERE channel_id = ? AND key = ?"
           : "UPDATE entries SET status = ?, at = ?, payload = NULL, recipients = NULL WHERE channel_id = ? AND key = ?";
         this.#db.query(sql).run(status, at, channelId, key);
+        this.#db
+          .query(
+            "UPDATE resend_commands SET state = ?, updated_at = ? WHERE channel_id = ? AND key = ? AND state = 'admitted'",
+          )
+          .run(status, at, channelId, key);
       },
       () => {
+        for (const row of this.#resendCommands.values()) {
+          if (row.channelId === channelId && row.key === key && row.state === "admitted") {
+            row.state = status;
+            row.updatedAt = at;
+          }
+        }
         entry.status = status;
         entry.at = at;
         if (!isKept) {
@@ -1201,28 +1212,97 @@ export class Ledger {
    */
   resend(channelId: string, key: string): ResendResult {
     this.#assertOpen();
+    const plan = this.#resendPlan(channelId, key);
+    if (plan.result === "resent") this.#transact(plan.write, plan.apply);
+    return plan.result;
+  }
+
+  #resendPlan(
+    channelId: string,
+    key: string,
+  ):
+    | { result: "resent"; write: () => void; apply: () => void }
+    | { result: Exclude<ResendResult, "resent"> } {
     const entry = this.#entry(channelId, key);
-    if (entry?.status !== "failed") return "not-failed";
-    if (!entry.payload) return "no-payload";
+    if (entry?.status !== "failed") return { result: "not-failed" };
+    if (!entry.payload) return { result: "no-payload" };
     const at = this.#now();
     const recipients = entry.recipients
       ? { delivered: [...entry.recipients.delivered], refused: [] }
       : undefined;
-    this.#transact(
-      () => {
+    return {
+      result: "resent",
+      write: () => {
         this.#db
           .query(
             "UPDATE entries SET status = 'pending', at = ?, recipients = ? WHERE channel_id = ? AND key = ?",
           )
           .run(at, json(recipients), channelId, key);
       },
-      () => {
+      apply: () => {
         entry.status = "pending";
         entry.at = at;
         entry.recipients = recipients;
       },
+    };
+  }
+
+  /**
+   * Handles a claimed resend command (Decision 14). A command id that already has a row is never
+   * executed again: its stored row comes back with `isNew` false. Otherwise the admission check,
+   * the resend of the key and the new row commit in one transaction; the caller enqueues an
+   * `admitted` key only after this returns.
+   */
+  admitResendCommand(
+    command: { id: string; channelId: string; key: string },
+    isInstalled: boolean,
+  ): { row: ResendCommandRow; isNew: boolean } {
+    this.#assertOpen();
+    const stored = this.#resendCommands.get(command.id);
+    if (stored) return { row: { ...stored }, isNew: false };
+    const { id, channelId, key } = command;
+    const plan = isInstalled
+      ? this.#resendPlan(channelId, key)
+      : { result: "channel-unavailable" as const };
+    const state: ResendCommandState = plan.result === "resent" ? "admitted" : plan.result;
+    const row: ResendCommandRow = {
+      id,
+      channelId,
+      key,
+      state,
+      postedState: undefined,
+      updatedAt: this.#now(),
+    };
+    this.#transact(
+      () => {
+        if ("write" in plan) plan.write();
+        this.#db
+          .query(
+            "INSERT INTO resend_commands (id, channel_id, key, state, posted_state, updated_at) VALUES (?, ?, ?, ?, NULL, ?)",
+          )
+          .run(id, channelId, key, state, row.updatedAt);
+      },
+      () => {
+        if ("apply" in plan) plan.apply();
+        this.#resendCommands.set(id, row);
+      },
     );
-    return "resent";
+    return { row: { ...row }, isNew: true };
+  }
+
+  /** Records that the api acknowledged (or finally refused) `state` for the command. */
+  markResendPosted(id: string, state: ResendCommandState): void {
+    this.#assertOpen();
+    const row = this.#resendCommands.get(id);
+    if (!row) return;
+    this.#transact(
+      () => {
+        this.#db.query("UPDATE resend_commands SET posted_state = ? WHERE id = ?").run(state, id);
+      },
+      () => {
+        row.postedState = state;
+      },
+    );
   }
 
   /** The stored alert state of the subject; `undefined` when there is none. */

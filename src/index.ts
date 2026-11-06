@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { hostname } from "node:os";
+import { validateResendClaimResponse } from "@lorenzh/pulse-contract";
 import {
   createLogger,
   type Env,
@@ -38,6 +39,12 @@ import {
 import { Metrics } from "./metrics.ts";
 import { Notifier, type NotifierOptions, type PollHealth } from "./notifier.ts";
 import { redactUrl } from "./redact.ts";
+import {
+  type PostOutcome,
+  type ResendCommandDeps,
+  type ResendLoop,
+  startResendLoop,
+} from "./resend-commands.ts";
 import { buildServiceReport, type FileChannelSource } from "./service-report.ts";
 import type { ChannelConfig, Config, Schedule } from "./types.ts";
 
@@ -53,6 +60,10 @@ export interface Stoppable {
   pollHealth?(): PollHealth;
   /** Installs a new effective channel set; absent in test fakes, which then keep their channels. */
   reconcile?(channels: readonly ChannelConfig[]): Promise<void>;
+  /** Absent in test fakes: a resend command then ends `channel-unavailable`. */
+  hasChannel?(id: string): boolean;
+  /** Absent in test fakes: an admitted key then waits for the next start. */
+  enqueueResent?(channelId: string, key: string): void;
 }
 
 /** The real clock, host, pid check and token for the state lock. */
@@ -103,6 +114,8 @@ export interface MainDeps {
   heartbeatSchedule?: Schedule;
   /** Timer for the channel poll and the report heartbeat; defaults to an unreferenced real timer. */
   channelSchedule?: Schedule;
+  /** Timer for the resend command poll; defaults to an unreferenced real timer. */
+  commandSchedule?: Schedule;
   /** `fetch` for the `/service/*` calls; defaults to the global one. */
   serviceFetch?: typeof fetch;
   /** Clock for the report and the applied stamps; defaults to `Date.now`. */
@@ -155,6 +168,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
   const state: {
     notifier?: Stoppable;
     channelLoop?: ChannelLoop;
+    resendLoop?: ResendLoop | undefined;
     health?: OpsServer;
     ledger?: Ledger | undefined;
     lock?: LedgerLock | undefined;
@@ -166,6 +180,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
     finishing ??= (async () => {
       // The channel loop stops first, so no install or report races the notifier stop.
       await state.channelLoop?.stop();
+      await state.resendLoop?.stop();
       await state.notifier?.stop().catch(() => {});
       await state.ledger?.flush().catch((err: unknown) => {
         logRef.logger?.error("ledger flush failed, pending keys are resent", {
@@ -261,6 +276,15 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
     schedule: deps.channelSchedule ?? unrefSchedule,
   });
   state.channelLoop = loop;
+  const resendLoop =
+    channels.service === undefined
+      ? undefined
+      : startResendLoop(
+          resendDeps(channels.service, ledger, logger, () => notifierRef.current),
+          settings.commandPollMs,
+          deps.commandSchedule ?? unrefSchedule,
+        );
+  state.resendLoop = resendLoop;
   notifierRef.current = notifier;
   startHeartbeat(lock, settings.lockLeaseSeconds, deps.heartbeatSchedule ?? unrefSchedule, {
     logger,
@@ -272,6 +296,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
       ledger.close();
       state.ledger = undefined;
       void loop.stop();
+      void resendLoop?.stop();
       void notifier.stop().catch(() => {});
       exit(2);
     },
@@ -280,6 +305,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
   const startNotifier = (): void => {
     notifier.start();
     loop.start();
+    resendLoop?.start();
     isStarted = true;
     logger.info("pulse-notify started", {
       channels: config.channels.map((c) => c.id),
@@ -451,6 +477,46 @@ function safeRead(read: () => string): string {
     // The startup load already read this file; a race here only empties the report refs.
     return "";
   }
+}
+
+/** The `/service/notify/resends` calls of Decision 14. */
+function resendDeps(
+  service: ServiceOptions,
+  ledger: Ledger,
+  logger: Logger,
+  notifier: () => Stoppable | undefined,
+): ResendCommandDeps {
+  return {
+    ledger,
+    logger,
+    claim: async () => {
+      const result = await sendService(service, "POST", "service/notify/resends/claim", {}, (raw) =>
+        validateResendClaimResponse(raw),
+      );
+      if (!result.ok) throw new ResendServiceError(`claim failed: ${result.error.kind}`);
+      return result.value?.commands ?? [];
+    },
+    postResult: async (id, state): Promise<PostOutcome> => {
+      const result = await sendService(
+        service,
+        "POST",
+        `service/notify/resends/${encodeURIComponent(id)}/result`,
+        { state },
+        (raw) => ({ ok: true, value: raw }),
+      );
+      if (result.ok) return "acknowledged";
+      const { error } = result;
+      if (error.kind === "http" && (error.status === 404 || error.status === 409)) return "refused";
+      return "retry";
+    },
+    isInstalled: (id) => notifier()?.hasChannel?.(id) ?? false,
+    enqueue: (channelId, key) => notifier()?.enqueueResent?.(channelId, key),
+  };
+}
+
+/** A resend call failed; the text holds the failure kind only, never an answer. */
+class ResendServiceError extends Error {
+  override readonly name = "ResendServiceError";
 }
 
 export interface ChannelLoop {
