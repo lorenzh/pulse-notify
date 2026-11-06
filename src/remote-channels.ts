@@ -7,7 +7,7 @@ import {
   validateServiceNotifyChannels,
 } from "@lorenzh/pulse-contract";
 import type { Env } from "@lorenzh/pulse-kit";
-import type { RawChannel } from "./channel-schema.ts";
+import { channelSchema, type RawChannel } from "./channel-schema.ts";
 import { ConfigError, resolveChannel } from "./config.ts";
 import type { ChannelConfig } from "./types.ts";
 
@@ -150,10 +150,19 @@ function allowedEnv(env: Env): Record<string, string | undefined> {
 /** The record as the channel shape of the file, which the shared secret step reads. */
 function rawOf(record: NotifyChannelRecord): RawChannel {
   const definition = definitionOf(record);
-  if (definition.type === "email") {
-    return { ...definition, smtp: { ...definition.smtp, tls: definition.smtp.tls ?? "starttls" } };
+  const candidate =
+    definition.type === "email"
+      ? { ...definition, smtp: { ...definition.smtp, tls: definition.smtp.tls ?? "starttls" } }
+      : definition;
+  // The contract checks the wire shape only; the notify-local rules of file channels apply too.
+  const schema = channelSchema(candidate.type);
+  if (schema === undefined) throw new ConfigError(`unknown type ${candidate.type}`);
+  const result = schema.safeParse(candidate);
+  if (!result.success) {
+    const [issue] = result.error.issues;
+    throw new ConfigError(issue === undefined ? "invalid channel" : issue.message);
   }
-  return definition;
+  return result.data;
 }
 
 /**
