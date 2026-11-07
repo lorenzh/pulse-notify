@@ -74,3 +74,7 @@ Status: https://status.example.com
 ```
 
 An expiry warning has the subject `TLS EXPIRES SOON` or `DOMAIN EXPIRES SOON` and the lines `Check: <name>`, `Expires in: <n> days` and `Kind: ...`. The Message-ID derives from the warning key.
+
+## Subscriber mail (in progress)
+
+Mail to status page subscribers does not use the email channel or its settings: it uses the `PULSE_NOTIFY_SUBSCRIPTIONS_SMTP_*` settings (see [configuration](../configuration.md)). It shares `PULSE_NOTIFY_SMTP_CLIENT_NAME` and the retry settings. Each message has exactly one `To` address. At most one subscriber message per mailbox is in flight at a time, confirmation and incident mail together; this bound does not cover the email channel. The confirmation mail has the subject `<prefix> Confirm your subscription`, a confirm link that works for 24 hours, an unsubscribe link and a link to the data notice, all on the configured status origin.

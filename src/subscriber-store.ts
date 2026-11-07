@@ -366,6 +366,15 @@ export class SubscriberStore {
     });
   }
 
+  /** The number of `pending` events: `pulse_notify_subscriber_events_pending`. */
+  pendingEventCount(): number {
+    return (
+      this.#db
+        .query<{ n: number }, []>("SELECT count(*) AS n FROM events WHERE status = 'pending'")
+        .get()?.n ?? 0
+    );
+  }
+
   /** Pending events in fan-out order: `detected_at`, then `key`. */
   pendingEvents(): EventRow[] {
     return this.#db

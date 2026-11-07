@@ -61,7 +61,7 @@ Settings, channels, routing, reminders, secrets, signing, payload, delivery, ope
 
 Settings (environment variables) are listed in [docs/configuration.md](docs/configuration.md); the channel config keys are there too.
 
-Email subscriptions for status page visitors are in progress: their settings and subscriber store exist, but the service does not start them yet. Email subscriptions need the status page at the root of its origin, for example `https://status.example.com`. A path such as `/pulse` is refused at startup while subscriptions are on. The store, its retention and `subscribers delete` are in [docs/operation.md](docs/operation.md#subscriber-store-in-progress).
+Email subscriptions for status page visitors are in progress: their settings, subscriber store, private listener and confirmation mail queue exist, but the service does not start them yet. Email subscriptions need the status page at the root of its origin, for example `https://status.example.com`. A path such as `/pulse` is refused at startup while subscriptions are on. The store, its retention and `subscribers delete` are in [docs/operation.md](docs/operation.md#subscriber-store-in-progress).
 
 ## Development
 

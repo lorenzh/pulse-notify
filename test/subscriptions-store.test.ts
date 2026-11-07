@@ -6,11 +6,17 @@ import { join } from "node:path";
 import { StartupError } from "@lorenzh/pulse-kit";
 import { SubscriberStore, startCleanup } from "../src/subscriber-store.ts";
 import {
+  confirmTokenOf,
   countRows,
   fakeScheduler,
+  letLoopRun,
   manualClock,
   readStore,
+  type SubscriptionFixture,
+  subscriptionFixture,
+  TEST_KEY,
   tempDir,
+  testUnsubscribeToken,
 } from "./subscriptions-support.ts";
 
 const DAY = 86_400_000;
@@ -506,4 +512,163 @@ describe("deletion inside an enclosing transaction", () => {
       assert.equal(walSize(), 0);
     });
   }
+});
+
+describe("Lifecycle and timing (operations, injected clock)", () => {
+  let fx: SubscriptionFixture | undefined;
+  afterEach(async () => {
+    await fx?.close();
+    fx = undefined;
+  });
+  const A = "sub-a@example.com";
+  const B = "sub-b@example.com";
+  const idOf = (f: SubscriptionFixture, email: string): string =>
+    readStore(
+      f.path,
+      (db) =>
+        db
+          .query<{ id: string }, [string]>("SELECT id FROM subscriptions WHERE email = ?")
+          .get(email)?.id ?? "",
+    );
+  /** Lets worker 1 send and resolves every held call. */
+  const flush = async (f: SubscriptionFixture): Promise<void> => {
+    await letLoopRun();
+    for (const call of f.mailer.calls) call.resolve();
+    await letLoopRun();
+  };
+
+  test("three mails at 0, 600000 and 1200000; none at 599999 and 1800000; tokens rotate", async () => {
+    const f = subscriptionFixture();
+    fx = f;
+    const sends: [number, string][] = [
+      [0, "queued"],
+      [599_999, "known"],
+      [600_000, "queued"],
+      [1_200_000, "queued"],
+      [1_800_000, "known"],
+    ];
+    for (const [t, outcome] of sends) {
+      f.clock.t = t;
+      const result = f.ops.subscribe(A, t);
+      assert.equal(typeof result, "string");
+      assert.equal(result, outcome);
+      await flush(f);
+    }
+    assert.equal(f.mailer.calls.length, 3);
+    const [t1, t2, t3] = f.mailer.calls.map(confirmTokenOf);
+    assert.equal(new Set([t1, t2, t3]).size, 3);
+    assert.equal(f.ops.confirm(t1 ?? "", 1_200_001), "invalid");
+    // The TTL ends exclusively at last_sent_at + 86400000.
+    assert.equal(f.ops.confirm(t3 ?? "", 1_200_000 + 86_400_000), "invalid");
+    assert.equal(f.ops.confirm(t3 ?? "", 1_200_000 + 86_399_999), "ok");
+  });
+
+  test("confirm twice keeps the first confirmed_at; confirm after unsubscribe is 404", async () => {
+    const f = subscriptionFixture();
+    fx = f;
+    f.ops.subscribe(A, 0);
+    await flush(f);
+    const token = f.mailer.calls[0] === undefined ? "" : confirmTokenOf(f.mailer.calls[0]);
+    assert.equal(f.ops.confirm(token, 10), "ok");
+    assert.equal(f.ops.confirm(token, 20), "ok");
+    assert.equal(
+      countRows(f.path, "SELECT confirmed_at AS n FROM subscriptions WHERE email = ?", A),
+      10,
+    );
+    const unsub = testUnsubscribeToken(idOf(f, A), TEST_KEY);
+    assert.equal(f.ops.unsubscribe(unsub), "ok");
+    assert.equal(f.ops.unsubscribe(unsub), "ok");
+    assert.equal(f.ops.confirm(token, 30), "invalid");
+    f.ops.subscribe(B, 40);
+    await flush(f);
+    assert.deepEqual(
+      f.mailer.calls.map((c) => c.to),
+      [A, B],
+    );
+  });
+
+  test("a mac of another key is 404 and the row stays", () => {
+    const f = subscriptionFixture();
+    fx = f;
+    f.ops.subscribe(A, 0);
+    assert.equal(f.ops.unsubscribe(testUnsubscribeToken(idOf(f, A), "b".repeat(64))), "invalid");
+    assert.equal(countRows(f.path, "SELECT count(*) AS n FROM subscriptions"), 1);
+  });
+
+  test("unsubscribe while pending cancels the job and the confirm link", async () => {
+    const f = subscriptionFixture();
+    fx = f;
+    f.ops.subscribe(A, 0);
+    f.ops.subscribe(B, 1);
+    await letLoopRun();
+    // A is in flight; B's job waits. B unsubscribes from its own (later) link.
+    assert.equal(f.ops.unsubscribe(testUnsubscribeToken(idOf(f, B), TEST_KEY)), "ok");
+    assert.equal(f.worker.size(), 1);
+    await flush(f);
+    assert.deepEqual(
+      f.mailer.calls.map((c) => c.to),
+      [A],
+    );
+  });
+
+  test("a fresh generation has a new id; the old token cannot touch it", async () => {
+    const f = subscriptionFixture();
+    fx = f;
+    f.ops.subscribe(A, 0);
+    const oldId = idOf(f, A);
+    const oldToken = testUnsubscribeToken(oldId, TEST_KEY);
+    assert.equal(f.ops.unsubscribe(oldToken), "ok");
+    assert.equal(f.ops.subscribe(A, 10), "queued");
+    const newId = idOf(f, A);
+    assert.notEqual(newId, oldId);
+    assert.equal(f.ops.unsubscribe(oldToken), "ok");
+    assert.equal(idOf(f, A), newId);
+    assert.equal(
+      countRows(f.path, "SELECT count(*) AS n FROM subscriptions WHERE state = 'pending'"),
+      1,
+    );
+  });
+
+  test("global window of 2: refuses silently at 3599999 and admits at 3600000", () => {
+    const f = subscriptionFixture({ confirmPerHour: 2 });
+    fx = f;
+    assert.equal(f.ops.subscribe("u1@example.com", 0), "queued");
+    assert.equal(f.ops.subscribe("u2@example.com", 1000), "queued");
+    assert.equal(f.ops.subscribe("u3@example.com", 3_599_999), "limited");
+    assert.deepEqual(f.limited, ["window"]);
+    assert.equal(countRows(f.path, "SELECT count(*) AS n FROM subscriptions"), 2);
+    assert.equal(f.ops.subscribe("u3@example.com", 3_600_000), "queued");
+    assert.equal(countRows(f.path, "SELECT count(*) AS n FROM subscriptions"), 3);
+  });
+
+  test("row cap 2: a new address stores nothing; a confirmed one is unchanged", async () => {
+    const f = subscriptionFixture({ max: 2, maxPending: 2 });
+    fx = f;
+    f.ops.subscribe(A, 0);
+    f.ops.subscribe(B, 1);
+    await flush(f);
+    const token = f.mailer.calls[0] === undefined ? "" : confirmTokenOf(f.mailer.calls[0]);
+    assert.equal(f.ops.confirm(token, 2), "ok");
+    assert.equal(f.ops.subscribe("new@example.com", 3), "limited");
+    assert.equal(f.ops.subscribe(A, 4), "known");
+    assert.deepEqual(f.limited, ["capacity"]);
+    assert.equal(countRows(f.path, "SELECT count(*) AS n FROM subscriptions"), 2);
+    assert.equal(
+      countRows(f.path, "SELECT confirmed_at AS n FROM subscriptions WHERE email = ?", A),
+      2,
+    );
+  });
+
+  test("an expired pending row is replaced by a new one at subscribe", () => {
+    const f = subscriptionFixture();
+    fx = f;
+    f.ops.subscribe(A, 0);
+    const oldId = idOf(f, A);
+    assert.equal(f.ops.subscribe(A, 86_400_000), "queued");
+    assert.notEqual(idOf(f, A), oldId);
+    assert.equal(
+      countRows(f.path, "SELECT confirm_sends AS n FROM subscriptions WHERE email = ?", A),
+      1,
+    );
+  });
 });

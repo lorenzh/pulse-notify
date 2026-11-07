@@ -42,7 +42,7 @@ The schedule is in [channels.md](channels.md#delivery-and-retries).
 
 ## Email subscriptions (in progress)
 
-Email subscriptions for status page visitors are being built. This version reads and checks the settings below and has the subscriber store, but the service does not start a listener, store or worker yet, whatever `PULSE_NOTIFY_SUBSCRIPTIONS` says.
+Email subscriptions for status page visitors are being built. This version reads and checks the settings below and has the subscriber store, the listener and the confirmation mail queue, but the service does not start a listener, store or worker yet, whatever `PULSE_NOTIFY_SUBSCRIPTIONS` says.
 
 | Variable                                        | Default                                               | Rule                                                                                                                                                              |
 | ----------------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
