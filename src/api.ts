@@ -350,8 +350,16 @@ function serviceUrl(baseUrl: string, path: string): string {
   return new URL(path, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
 }
 
+/** True for a token of visible ASCII only, safe in an `Authorization` header. */
+export function isHeaderToken(token: string): boolean {
+  return /^[\x21-\x7e]+$/.test(token);
+}
+
 function serviceHeaders(token: string, extra: Record<string, string> = {}): Headers {
   const headers = new Headers({ accept: "application/json", ...extra });
+  // The runtime error for an invalid header value quotes the value, so it holds the token.
+  if (!isHeaderToken(token))
+    throw new ApiReadError("service token is not a valid header value", "token");
   headers.set("authorization", `Bearer ${token}`);
   return headers;
 }

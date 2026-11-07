@@ -13,7 +13,7 @@ import {
   StartupError,
 } from "@lorenzh/pulse-kit";
 import { z } from "zod";
-import { DEFAULT_API_MAX_BYTES } from "./api.ts";
+import { DEFAULT_API_MAX_BYTES, isHeaderToken } from "./api.ts";
 import { channelSchema, type RawChannel } from "./channel-schema.ts";
 import { isLoopbackHost } from "./channels/loopback.ts";
 import { isEhloName } from "./channels/mailer.ts";
@@ -460,11 +460,19 @@ function readApiToken(env: Env, readFile?: (path: string) => string): string | u
       { setting: "PULSE_NOTIFY_API_TOKEN_FILE" },
     );
   }
-  if (file === undefined) return value;
-  return readSecretFile(file, {
-    setting: "PULSE_NOTIFY_API_TOKEN_FILE",
-    ...(readFile === undefined ? {} : { readFile }),
-  });
+  const token =
+    file === undefined
+      ? value
+      : readSecretFile(file, {
+          setting: "PULSE_NOTIFY_API_TOKEN_FILE",
+          ...(readFile === undefined ? {} : { readFile }),
+        });
+  if (token !== undefined && !isHeaderToken(token)) {
+    throw new StartupError("the service token must hold visible ASCII characters only", {
+      setting: file === undefined ? "PULSE_NOTIFY_API_TOKEN" : "PULSE_NOTIFY_API_TOKEN_FILE",
+    });
+  }
+  return token;
 }
 
 /** `readFile` reads the token file; injected so tests need no real file system. */
