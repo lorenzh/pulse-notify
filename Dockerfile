@@ -8,7 +8,8 @@ FROM oven/bun:1.4.0-alpine@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5d
 ENV NODE_ENV=production \
     PULSE_NOTIFY_STATE=/data/notify-state.json \
     PULSE_HEALTH_PORT=9100 \
-    PULSE_HEALTH_HOST=0.0.0.0
+    PULSE_HEALTH_HOST=0.0.0.0 \
+    PULSE_NOTIFY_SUBSCRIPTIONS_HOST=0.0.0.0
 WORKDIR /app
 RUN mkdir /data && chown bun:bun /data
 COPY --from=build /app/node_modules ./node_modules
