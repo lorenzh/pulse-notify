@@ -106,8 +106,9 @@ Credentials never go inline in the config file, except the webhook `url`:
 | `slack`, `teams` | `urlEnv` or `urlFile`                     | The webhook URL    |
 | `email`          | `smtp.passwordEnv` or `smtp.passwordFile` | The SMTP password  |
 | `webhook`        | `secretEnv` or `secretFile` (optional)    | The signing secret |
+| `webhook`        | `url`, `urlEnv` or `urlFile`              | The URL            |
 
-Exactly one of each pair. The `...Env` key holds the name of an environment variable; the `...File` key holds a path. A file is read once at start and one trailing newline is removed. A missing or empty variable or file stops startup with an error that names the channel and the key, never the value. Logs, errors and `/metrics` do not contain these values.
+Exactly one of each pair, and exactly one of the three webhook URL keys. The `...Env` key holds the name of an environment variable; the `...File` key holds a path. A file is read once at start and one trailing newline is removed. A missing or empty variable or file stops startup with an error that names the channel and the key, never the value. Logs, errors and `/metrics` do not contain these values.
 
 ## Warnings
 
@@ -189,10 +190,23 @@ The reason is untrusted text: it is cut to 300 characters, control characters ar
   - HTTP channels (webhook, Slack, Teams): a 4xx status except 408 and 429, for example 400, 401, 403, 404 or 410. A 3xx status, 408, 429, a 5xx status, a timeout or a network error is retried.
   - Email: an SMTP reply with a 5xx code, at any stage. A 4xx reply is retried.
 
-  The next queued event of the channel is sent at once. Resend a failed event with `failed resend`, see [operation.md](operation.md#failed-events-and-resend).
+  The next queued event of the channel is sent at once. Resend a failed event with `failed resend`, or from the console with a token, see [operation.md](operation.md#failed-events-and-resend).
 - `PULSE_NOTIFY_RETRY_ATTEMPTS=0` keeps retrying a failing event without end, but it does not block the channel: later events of that channel are still sent.
 - After the last attempt the event is logged at error level (channel, key, attempts, error, code, cause) and marked `failed`. `failed` is not retried by the service, not even after a restart (unless `PULSE_NOTIFY_RETRY_ATTEMPTS=0`, where a retryable error never ends the event). Its notification is kept in the ledger, so `failed resend` can send it again.
 - Each channel has its own queue and sends one event at a time. A slow or failing channel delays neither other channels nor polling. First attempts run in the order the events arrive. When an attempt fails and a retry follows, the event waits for its own retry delay without blocking the channel; the next event is sent at once. When the delay ends, the event goes to the end of the queue, behind the events that are already waiting to be sent. So completion order is not FIFO: a retried event can arrive after events that came later, for example a `resolved` before its `opened`. Each event counts its own attempts. A reminder is checked again before each attempt and is dropped if its incident resolved during the wait.
 - `resolved` is sent after `opened`. It is still sent if `opened` failed.
 - On the first start of a channel (new ledger or new channel id) all incidents that the API shows are recorded as `seeded`. No notifications are sent for this history. The seed covers all incidents, whatever the `checks` filter says.
 - A failing or malformed api poll is logged and retried on the next tick. See [operation.md](operation.md) for restarts and logs.
+
+## Database channels
+
+With a service token, the api may hold channels of type `webhook`, `slack`, `teams` and `email` (never `file`). They hold references only, never a secret value:
+
+- An env reference must match `PULSE_NOTIFY_SECRET_[A-Z0-9_]{1,64}`; other variables, such as `PULSE_NOTIFY_API_TOKEN`, are never read for them.
+- A file reference is a basename (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`), read only inside `PULSE_NOTIFY_SECRET_DIR`. A symlink that leads out of that directory is refused. Without the variable, file references are refused with `secret files are not enabled`.
+- The channels answer is checked in two levels. A bad envelope (not `{revision, channels}`, more than 100 channels, a missing, invalid or repeated id) is refused as a whole and nothing changes. After a good envelope each channel is checked on its own, including the limit of 16384 bytes of JSON per definition; a bad channel is reported by its id and the others still apply.
+- A channel file entry with the same id wins over the database channel as a whole; no field is mixed. The database copy is listed in `shadowedIds` of the report, and removing the file entry installs it again.
+- Every `PULSE_NOTIFY_CHANNELS_POLL_MS` notify re-reads the channel file (applied only when its SHA-256 changes, also without a token) and asks for the channels with the stored ETag. An invalid, deleted or unreadable file keeps the last good file channels and is reported as a rejection with `channelId: null` until the file is good again. A refused envelope, an answer over 1048576 bytes, a wire mismatch, invalid JSON, or a failed read (api error status other than 404, network error, timeout) keeps everything: workers, stored rows, ETag and applied revision; the report shows one rejection with `channelId: null` and a reason that starts with `channels answer`. Without a token notify ignores stored database channels from an earlier run. After a good envelope a bad or unresolvable channel keeps its last good version, and the rejection stays until a later answer fixes it.
+- A changed channel gets a new worker: the old one finishes its send in flight, then hands its pending events and email recipient progress to the new one. An unchanged channel keeps its worker. A removed channel keeps its pending events until it returns. A new channel is seeded quietly.
+- The last applied definitions (references only) are stored in the state file, so they work after a restart while the api is down. An api that answers 404 gives no database channels, logged once.
+- After every poll, and at least every 60000 ms, notify sends `PUT /service/notify/report`: the applied revision, the file channels with their reference names, the shadowed ids, the rejections and the newest failed events, without payloads or destinations. Without a token notify makes no `/service/*` call and sends no report.

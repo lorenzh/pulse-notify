@@ -7,12 +7,13 @@ import {
   readLogLevel,
   readMs,
   readPort,
+  readSecretFile,
   readString,
   readUrl,
   StartupError,
 } from "@lorenzh/pulse-kit";
 import { z } from "zod";
-import { DEFAULT_API_MAX_BYTES } from "./api.ts";
+import { DEFAULT_API_MAX_BYTES, isHeaderToken } from "./api.ts";
 import { channelSchema, type RawChannel } from "./channel-schema.ts";
 import { isLoopbackHost } from "./channels/loopback.ts";
 import { isEhloName } from "./channels/mailer.ts";
@@ -98,6 +99,26 @@ function requireSecret(refs: SecretRefs, id: string, name: string, source: Secre
     throw new ConfigError(`channel "${id}": ${name}Env or ${name}File is required`);
   }
   return value;
+}
+
+/** A webhook url from a reference must be http(s), as a literal one; the value is not shown. */
+function resolveWebhookUrl(
+  raw: Extract<RawChannel, { type: "webhook" }>,
+  source: SecretSource,
+): string {
+  if (raw.url !== undefined) return raw.url;
+  const url = requireSecret({ env: raw.urlEnv, file: raw.urlFile }, raw.id, "url", source);
+  const key = raw.urlEnv === undefined ? "urlFile" : "urlEnv";
+  let protocol: string;
+  try {
+    protocol = new URL(url).protocol;
+  } catch {
+    throw new ConfigError(`channel "${raw.id}": ${key} does not hold a valid url`);
+  }
+  if (protocol !== "https:" && protocol !== "http:") {
+    throw new ConfigError(`channel "${raw.id}": ${key} must hold an http(s) url`);
+  }
+  return url;
 }
 
 /** Slack and Teams URLs are credentials: https only, except for a local test server. */
@@ -196,8 +217,11 @@ function messageOptionsOf(raw: {
   };
 }
 
-/** Turns a validated channel into its config; this is the separate secret step. */
-function resolveChannel(raw: RawChannel, source: SecretSource): ChannelConfig {
+/**
+ * Turns a validated channel into its config; this is the separate secret step. Errors name the
+ * channel and the reference, never a value.
+ */
+export function resolveChannel(raw: RawChannel, source: SecretSource): ChannelConfig {
   const base = baseOf(raw);
   switch (raw.type) {
     case "webhook": {
@@ -210,7 +234,7 @@ function resolveChannel(raw: RawChannel, source: SecretSource): ChannelConfig {
       return {
         ...base,
         type: "webhook",
-        url: raw.url,
+        url: resolveWebhookUrl(raw, source),
         ...(secret === undefined ? {} : { secret }),
       };
     }
@@ -287,13 +311,25 @@ const configSchema = z.strictObject(
   "config must be an object",
 );
 
+/** With a service token the database may hold every channel, so the file may list none. */
+const optionalChannelsSchema = z.strictObject(
+  { channels: z.array(z.unknown(), "config.channels must be an array") },
+  "config must be an object",
+);
+
+export interface ParseOptions {
+  /** Token mode (Decision 11): `"channels": []` is valid. */
+  allowEmpty?: boolean;
+}
+
 /** `path` names the file in unknown-key errors. Secrets are read from `source` right here. */
 export function parseConfig(
   raw: unknown,
   path = "config",
   source: SecretSource = realSource(),
+  opts: ParseOptions = {},
 ): Config {
-  const top = configSchema.safeParse(raw);
+  const top = (opts.allowEmpty === true ? optionalChannelsSchema : configSchema).safeParse(raw);
   if (!top.success) {
     const issue =
       top.error.issues.find((i) => i.code === "unrecognized_keys") ?? top.error.issues[0];
@@ -310,7 +346,11 @@ export function parseConfig(
   return { channels };
 }
 
-export function loadConfigFile(path: string, source?: SecretSource): Config {
+export function loadConfigFile(
+  path: string,
+  source?: SecretSource,
+  opts: ParseOptions = {},
+): Config {
   let text: string;
   try {
     text = readFileSync(path, "utf8");
@@ -323,11 +363,20 @@ export function loadConfigFile(path: string, source?: SecretSource): Config {
   } catch (err) {
     throw new ConfigError(`config file ${path} is not valid JSON: ${(err as Error).message}`);
   }
-  return parseConfig(json, path, source);
+  return parseConfig(json, path, source, opts);
 }
 
 export interface Settings {
-  configPath: string;
+  /** `undefined` only in token mode: the database holds every channel. */
+  configPath: string | undefined;
+  /** The notify service token; `undefined` without one (file-only mode, as before). */
+  apiToken: string | undefined;
+  /** Directory of the secret files of database channels; `undefined` disables them. */
+  secretDir: string | undefined;
+  /** Poll of `/service/notify/channels` and of the channel file. */
+  channelsPollMs: number;
+  /** Poll of the resend commands. */
+  commandPollMs: number;
   apiUrl: string;
   statePath: string;
   pollMs: number;
@@ -393,9 +442,44 @@ export function loadLockLeaseSeconds(env: Env): number {
   });
 }
 
-export function loadSettings(env: Env): Settings {
+export const DEFAULT_CHANNELS_POLL_MS = 15_000;
+export const DEFAULT_COMMAND_POLL_MS = 5000;
+export const MIN_SERVICE_POLL_MS = 1000;
+
+/**
+ * The token from `PULSE_NOTIFY_API_TOKEN` or `PULSE_NOTIFY_API_TOKEN_FILE` (a value empty after
+ * trim counts as unset). Both set, or an unreadable or empty file, is a startup error that
+ * never holds the token.
+ */
+function readApiToken(env: Env, readFile?: (path: string) => string): string | undefined {
+  const value = readString(env, "PULSE_NOTIFY_API_TOKEN");
+  const file = readString(env, "PULSE_NOTIFY_API_TOKEN_FILE");
+  if (value !== undefined && file !== undefined) {
+    throw new StartupError(
+      "set only one of PULSE_NOTIFY_API_TOKEN and PULSE_NOTIFY_API_TOKEN_FILE",
+      { setting: "PULSE_NOTIFY_API_TOKEN_FILE" },
+    );
+  }
+  const token =
+    file === undefined
+      ? value
+      : readSecretFile(file, {
+          setting: "PULSE_NOTIFY_API_TOKEN_FILE",
+          ...(readFile === undefined ? {} : { readFile }),
+        });
+  if (token !== undefined && !isHeaderToken(token)) {
+    throw new StartupError("the service token must hold visible ASCII characters only", {
+      setting: file === undefined ? "PULSE_NOTIFY_API_TOKEN" : "PULSE_NOTIFY_API_TOKEN_FILE",
+    });
+  }
+  return token;
+}
+
+/** `readFile` reads the token file; injected so tests need no real file system. */
+export function loadSettings(env: Env, readFile?: (path: string) => string): Settings {
+  const apiToken = readApiToken(env, readFile);
   const configPath = readString(env, "PULSE_NOTIFY_CONFIG");
-  if (configPath === undefined) {
+  if (configPath === undefined && apiToken === undefined) {
     throw new StartupError("PULSE_NOTIFY_CONFIG is required", { setting: "PULSE_NOTIFY_CONFIG" });
   }
   const pollMs = readMs(env, "PULSE_NOTIFY_POLL_MS", { fallback: 5000, min: 1 });
@@ -416,6 +500,16 @@ export function loadSettings(env: Env): Settings {
   }
   return {
     configPath,
+    apiToken,
+    secretDir: readString(env, "PULSE_NOTIFY_SECRET_DIR"),
+    channelsPollMs: readMs(env, "PULSE_NOTIFY_CHANNELS_POLL_MS", {
+      fallback: DEFAULT_CHANNELS_POLL_MS,
+      min: MIN_SERVICE_POLL_MS,
+    }),
+    commandPollMs: readMs(env, "PULSE_NOTIFY_COMMAND_POLL_MS", {
+      fallback: DEFAULT_COMMAND_POLL_MS,
+      min: MIN_SERVICE_POLL_MS,
+    }),
     apiUrl: parseApiUrl(env),
     statePath: readString(env, "PULSE_NOTIFY_STATE") ?? "./notify-state.json",
     pollMs,

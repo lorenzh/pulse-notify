@@ -92,7 +92,7 @@ test("settle removes the payload; a ledger without payloads loads", () => {
   assert.deepEqual(new Ledger(legacy).pending(), [{ channelId: "c", key: "9:opened" }]);
 });
 
-test("format 4 has the exact schema, user_version 4 and WAL mode", () => {
+test("format 5 has the exact schema, user_version 5 and WAL mode", () => {
   const path = tmpPath();
   const ledger = new Ledger(path);
   ledger.close();
@@ -109,8 +109,10 @@ test("format 4 has the exact schema, user_version 4 and WAL mode", () => {
     "CREATE TABLE alert_state ( kind TEXT NOT NULL CHECK (kind IN ('budget-check','budget-component','expiry')), subject_id TEXT NOT NULL, last_event_at INTEGER, stage INTEGER CHECK (stage IN (14, 3)), episode_at INTEGER, observed_at INTEGER, updated_at INTEGER NOT NULL, PRIMARY KEY (kind, subject_id) ) STRICT",
     "CREATE TABLE channels ( id TEXT PRIMARY KEY, reminders_from INTEGER, manual_from INTEGER, check_routing TEXT, component_routing TEXT ) STRICT",
     "CREATE TABLE entries ( channel_id TEXT NOT NULL, key TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('seeded','pending','delivered','failed','dropped')), at INTEGER NOT NULL, payload TEXT, recipients TEXT, PRIMARY KEY (channel_id, key) ) STRICT",
+    "CREATE TABLE remote_channels ( id TEXT PRIMARY KEY, definition TEXT NOT NULL, revision TEXT NOT NULL, applied_at INTEGER NOT NULL ) STRICT",
+    "CREATE TABLE resend_commands ( id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, key TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('admitted','delivered','failed','dropped','not-failed','no-payload','channel-unavailable')), posted_state TEXT CHECK (posted_state IS NULL OR posted_state IN ('admitted','delivered','failed','dropped','not-failed','no-payload','channel-unavailable')), updated_at INTEGER NOT NULL ) STRICT",
   ]);
-  assert.deepEqual(db.query("PRAGMA user_version").get(), { user_version: 4 });
+  assert.deepEqual(db.query("PRAGMA user_version").get(), { user_version: 5 });
   assert.deepEqual(db.query("PRAGMA journal_mode").get(), { journal_mode: "wal" });
   db.close();
 });

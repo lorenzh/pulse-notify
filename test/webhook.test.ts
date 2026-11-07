@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { createServer } from "node:http";
 import { createWebhookSender } from "../src/channels/webhook.ts";
+import { parseConfig } from "../src/config.ts";
 import type { Notification, Schedule } from "../src/types.ts";
 import {
   asRecord,
@@ -156,6 +157,29 @@ test("a warning is posted as raw JSON, signed, with the key as idempotency key",
       assert.equal(req.headers["x-pulse-signature"], `sha256=${mac}`);
       assert.equal(req.headers["x-pulse-timestamp"], "1767268800");
     });
+  } finally {
+    await rx.close();
+  }
+});
+
+test("a webhook whose url comes from urlEnv or urlFile posts to that url", async () => {
+  const rx = await startReceiver();
+  try {
+    const source = { env: { HOOK: rx.url }, readFile: () => `${rx.url}\n` };
+    for (const ref of [{ urlEnv: "HOOK" }, { urlFile: "/run/hook-url" }]) {
+      const [channel] = parseConfig(
+        { channels: [{ id: "h", type: "webhook", ...ref }] },
+        "c",
+        source,
+      ).channels;
+      assert.equal(channel?.type, "webhook");
+      if (channel?.type !== "webhook") continue;
+      await createWebhookSender(channel)(note);
+    }
+    assert.deepEqual(
+      rx.requests.map((r) => r.headers["idempotency-key"]),
+      ["7:opened", "7:opened"],
+    );
   } finally {
     await rx.close();
   }

@@ -156,11 +156,11 @@ function crash(): never {
   throw new Error("simulated crash");
 }
 
-test("a valid format-3 file migrates to format 4 with every record and a private backup", () => {
+test("a valid format-3 file migrates to format 5 with every record and a private backup", () => {
   const file = fixture(SCHEMA_V3 + ROWS_V3);
   const ledger = ledgerAt(file);
   assert.deepEqual(ledger.migration, { from: 3, entries: 3, backup: `${file}.v3.bak` });
-  assert.equal(inspect(file).version, 4);
+  assert.equal(inspect(file).version, 5);
   assert.equal(inspect(`${file}.v3.bak`).version, 3);
   assert.equal(statSync(`${file}.v3.bak`).mode & 0o777, 0o600);
   assert.deepEqual(ledger.entries("c"), THREE);
@@ -185,7 +185,7 @@ test("a valid format-3 file migrates to format 4 with every record and a private
   assert.equal(ledgerAt(file).migration, undefined);
 });
 
-test("a JSON ledger migrates directly to format 4", () => {
+test("a JSON ledger migrates directly to format 5", () => {
   const file = path();
   writeFileSync(
     file,
@@ -193,7 +193,7 @@ test("a JSON ledger migrates directly to format 4", () => {
   );
   const ledger = ledgerAt(file);
   assert.equal(ledger.migration?.from, 2);
-  assert.equal(inspect(file).version, 4);
+  assert.equal(inspect(file).version, 5);
   assert.deepEqual(ledger.entries("c"), [["1:opened", "delivered"]]);
 });
 
@@ -204,7 +204,8 @@ test("bad format-3 and format-4 files are refused with their bytes unchanged", (
       `${SCHEMA_V3} INSERT INTO channels (id) VALUES ('c'); INSERT INTO entries VALUES ('c', 'k', 'sent', 1, NULL, NULL);`,
     ],
     ["format 4 without alert_state", `${SCHEMA_V3} PRAGMA user_version = 4;`],
-    ["user_version 5", `${SCHEMA_V3} PRAGMA user_version = 5;`],
+    ["format 5 without its new tables", `${SCHEMA_V3} PRAGMA user_version = 5;`],
+    ["user_version 6", `${SCHEMA_V3} PRAGMA user_version = 6;`],
     ["stage 7", `${LOOSE_V4} INSERT INTO alert_state VALUES ('expiry', 'x', NULL, 7, 1, 1, 1);`],
     ["kind x", `${LOOSE_V4} INSERT INTO alert_state VALUES ('x', 'a', 1, NULL, NULL, NULL, 1);`],
     [
@@ -218,6 +219,7 @@ test("bad format-3 and format-4 files are refused with their bytes unchanged", (
     assert.throws(() => new Ledger(file), /unsupported format/, name);
     assert.deepEqual(readFileSync(file), bytes, name);
     assert.equal(existsSync(`${file}.v3.bak`), false, name);
+    assert.equal(existsSync(`${file}.v4.bak`), false, name);
   }
 });
 
@@ -252,7 +254,7 @@ test("committed WAL survives sidecar crash", () => {
   }
   const ledger = ledgerAt(file);
   assert.equal(ledger.migration?.from, 3);
-  assert.deepEqual(inspect(file), { version: 4, entries: THREE });
+  assert.deepEqual(inspect(file), { version: 5, entries: THREE });
   assert.deepEqual(ledger.entries("c"), THREE);
   assert.equal(inspect(backup).entries.length, 3);
 });
@@ -263,7 +265,7 @@ test("committed WAL survives a crash before publish", () => {
   assert.equal(existsSync(`${file}.migrating`), true);
   const ledger = ledgerAt(file);
   assert.equal(existsSync(`${file}.migrating`), false);
-  assert.deepEqual(inspect(file), { version: 4, entries: THREE });
+  assert.deepEqual(inspect(file), { version: 5, entries: THREE });
   assert.deepEqual(ledger.entries("c"), THREE);
   assert.equal(inspect(`${file}.v3.bak`).entries.length, 3);
 });
@@ -543,7 +545,8 @@ test("a refused file keeps the bytes of its main file, WAL and SHM", () => {
       `${SCHEMA_V3} INSERT INTO channels (id) VALUES ('c'); INSERT INTO entries VALUES ('c', 'k', 'sent', 1, NULL, NULL);`,
     ],
     ["format 4 without alert_state", `${SCHEMA_V3} PRAGMA user_version = 4;`],
-    ["user_version 5", `${SCHEMA_V3} PRAGMA user_version = 5;`],
+    ["format 5 without its new tables", `${SCHEMA_V3} PRAGMA user_version = 5;`],
+    ["user_version 6", `${SCHEMA_V3} PRAGMA user_version = 6;`],
     ["stage 7", `${LOOSE_V4} INSERT INTO alert_state VALUES ('expiry', 'x', NULL, 7, 1, 1, 1);`],
     ["kind x", `${LOOSE_V4} INSERT INTO alert_state VALUES ('x', 'a', 1, NULL, NULL, NULL, 1);`],
   ];
@@ -555,6 +558,7 @@ test("a refused file keeps the bytes of its main file, WAL and SHM", () => {
       assert.deepEqual(readFileSync(`${file}${s}`), before[i], `${name} ${s || "main"}`);
     });
     assert.equal(existsSync(`${file}.v3.bak`), false, name);
+    assert.equal(existsSync(`${file}.v4.bak`), false, name);
   }
 });
 

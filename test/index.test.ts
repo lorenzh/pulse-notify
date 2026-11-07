@@ -7,10 +7,13 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { validateNotifyServiceReport } from "@lorenzh/pulse-contract";
 import { StartupError } from "@lorenzh/pulse-kit";
 import { ConfigError } from "../src/config.ts";
 import { main, run, type Stoppable } from "../src/index.ts";
-import { close, listen } from "./support.ts";
+import { Ledger } from "../src/ledger.ts";
+import type { Schedule } from "../src/types.ts";
+import { close, listen, startFakeApi, startReceiver } from "./support.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "notify-main-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -395,5 +398,364 @@ test("PULSE_NOTIFY_BUDGET_THRESHOLD outside 0..100 stops startup", () => {
         err.message === "PULSE_NOTIFY_BUDGET_THRESHOLD: must be an integer from 0 to 100" &&
         !err.message.includes(value),
     );
+  }
+});
+
+const TOKEN = "sentinel-notify-token-0123456789";
+const fakeNotifier = { createNotifier: (): Stoppable => ({ start() {}, async stop() {} }) };
+
+test("token mode starts without a config file; without a token the file stays required", async () => {
+  const state = join(dir, "token-mode.db");
+  const running = main({ PULSE_NOTIFY_API_TOKEN: TOKEN, PULSE_NOTIFY_STATE: state }, fakeNotifier);
+  await running.stop();
+  const empty = join(dir, "c-empty.json");
+  writeFileSync(empty, JSON.stringify({ channels: [] }));
+  const withEmpty = main(
+    { PULSE_NOTIFY_API_TOKEN: TOKEN, PULSE_NOTIFY_CONFIG: empty, PULSE_NOTIFY_STATE: state },
+    fakeNotifier,
+  );
+  await withEmpty.stop();
+  assert.throws(
+    () => main({ PULSE_NOTIFY_STATE: state }, fakeNotifier),
+    /PULSE_NOTIFY_CONFIG is required/,
+  );
+  assert.throws(
+    () => main({ PULSE_NOTIFY_CONFIG: empty, PULSE_NOTIFY_STATE: state }, fakeNotifier),
+    (err) => err instanceof ConfigError && /non-empty array/.test(err.message),
+  );
+});
+
+test("bad token settings stop startup without the token in the message", () => {
+  const tokenFile = join(dir, "token");
+  writeFileSync(tokenFile, `${TOKEN}\n`);
+  const emptyFile = join(dir, "token-empty");
+  writeFileSync(emptyFile, "  \n");
+  const state = join(dir, "token-bad.db");
+  const cases: [string, Record<string, string>, RegExp][] = [
+    [
+      "both sources",
+      { PULSE_NOTIFY_API_TOKEN: TOKEN, PULSE_NOTIFY_API_TOKEN_FILE: tokenFile },
+      /set only one of PULSE_NOTIFY_API_TOKEN and PULSE_NOTIFY_API_TOKEN_FILE/,
+    ],
+    ["empty file", { PULSE_NOTIFY_API_TOKEN_FILE: emptyFile }, /file is empty/],
+    ["missing file", { PULSE_NOTIFY_API_TOKEN_FILE: join(dir, "nope") }, /cannot read \(ENOENT\)/],
+  ];
+  for (const [name, env, message] of cases) {
+    assert.throws(
+      () => main({ ...env, PULSE_NOTIFY_STATE: state }, fakeNotifier),
+      (err) =>
+        err instanceof StartupError && message.test(err.message) && !err.message.includes(TOKEN),
+      name,
+    );
+  }
+});
+
+test("entry point: two token sources exit 2 with one line that holds no token", async () => {
+  const tokenFile = join(dir, "token-entry");
+  writeFileSync(tokenFile, TOKEN);
+  const child = spawn(process.execPath, [join(import.meta.dirname, "../src/index.ts")], {
+    env: {
+      ...process.env,
+      PULSE_NOTIFY_API_TOKEN: TOKEN,
+      PULSE_NOTIFY_API_TOKEN_FILE: tokenFile,
+      PULSE_NOTIFY_STATE: join(dir, "state-entry.db"),
+    },
+  });
+  let output = "";
+  child.stdout.on("data", (d) => {
+    output += d;
+  });
+  child.stderr.on("data", (d) => {
+    output += d;
+  });
+  const code = await new Promise((resolve) => child.once("close", resolve));
+  assert.equal(code, 2);
+  assert.match(output, /set only one of PULSE_NOTIFY_API_TOKEN and PULSE_NOTIFY_API_TOKEN_FILE/);
+  assert.equal(output.includes(TOKEN), false);
+});
+
+/** A fake timer list: each entry runs only when the test fires it. */
+function fakeTimers() {
+  const timers: { fn: () => void; ms: number; isCancelled: boolean }[] = [];
+  const schedule: Schedule = (fn, ms) => {
+    const timer = { fn, ms, isCancelled: false };
+    timers.push(timer);
+    return () => {
+      timer.isCancelled = true;
+    };
+  };
+  const fire = (ms: number): boolean => {
+    const timer = timers.find((t) => t.ms === ms && !t.isCancelled);
+    if (timer === undefined) return false;
+    timer.isCancelled = true;
+    timer.fn();
+    return true;
+  };
+  return { timers, schedule, fire };
+}
+
+async function until(check: () => boolean): Promise<void> {
+  for (let i = 0; i < 500 && !check(); i++) await new Promise((r) => setTimeout(r, 2));
+  assert.ok(check(), "condition not reached");
+}
+
+const REVISION = `sha256-${"7".repeat(64)}`;
+const HOOK_SECRET = "sentinel-hook-path-0123456789";
+
+test("token mode: a database channel installs after one poll, reports follow every poll and the 60000 ms heartbeat, shutdown stops all", async () => {
+  const api = await startFakeApi();
+  const receiver = await startReceiver();
+  const hook = `${receiver.url}/${HOOK_SECRET}`;
+  api.incidents = [];
+  api.notifyChannels = {
+    etag: '"r1"',
+    body: {
+      revision: REVISION,
+      channels: [
+        {
+          id: "db",
+          type: "webhook",
+          urlEnv: "PULSE_NOTIFY_SECRET_HOOK",
+          createdAt: 1,
+          updatedAt: 2,
+        },
+      ],
+    },
+  };
+  const state = join(dir, "token-loop.db");
+  const lines: string[] = [];
+  const timers = fakeTimers();
+  try {
+    const running = main(
+      {
+        PULSE_NOTIFY_API_TOKEN: TOKEN,
+        PULSE_NOTIFY_STATE: state,
+        PULSE_API_URL: api.url,
+        PULSE_NOTIFY_SECRET_HOOK: hook,
+      },
+      { write: (line) => lines.push(line), channelSchedule: timers.schedule, now: () => 1_000 },
+    );
+    await running.listening;
+    assert.equal(timers.fire(0), true);
+    await until(() => api.reports.length === 1);
+    const report = api.reports[0] as Record<string, unknown>;
+    assert.equal(validateNotifyServiceReport(report).ok, true);
+    assert.equal(report.appliedRevision, REVISION);
+    assert.deepEqual(report.rejected, []);
+    assert.deepEqual(report.shadowedIds, []);
+    assert.equal(report.startedAt, 1_000);
+    // The next poll uses the ETag and gets a 304; a report still follows the attempt.
+    await until(() => timers.timers.some((t) => t.ms === 15_000));
+    assert.equal(timers.fire(15_000), true);
+    await until(() => api.reports.length === 2);
+    assert.equal(timers.fire(60_000), true);
+    await until(() => api.reports.length === 3);
+    await running.stop();
+    const after = api.requested.length;
+    assert.equal(timers.fire(15_000), false);
+    assert.equal(timers.fire(60_000), false);
+    assert.equal(api.requested.length, after);
+    assert.equal(api.requested.filter((p) => p === "/service/notify/channels").length, 2);
+    const seen = JSON.stringify(api.reports) + lines.join("\n");
+    assert.equal(seen.includes(TOKEN), false);
+    assert.equal(seen.includes(HOOK_SECRET), false);
+    const ledger = new Ledger(state);
+    try {
+      assert.deepEqual(
+        ledger.remoteChannels().map((r) => [r.id, r.revision]),
+        [["db", REVISION]],
+      );
+    } finally {
+      ledger.close();
+    }
+  } finally {
+    await api.close();
+    await receiver.close();
+  }
+});
+
+test("tokenless mode re-reads the file and makes 0 service calls and 0 reports", async () => {
+  const api = await startFakeApi();
+  const configPath = join(dir, "tokenless.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({ channels: [{ id: "log", type: "file", path: join(dir, "t.jsonl") }] }),
+  );
+  const timers = fakeTimers();
+  try {
+    const running = main(
+      {
+        PULSE_NOTIFY_CONFIG: configPath,
+        PULSE_NOTIFY_STATE: join(dir, "tokenless.db"),
+        PULSE_API_URL: api.url,
+      },
+      { write: () => {}, channelSchedule: timers.schedule },
+    );
+    await running.listening;
+    assert.equal(timers.fire(0), true);
+    assert.equal(
+      timers.timers.some((t) => t.ms === 60_000),
+      false,
+    );
+    await until(() => timers.timers.some((t) => t.ms === 15_000));
+    await running.stop();
+    assert.equal(api.requested.filter((p) => p.startsWith("/service/")).length, 0);
+    assert.equal(api.reports.length, 0);
+  } finally {
+    await api.close();
+  }
+});
+
+test("an old api that answers 404 on the channels gives file channels only, logged once", async () => {
+  const api = await startFakeApi();
+  const lines: string[] = [];
+  const timers = fakeTimers();
+  try {
+    const running = main(
+      {
+        PULSE_NOTIFY_API_TOKEN: TOKEN,
+        PULSE_NOTIFY_STATE: join(dir, "old-api.db"),
+        PULSE_API_URL: api.url,
+      },
+      { write: (line) => lines.push(line), channelSchedule: timers.schedule },
+    );
+    await running.listening;
+    timers.fire(0);
+    await until(() => timers.timers.some((t) => t.ms === 15_000));
+    timers.fire(15_000);
+    await until(() => timers.timers.filter((t) => t.ms === 15_000).length === 2);
+    await running.stop();
+    assert.equal(lines.filter((l) => l.includes("the api has no database channels")).length, 1);
+  } finally {
+    await api.close();
+  }
+});
+
+const RESEND_ID = "AAAAAAAAAAAAAAAAAAAAAAA9";
+
+/** A state file whose database channel `db` holds `1:opened` as failed, with its payload. */
+function failedState(file: string): void {
+  const ledger = new Ledger(file, { now: () => Date.now() });
+  ledger.claim("db", "1:opened", {
+    key: "1:opened",
+    event: "opened",
+    incidentId: 1,
+    checkId: "example",
+    checkName: "Example site",
+    reason: null,
+    time: "2026-01-01T00:00:00.000Z",
+    timeMs: 0,
+    openedMs: 0,
+  });
+  ledger.settle("db", "1:opened", "failed");
+  ledger.close();
+}
+
+function failedKeys(report: unknown): unknown[] {
+  const failed = (report as { failed: { channelId: string; key: string }[] }).failed;
+  return failed.map((f) => `${f.channelId}/${f.key}`);
+}
+
+test("token mode: a claimed resend sends once over HTTP, posts its results with Bearer, and leaves the report", async () => {
+  const api = await startFakeApi();
+  const receiver = await startReceiver();
+  api.notifyChannels = {
+    etag: '"r1"',
+    body: {
+      revision: REVISION,
+      channels: [
+        {
+          id: "db",
+          type: "webhook",
+          urlEnv: "PULSE_NOTIFY_SECRET_HOOK",
+          createdAt: 1,
+          updatedAt: 2,
+        },
+      ],
+    },
+  };
+  const state = join(dir, "token-resend.db");
+  failedState(state);
+  const lines: string[] = [];
+  const channelTimers = fakeTimers();
+  const commandTimers = fakeTimers();
+  try {
+    const running = main(
+      {
+        PULSE_NOTIFY_API_TOKEN: TOKEN,
+        PULSE_NOTIFY_STATE: state,
+        PULSE_API_URL: api.url,
+        PULSE_NOTIFY_SECRET_HOOK: `${receiver.url}/${HOOK_SECRET}`,
+      },
+      {
+        write: (line) => lines.push(line),
+        channelSchedule: channelTimers.schedule,
+        commandSchedule: commandTimers.schedule,
+        now: () => 1_000,
+      },
+    );
+    await running.listening;
+    channelTimers.fire(0);
+    await until(() => api.reports.length === 1);
+    assert.deepEqual(failedKeys(api.reports[0]), ["db/1:opened"]);
+
+    // Claim: admitted and sent once; the admitted post gets a 503 and stays due.
+    api.resendClaims.push([
+      {
+        id: RESEND_ID,
+        channelId: "db",
+        key: "1:opened",
+        requestId: "request-0000000001",
+        state: "claimed",
+        createdAt: 900,
+        updatedAt: 900,
+      },
+    ]);
+    api.resendStatuses.push(503, 409);
+    assert.equal(commandTimers.fire(0), true);
+    await until(() => receiver.requests.length === 1 && api.resendResults.length === 1);
+    assert.equal(receiver.requests[0]?.headers["idempotency-key"], "1:opened");
+    assert.deepEqual(api.resendResults[0], { id: RESEND_ID, state: "admitted", status: 503 });
+
+    // The next poll posts the stored final state; the api answers 409 and it is never posted again.
+    await until(() => commandTimers.timers.some((t) => t.ms === 5_000 && !t.isCancelled));
+    commandTimers.fire(5_000);
+    await until(() => api.resendResults.length === 2);
+    assert.deepEqual(api.resendResults[1], { id: RESEND_ID, state: "delivered", status: 409 });
+    await until(() => commandTimers.timers.filter((t) => t.ms === 5_000).length === 2);
+    commandTimers.fire(5_000);
+    await until(() => commandTimers.timers.filter((t) => t.ms === 5_000).length === 3);
+    assert.equal(api.resendResults.length, 2);
+    assert.equal(lines.filter((l) => l.includes("resend result refused by the api")).length, 1);
+
+    // The next report no longer lists the resent key.
+    await until(() => channelTimers.timers.some((t) => t.ms === 15_000 && !t.isCancelled));
+    channelTimers.fire(15_000);
+    await until(() => api.reports.length === 2);
+    assert.deepEqual(failedKeys(api.reports[1]), []);
+    await running.stop();
+    assert.equal(receiver.requests.length, 1);
+
+    for (const { path, authorization } of api.authorizations) {
+      const expected = path.startsWith("/service/") ? `Bearer ${TOKEN}` : undefined;
+      assert.equal(authorization, expected, path);
+    }
+    assert.ok(api.authorizations.some((a) => a.path === "/service/notify/resends/claim"));
+    assert.ok(api.authorizations.some((a) => !a.path.startsWith("/service/")));
+    const seen = JSON.stringify(api.reports) + JSON.stringify(api.resendResults) + lines.join("\n");
+    assert.equal(seen.includes(TOKEN), false);
+    assert.equal(seen.includes(HOOK_SECRET), false);
+    const ledger = new Ledger(state);
+    try {
+      assert.deepEqual(
+        ledger.resendCommands().map((r) => [r.id, r.channelId, r.key, r.state, r.postedState]),
+        [[RESEND_ID, "db", "1:opened", "delivered", "delivered"]],
+      );
+    } finally {
+      ledger.close();
+    }
+  } finally {
+    await api.close();
+    await receiver.close();
   }
 });

@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type {
   Check,
@@ -92,6 +92,18 @@ export interface FakeApi {
   requested: string[];
   /** Paths that answer with this raw status, headers and body text, before any other rule. */
   raw: Map<string, RawAnswer>;
+  /** The `authorization` header of each request, in order, with its path. */
+  authorizations: { path: string; authorization: string | undefined }[];
+  /** The answer of `GET /service/notify/channels`; `undefined` answers 404. */
+  notifyChannels: { etag: string; body: unknown } | undefined;
+  /** Bodies of `PUT /service/notify/report`, parsed, in order; each answers 204. */
+  reports: unknown[];
+  /** Answers of `POST /service/notify/resends/claim`, one per claim; empty answers no commands. */
+  resendClaims: unknown[][];
+  /** Bodies of `POST /service/notify/resends/:id/result`, with the id and the answered status. */
+  resendResults: { id: string; state: unknown; status: number }[];
+  /** Status of each result post, in order; `204` when the list is used up. */
+  resendStatuses: number[];
   close(): Promise<void>;
 }
 
@@ -99,6 +111,58 @@ export interface RawAnswer {
   status?: number;
   headers?: Record<string, string>;
   body?: string;
+}
+
+/** Answers the channels with their ETag, or 304 when the request names it. */
+function answerChannels(
+  req: IncomingMessage,
+  res: ServerResponse,
+  channels: { etag: string; body: unknown },
+): void {
+  res.setHeader("etag", channels.etag);
+  if (req.headers["if-none-match"] === channels.etag) {
+    res.statusCode = 304;
+    res.end();
+  } else res.end(JSON.stringify(channels.body));
+}
+
+/** Stores the parsed body of a report and answers 204, like the api. */
+function recordReport(req: IncomingMessage, res: ServerResponse, reports: unknown[]): void {
+  let text = "";
+  req.on("data", (chunk: Buffer) => {
+    text += chunk.toString("utf8");
+  });
+  req.on("end", () => {
+    reports.push(JSON.parse(text));
+    res.statusCode = 204;
+    res.end();
+  });
+}
+
+const RESULT_PATH = /^\/service\/notify\/resends\/([^/]+)\/result$/;
+
+/** Answers the resend claim and result posts of Decision 14; `false` for any other request. */
+function answerResends(req: IncomingMessage, res: ServerResponse, api: FakeApi): boolean {
+  if (req.method !== "POST") return false;
+  if (req.url === "/service/notify/resends/claim") {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ commands: api.resendClaims.shift() ?? [] }));
+    return true;
+  }
+  const match = RESULT_PATH.exec(req.url ?? "");
+  if (match === null) return false;
+  let text = "";
+  req.on("data", (chunk: Buffer) => {
+    text += chunk.toString("utf8");
+  });
+  req.on("end", () => {
+    const status = api.resendStatuses.shift() ?? 204;
+    const body = asRecord(JSON.parse(text));
+    api.resendResults.push({ id: decodeURIComponent(match[1] ?? ""), state: body.state, status });
+    res.statusCode = status;
+    res.end();
+  });
+  return true;
 }
 
 export async function startFakeApi(): Promise<FakeApi> {
@@ -113,16 +177,28 @@ export async function startFakeApi(): Promise<FakeApi> {
     failingPaths: new Map(),
     requested: [],
     raw: new Map(),
+    authorizations: [],
+    notifyChannels: undefined,
+    reports: [],
+    resendClaims: [],
+    resendResults: [],
+    resendStatuses: [],
     close: () => close(server),
   };
   const server = createServer((req, res) => {
     api.requested.push(req.url ?? "");
+    api.authorizations.push({ path: req.url ?? "", authorization: req.headers.authorization });
     const raw = api.raw.get(req.url ?? "");
     if (raw) {
       res.writeHead(raw.status ?? 200, raw.headers ?? {});
       res.end(raw.body ?? "");
       return;
     }
+    if (req.method === "PUT" && req.url === "/service/notify/report") {
+      recordReport(req, res, api.reports);
+      return;
+    }
+    if (answerResends(req, res, api)) return;
     const failStatus = api.failingPaths.get(req.url ?? "");
     if (api.failing || (api.failingManual && req.url === "/manual-incidents") || failStatus) {
       res.statusCode = failStatus ?? 500;
@@ -130,7 +206,9 @@ export async function startFakeApi(): Promise<FakeApi> {
       return;
     }
     res.setHeader("content-type", "application/json");
-    if (req.url === "/incidents") res.end(JSON.stringify(api.incidents));
+    if (req.url === "/service/notify/channels" && api.notifyChannels) {
+      answerChannels(req, res, api.notifyChannels);
+    } else if (req.url === "/incidents") res.end(JSON.stringify(api.incidents));
     else if (req.url === "/manual-incidents" && api.manualIncidents) {
       res.end(JSON.stringify(api.manualIncidents));
     } else if (req.url === "/checks") res.end(JSON.stringify(api.checks));
@@ -147,6 +225,8 @@ export async function startFakeApi(): Promise<FakeApi> {
 
 export interface ReceivedRequest {
   method: string | undefined;
+  /** The request path and query. */
+  url?: string | undefined;
   headers: IncomingMessage["headers"];
   body: unknown;
   /** The body bytes as text, for signature checks. */
@@ -187,7 +267,14 @@ export async function startReceiver(): Promise<Receiver> {
         // Non-JSON payloads are recorded with a null body.
         body = null;
       }
-      receiver.requests.push({ method: req.method, headers: req.headers, body, raw, status });
+      receiver.requests.push({
+        method: req.method,
+        url: req.url,
+        headers: req.headers,
+        body,
+        raw,
+        status,
+      });
       res.statusCode = status;
       res.end();
     });

@@ -104,6 +104,10 @@ test("loadSettings applies defaults and validates", () => {
   const s = loadSettings({ PULSE_NOTIFY_CONFIG: "c.json" });
   assert.deepEqual(s, {
     configPath: "c.json",
+    apiToken: undefined,
+    secretDir: undefined,
+    channelsPollMs: 15000,
+    commandPollMs: 5000,
     apiUrl: "http://localhost:3000",
     statePath: "./notify-state.json",
     pollMs: 5000,
@@ -508,4 +512,93 @@ test("the budget threshold defaults to 25 and accepts 0 and 100", () => {
   assert.equal(loadBudgetThreshold({}), 25);
   assert.equal(loadBudgetThreshold({ PULSE_NOTIFY_BUDGET_THRESHOLD: "0" }), 0);
   assert.equal(loadBudgetThreshold({ PULSE_NOTIFY_BUDGET_THRESHOLD: "100" }), 100);
+});
+
+test("the service token comes from env or a file; empty env or file path means unset", () => {
+  const files: Record<string, string> = { "/t": " tok-123 \n", "/empty": "\n" };
+  const readFile = (p: string): string => {
+    const text = files[p];
+    if (text === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    return text;
+  };
+  assert.equal(loadSettings({ PULSE_NOTIFY_API_TOKEN: "tok-1" }).apiToken, "tok-1");
+  assert.equal(loadSettings({ PULSE_NOTIFY_API_TOKEN_FILE: "/t" }, readFile).apiToken, "tok-123");
+  const unset = loadSettings({ PULSE_NOTIFY_CONFIG: "c", PULSE_NOTIFY_API_TOKEN_FILE: "  " });
+  assert.equal(unset.apiToken, undefined);
+  assert.equal(loadSettings({ PULSE_NOTIFY_API_TOKEN: "t" }).configPath, undefined);
+  assert.throws(
+    () => loadSettings({ PULSE_NOTIFY_API_TOKEN_FILE: "/empty" }, readFile),
+    (err) => err instanceof StartupError && /file is empty/.test(err.message),
+  );
+  assert.throws(
+    () => loadSettings({ PULSE_NOTIFY_API_TOKEN: "tok-1", PULSE_NOTIFY_API_TOKEN_FILE: "/t" }),
+    (err) => err instanceof StartupError && !err.message.includes("tok-1"),
+  );
+});
+
+test("poll settings default to 15000 and 5000 ms with a minimum of 1000", () => {
+  const base = { PULSE_NOTIFY_CONFIG: "c" };
+  const s = loadSettings({
+    ...base,
+    PULSE_NOTIFY_CHANNELS_POLL_MS: "1000",
+    PULSE_NOTIFY_COMMAND_POLL_MS: "2000",
+    PULSE_NOTIFY_SECRET_DIR: "/run/secrets",
+  });
+  assert.deepEqual([s.channelsPollMs, s.commandPollMs, s.secretDir], [1000, 2000, "/run/secrets"]);
+  for (const name of ["PULSE_NOTIFY_CHANNELS_POLL_MS", "PULSE_NOTIFY_COMMAND_POLL_MS"]) {
+    assert.throws(() => loadSettings({ ...base, [name]: "999" }), StartupError, name);
+  }
+});
+
+test("token mode accepts a file without channels; tokenless mode refuses it", () => {
+  assert.deepEqual(parseConfig({ channels: [] }, "c", undefined, { allowEmpty: true }), {
+    channels: [],
+  });
+  assert.throws(() => parseConfig({ channels: [] }), /non-empty array/);
+});
+
+test("a file webhook takes exactly one of url, urlEnv, urlFile with legacy reference names", () => {
+  const source = {
+    env: { HOOK_URL: "https://hooks.example.com/a" },
+    readFile: (p: string) => (p === "./any/path.txt" ? "http://127.0.0.1:9/b\n" : "x"),
+  };
+  const env = parseConfig(
+    { channels: [{ id: "h", type: "webhook", urlEnv: "HOOK_URL" }] },
+    "c",
+    source,
+  );
+  assert.equal(
+    env.channels[0]?.type === "webhook" && env.channels[0].url,
+    "https://hooks.example.com/a",
+  );
+  const file = parseConfig(
+    { channels: [{ id: "h", type: "webhook", urlFile: "./any/path.txt" }] },
+    "c",
+    source,
+  );
+  assert.equal(
+    file.channels[0]?.type === "webhook" && file.channels[0].url,
+    "http://127.0.0.1:9/b",
+  );
+  const cases: [string, Record<string, unknown>, RegExp][] = [
+    ["none", {}, /webhook needs a valid http\(s\) url or one of urlEnv, urlFile/],
+    [
+      "url and urlEnv",
+      { url: "https://a", urlEnv: "HOOK_URL" },
+      /exactly one of url, urlEnv, urlFile/,
+    ],
+    ["urlEnv and urlFile", { urlEnv: "HOOK_URL", urlFile: "./any/path.txt" }, /exactly one/],
+    ["not a url", { urlFile: "./other" }, /urlFile does not hold a valid url/],
+    ["missing env", { urlEnv: "NOPE" }, /urlEnv: NOPE is missing or empty/],
+  ];
+  for (const [name, over, message] of cases) {
+    assert.throws(
+      () => parseConfig({ channels: [{ id: "h", type: "webhook", ...over }] }, "c", source),
+      (err) =>
+        err instanceof ConfigError &&
+        message.test(err.message) &&
+        !err.message.includes("hooks.example"),
+      name,
+    );
+  }
 });

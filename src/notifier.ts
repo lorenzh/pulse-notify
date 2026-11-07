@@ -13,6 +13,7 @@ import {
   type RejectedIncident,
 } from "./api.ts";
 import { BoundedSet } from "./bounded-set.ts";
+import { channelChanges, type InstalledChannel, installedChannel } from "./channel-set.ts";
 import { createSender } from "./channels/factory.ts";
 import type { SendMail } from "./channels/mailer.ts";
 import {
@@ -121,6 +122,9 @@ const realSleep: Sleep = (ms, signal) =>
 
 interface ChannelState {
   config: ChannelConfig;
+  digest: string;
+  /** False until the pending keys of a replaced or re-added channel are handed over. */
+  isReady: boolean;
   delivery: ChannelDelivery;
   /** Keys enqueued but not yet recorded in the ledger. */
   queued: Set<string>;
@@ -183,7 +187,11 @@ function buildArgs(...args: BuildArgs): BuildArgs {
 
 export class Notifier {
   readonly #opts: NotifierOptions;
-  readonly #channels: ChannelState[];
+  #channels: ChannelState[];
+  /** Retired workers whose in-flight send has not finished yet. */
+  readonly #retiring = new Set<ChannelState>();
+  /** Per id, resolves when every retired worker of that id is idle. */
+  readonly #handovers = new Map<string, Promise<void>>();
   /** Identities of malformed api items already logged (`<feed>:id:<id>` or `<feed>:index:<n>`). */
   readonly #malformed = new BoundedSet(MALFORMED_REPORT_LIMIT);
   /** Legacy pending keys already reported; they come from the local ledger, not the api. */
@@ -212,50 +220,133 @@ export class Notifier {
   constructor(opts: NotifierOptions) {
     this.#opts = opts;
     this.#now = opts.now ?? Date.now;
-    const schedule = opts.schedule ?? defaultSchedule;
-    this.#channels = opts.config.channels.map((config) => {
-      const send = createSender(config, {
-        fetch: opts.fetch,
-        timeoutMs: opts.timeoutMs,
-        schedule,
-        now: this.#now,
-        logger: opts.logger,
-        sendMail: opts.sendMail,
-        smtpClientName: opts.smtpClientName,
-        hostname: opts.hostname,
-      });
-      const queued = new Set<string>();
-      const state: ChannelState = {
-        config,
-        queued,
-        held: [],
-        delivery: new ChannelDelivery({
-          channelId: config.id,
-          send,
-          ledger: opts.ledger,
-          sleep: opts.sleep ?? realSleep,
-          retryDelayMs: opts.retryDelayMs ?? 1000,
-          retryMaxDelayMs: opts.retryMaxDelayMs,
-          retryAttempts: opts.retryAttempts,
-          logger: opts.logger,
-          release: (key) => queued.delete(key),
-          isStale: (n) =>
-            n.event === "reminder" &&
-            (this.#resolved.has(n.incidentId) || this.#isSuperseded(state, n)),
-          onOutcome: (outcome) =>
-            opts.metrics?.deliveryDone(config.id, outcome === "delivered" ? "success" : "failure"),
-        }),
-      };
-      return state;
+    this.#channels = opts.config.channels.map((config) =>
+      this.#createState(installedChannel(config)),
+    );
+    this.#dropIncidentsOfWarningOnly(opts.config.channels);
+    for (const channel of this.#channels) channel.isReady = true;
+  }
+
+  #createState(installed: InstalledChannel): ChannelState {
+    const opts = this.#opts;
+    const { config } = installed;
+    const send = createSender(config, {
+      fetch: opts.fetch,
+      timeoutMs: opts.timeoutMs,
+      schedule: opts.schedule ?? defaultSchedule,
+      now: this.#now,
+      logger: opts.logger,
+      sendMail: opts.sendMail,
+      smtpClientName: opts.smtpClientName,
+      hostname: opts.hostname,
     });
-    this.#dropIncidentsOfWarningOnly();
+    const queued = new Set<string>();
+    const state: ChannelState = {
+      config,
+      digest: installed.digest,
+      isReady: false,
+      queued,
+      held: [],
+      delivery: new ChannelDelivery({
+        channelId: config.id,
+        send,
+        ledger: opts.ledger,
+        sleep: opts.sleep ?? realSleep,
+        retryDelayMs: opts.retryDelayMs ?? 1000,
+        retryMaxDelayMs: opts.retryMaxDelayMs,
+        retryAttempts: opts.retryAttempts,
+        logger: opts.logger,
+        release: (key) => queued.delete(key),
+        isStale: (n) =>
+          n.event === "reminder" &&
+          (this.#resolved.has(n.incidentId) || this.#isSuperseded(state, n)),
+        onOutcome: (outcome) =>
+          opts.metrics?.deliveryDone(config.id, outcome === "delivered" ? "success" : "failure"),
+      }),
+    };
+    opts.metrics?.installChannel(config.id);
+    return state;
+  }
+
+  /** The channels installed now. */
+  channels(): ChannelConfig[] {
+    return this.#channels.map((c) => c.config);
+  }
+
+  /** True when a worker for the id is installed (a resend command needs one). */
+  hasChannel(id: string): boolean {
+    return this.#channels.some((c) => c.config.id === id);
+  }
+
+  /**
+   * Enqueues a key that a resend command set back to pending. Without a running worker the key
+   * stays pending, and `start()` or the next handover sends it.
+   */
+  enqueueResent(channelId: string, key: string): void {
+    if (!this.#running) return;
+    const state = this.#channels.find((c) => c.config.id === channelId);
+    if (!state?.isReady) return;
+    this.#enqueuePending(
+      this.#opts.ledger.pending().filter((p) => p.channelId === channelId && p.key === key),
+    );
+  }
+
+  /**
+   * Decision 13: installs the next channel set by id. An unchanged channel keeps its worker. A
+   * changed or removed one takes no new job; its in-flight send finishes, then its pending keys go
+   * to the replacement (or stay pending in the ledger until the id returns). The returned promise
+   * resolves when every handover of this call is done; polling never waits for it.
+   */
+  reconcile(next: readonly ChannelConfig[]): Promise<void> {
+    const installed = this.#channels.map((c) => ({ config: c.config, digest: c.digest }));
+    const changes = channelChanges(installed, next.map(installedChannel));
+    const byId = new Map(this.#channels.map((c) => [c.config.id, c]));
+    const states: ChannelState[] = [];
+    const created: ChannelState[] = [];
+    for (const change of changes) {
+      const current = byId.get(change.id);
+      if (change.kind === "unchanged") {
+        if (current) states.push(current);
+        continue;
+      }
+      if (current) this.#retire(current);
+      if (change.kind === "removed") continue;
+      const state = this.#createState(change.next);
+      states.push(state);
+      created.push(state);
+    }
+    this.#channels = states;
+    if (created.length > 0) this.#dropIncidentsOfWarningOnly(created.map((c) => c.config));
+    return Promise.all(created.map((state) => this.#handOver(state))).then(() => undefined);
+  }
+
+  #retire(state: ChannelState): void {
+    const id = state.config.id;
+    state.delivery.retire();
+    this.#retiring.add(state);
+    const before = this.#handovers.get(id) ?? Promise.resolve();
+    this.#handovers.set(
+      id,
+      before.then(() => state.delivery.idle()).finally(() => this.#retiring.delete(state)),
+    );
+  }
+
+  /** After the retired worker of the id is idle, the new one takes the pending keys of the ledger. */
+  async #handOver(state: ChannelState): Promise<void> {
+    await this.#handovers.get(state.config.id);
+    if (!this.#channels.includes(state) || !this.#running) {
+      state.isReady = true;
+      return;
+    }
+    this.#enqueuePending(
+      this.#opts.ledger.pending().filter((p) => p.channelId === state.config.id),
+    );
+    state.isReady = true;
   }
 
   /** Before any send: a channel with `sendIncidents: false` never sends a stored incident. */
-  #dropIncidentsOfWarningOnly(): void {
-    const ids = this.#opts.config.channels
-      .filter((c) => c.sendIncidents === false)
-      .map((c) => c.id);
+  #dropIncidentsOfWarningOnly(channels: readonly ChannelConfig[]): void {
+    const ids = channels.filter((c) => c.sendIncidents === false).map((c) => c.id);
     if (ids.length === 0) return;
     let counts: Map<string, number>;
     try {
@@ -306,7 +397,7 @@ export class Notifier {
     this.#running = false;
     this.#cancelPoll?.();
     this.#cancelPoll = undefined;
-    for (const channel of this.#channels) channel.delivery.stop();
+    for (const channel of [...this.#channels, ...this.#retiring]) channel.delivery.stop();
     await this.idle();
   }
 
@@ -316,12 +407,16 @@ export class Notifier {
 
   /** Resolves when every channel queue is empty. */
   async idle(): Promise<void> {
-    await Promise.all(this.#channels.map((c) => c.delivery.idle()));
+    await Promise.all([...this.#channels, ...this.#retiring].map((c) => c.delivery.idle()));
   }
 
   #resendPending(): void {
+    this.#enqueuePending(this.#opts.ledger.pending());
+  }
+
+  #enqueuePending(pending: ReturnType<Ledger["pending"]>): void {
     const counts = new Map<string, number>();
-    for (const { channelId, key, notification, recipients } of this.#opts.ledger.pending()) {
+    for (const { channelId, key, notification, recipients } of pending) {
       const channel = this.#channels.find((c) => c.config.id === channelId);
       if (!channel || !notification) continue;
       if (notification.event === "reminder") {
@@ -329,6 +424,7 @@ export class Notifier {
         channel.held.push({ notification, recipients });
         continue;
       }
+      if (channel.queued.has(key)) continue;
       channel.queued.add(key);
       channel.delivery.enqueue(notification, recipients);
       counts.set(channelId, (counts.get(channelId) ?? 0) + 1);
@@ -381,7 +477,7 @@ export class Notifier {
       onInvalidCheck: (index: number) => this.#reportInvalidCheck(index),
       onInvalidComponent: (index: number) => this.#reportInvalidComponent(index),
     };
-    const channels = this.#opts.config.channels;
+    const channels = this.channels();
     const hasAlerts = channels.some((c) => (c.alerts ?? []).length > 0);
     const hasBudget = isSubscribed(channels, "budget-low");
     const [incidentsRead, checksRead, manualRead, componentsRead] = await Promise.allSettled([
@@ -460,6 +556,14 @@ export class Notifier {
       return;
     }
     if (count > 0) this.#opts.logger.info("old ledger entries pruned", { count });
+    let commands = 0;
+    try {
+      commands = this.#opts.ledger.pruneResendCommands();
+    } catch (err) {
+      this.#opts.logger.error("ledger prune failed, the next prune retries", errorFields(err));
+      return;
+    }
+    if (commands > 0) this.#opts.logger.info("old resend commands pruned", { count: commands });
   }
 
   /** One evaluation of all warning kinds, committed in one transaction, then enqueued. */
@@ -478,7 +582,7 @@ export class Notifier {
     };
     let added: AlertDelivery[];
     try {
-      const plan = planAlerts(this.#opts.config.channels, inputs, {
+      const plan = planAlerts(this.channels(), inputs, {
         lookup: (kind, id) => ledger.alertState(kind, id),
         hasChannel: (id) => ledger.hasChannel(id),
         threshold: this.#opts.budgetThreshold ?? 25,
@@ -587,7 +691,8 @@ export class Notifier {
     }
     if (incidents && this.#syncCheckRouting(channel, incidents, reminders)) {
       if (!this.#syncReminderMark(channel.config.id, incidents, reminders, nowMs)) return;
-      if (channel.config.sendIncidents !== false) {
+      // A channel waiting for its handover does not own the pending keys yet.
+      if (channel.config.sendIncidents !== false && channel.isReady) {
         this.#rebuildLegacyPending(channel, incidents, nowMs);
       }
       this.#detectAutomatic(channel, incidents, reminders, nowMs);
