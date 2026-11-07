@@ -122,19 +122,18 @@ export function createSubscriptionOperations(
 
   return {
     subscribe: (email, now) => {
-      let expiredId: string | undefined;
       const decision = store.transaction((): Decision => {
         let row = store.subscriptionByEmail(email);
         if (row !== undefined && isExpired(row, now)) {
           store.deleteSubscription(row.id);
-          expiredId = row.id;
+          // Free its queue slot before the L6 check; an expired job never sends anyway.
+          queue.cancel(row.id);
           row = undefined;
         }
         if (row?.state === "confirmed") return { outcome: "known" };
         return row === undefined ? decideNew(email, now) : decidePending(row, now);
       });
       // Queue changes follow the commit (D19), before the caller answers.
-      if (expiredId !== undefined) queue.cancel(expiredId);
       if (decision.outcome === "limited") deps.onLimited?.(decision.limit);
       if (decision.outcome === "queued") {
         if (decision.replaces !== undefined) queue.cancel(decision.replaces);

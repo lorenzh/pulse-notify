@@ -94,12 +94,13 @@ export class ConfirmationWorker {
 
   /** Jobs queued or in flight: `pulse_notify_subscriber_confirmations_queued`. */
   size(): number {
+    this.#dropExpired(this.#deps.now());
     return this.#queue.length;
   }
 
   /** Queues a job; false when the queue is full or the worker stops. */
   enqueue(input: ConfirmationJobInput): boolean {
-    if (this.#isStopping || this.#queue.length >= CONFIRMATION_QUEUE_MAX) return false;
+    if (this.#isStopping || this.size() >= CONFIRMATION_QUEUE_MAX) return false;
     this.#queue.push({
       ...input,
       key: this.#deps.guard.key(input.address),
@@ -146,11 +147,19 @@ export class ConfirmationWorker {
     }
   }
 
+  /** Expired jobs hold no queue capacity, whether or not their retry is due (R5). */
+  #dropExpired(now: number): void {
+    for (const job of [...this.#queue]) {
+      if (!job.isInFlight && now >= job.expiresAt) this.#remove(job);
+    }
+  }
+
   /** One synchronous selection step: drops stale jobs and starts the first ready one. */
   #selectStep(): Promise<void> | undefined {
     this.#selections += 1;
     const now = this.#deps.now();
     this.#hasReadFailed = false;
+    this.#dropExpired(now);
     for (const job of [...this.#queue]) {
       if (job.isInFlight || job.notBefore > now) continue;
       let row: SubscriptionRow | undefined;

@@ -222,6 +222,7 @@ export interface FixtureOptions {
   confirmPerHour?: number;
   timeoutMs?: number;
   retryDelayMs?: number;
+  retryMaxDelayMs?: number;
 }
 
 /** A store in its own temp dir, worker 1, the operations and fakes, wired as `main` will wire them. */
@@ -264,7 +265,7 @@ export function subscriptionFixture(opts: FixtureOptions = {}): SubscriptionFixt
     now: clock.now,
     sleep: sleep.sleep,
     retryDelayMs: opts.retryDelayMs ?? 1000,
-    retryMaxDelayMs: 60_000,
+    retryMaxDelayMs: opts.retryMaxDelayMs ?? 60_000,
     onOutcome: (o) => outcomes.push(o),
   });
   const ops = createSubscriptionOperations({

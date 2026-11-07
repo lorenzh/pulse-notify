@@ -274,3 +274,48 @@ describe("confirmation message", () => {
     ).not.toContain(token);
   });
 });
+
+describe("Expired jobs hold no queue capacity (R5 Subscribe step 1, selection)", () => {
+  const expiredAt = 86_400_001;
+  test.each([
+    {
+      name: "replacing an expired row at a full queue",
+      jobs: 100,
+      again: "sub-0@example.com",
+      size: 1,
+    },
+    {
+      name: "a fresh address beside an expired retrying job",
+      jobs: 1,
+      again: "fresh@example.com",
+      size: 1,
+    },
+    {
+      name: "a fresh address at a full queue of expired jobs",
+      jobs: 100,
+      again: "fresh@example.com",
+      size: 1,
+    },
+  ])("$name: queued, gauge $size", async ({ jobs, again, size }) => {
+    const f = subscriptionFixture({
+      confirmPerHour: 1000,
+      retryDelayMs: 90_000_000,
+      retryMaxDelayMs: 90_000_000,
+    });
+    fx = f;
+    for (let i = 0; i < jobs; i += 1) {
+      expect(f.ops.subscribe(`sub-${i}@example.com`, 0)).toBe("queued");
+    }
+    for (let i = 0; i < jobs; i += 1) {
+      await letLoopRun();
+      f.mailer.calls[i]?.reject(new Error("try later"));
+    }
+    await letLoopRun();
+    expect(f.worker.size()).toBe(jobs);
+    f.clock.t = expiredAt;
+    expect(f.ops.subscribe(again, expiredAt)).toBe("queued");
+    await letLoopRun();
+    expect(f.limited).toEqual([]);
+    expect(f.worker.size()).toBe(size);
+  });
+});
