@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
+import { chmodSync, readFileSync, realpathSync } from "node:fs";
 import { hostname } from "node:os";
 import { validateResendClaimResponse } from "@lorenzh/pulse-contract";
 import {
@@ -17,6 +17,8 @@ import {
 } from "@lorenzh/pulse-kit";
 import { getService, type ServiceOptions, sendService } from "./api.ts";
 import { ChannelSync } from "./channel-sync.ts";
+import type { SendMail } from "./channels/mailer.ts";
+import { sendMail as smtpSendMail } from "./channels/smtp-send.ts";
 import {
   ConfigError,
   loadBudgetThreshold,
@@ -36,6 +38,7 @@ import {
   type LockDeps,
   LockLostError,
 } from "./ledger-lock.ts";
+import { createMailboxGuard, type MailboxGuard } from "./mailbox-guard.ts";
 import { Metrics } from "./metrics.ts";
 import { Notifier, type NotifierOptions, type PollHealth } from "./notifier.ts";
 import { redactUrl } from "./redact.ts";
@@ -46,6 +49,23 @@ import {
   startResendLoop,
 } from "./resend-commands.ts";
 import { buildServiceReport, type FileChannelSource } from "./service-report.ts";
+import {
+  ConfirmationWorker,
+  createSubscriberDetection,
+  IncidentWorker,
+  type ManualRead,
+  type Sleep,
+} from "./subscriber-fanout.ts";
+import { type CleanupTimer, SubscriberStore, startCleanup } from "./subscriber-store.ts";
+import { runSubscribers } from "./subscribers-cli.ts";
+import { createSubscriptionOperations } from "./subscription-requests.ts";
+import { type SubscriptionServer, startSubscriptionServer } from "./subscription-server.ts";
+import {
+  loadSubscriptionSettings,
+  type SubscriptionSettings,
+  type SubscriptionsOn,
+  subscriptionStorePath,
+} from "./subscription-settings.ts";
 import type { ChannelConfig, Config, Schedule } from "./types.ts";
 
 export const name = "pulse-notify";
@@ -120,6 +140,10 @@ export interface MainDeps {
   serviceFetch?: typeof fetch;
   /** Clock for the report and the applied stamps; defaults to `Date.now`. */
   now?: () => number;
+  /** SMTP send of subscriber mail; defaults to the real one. */
+  subscriptionSendMail?: SendMail;
+  /** Sleep of the subscriber workers; defaults to a real timer. */
+  subscriptionSleep?: Sleep;
 }
 
 export interface Running extends Stoppable {
@@ -130,6 +154,13 @@ export interface Running extends Stoppable {
   listening: Promise<number | undefined>;
   /** Frees the state lock at once; for a stop that ran out of time. */
   releaseLock(): void;
+  /**
+   * Resolves with the subscription listener port, or `undefined` when subscriptions are off.
+   * Settles before the notifier starts.
+   */
+  subscriptionsListening: Promise<number | undefined>;
+  /** The mailbox guard's in-flight count; `0` when subscriptions are off. */
+  subscriberGuardSize(): number;
 }
 
 function bindReason(err: unknown): string {
@@ -172,6 +203,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
     health?: OpsServer;
     ledger?: Ledger | undefined;
     lock?: LedgerLock | undefined;
+    subscriptions?: Subscriptions | undefined;
     isShuttingDown: boolean;
   } = { isShuttingDown: false };
   // Stops the notifier, checkpoints and closes the ledger, then frees the state lock.
@@ -182,6 +214,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
       await state.channelLoop?.stop();
       await state.resendLoop?.stop();
       await state.notifier?.stop().catch(() => {});
+      await state.subscriptions?.stop();
       await state.ledger?.flush().catch((err: unknown) => {
         logRef.logger?.error("ledger flush failed, pending keys are resent", {
           error: errorReason(err),
@@ -196,6 +229,8 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
 
   const settings = loadSettings(env);
   const budgetThreshold = loadBudgetThreshold(env);
+  // Every subscription setting is checked before any file is opened (R3, R9).
+  const subscriptionSettings = readSubscriptionSettings(env);
   // Token mode (Decision 11): the file is optional and may list no channel.
   const isTokenMode = settings.apiToken !== undefined;
   const source = { env, readFile: (path: string) => readFileSync(path, "utf8") };
@@ -239,6 +274,27 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
     () => ledger.pending().length,
     () => notifierRef.current?.pollHealth?.().consecutiveFailedPolls ?? 0,
   );
+  let subscriptions: Subscriptions | undefined;
+  if (subscriptionSettings.isOn) {
+    try {
+      subscriptions = openSubscriptions(subscriptionSettings, {
+        settings,
+        logger,
+        metrics,
+        now,
+        lock: lockDeps(deps.lock, settings.lockLeaseSeconds, logger),
+        sendMail: deps.subscriptionSendMail ?? smtpSendMail,
+        sleep: deps.subscriptionSleep ?? realSleep,
+      });
+    } catch (err) {
+      ledger.close();
+      state.ledger = undefined;
+      lock.release();
+      state.lock = undefined;
+      throw err;
+    }
+    state.subscriptions = subscriptions;
+  }
   const options: NotifierOptions = {
     config,
     apiUrl: settings.apiUrl,
@@ -255,12 +311,14 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
     smtpClientName: settings.smtpClientName,
     hostname: deps.lock?.hostname ?? hostname,
     budgetThreshold,
+    ...(subscriptions ? { onManualRead: subscriptions.onManualRead } : {}),
   };
   let notifier: Stoppable;
   try {
     notifier = deps.createNotifier ? deps.createNotifier(options) : new Notifier(options);
   } catch (err) {
     // The constructor drops incidents of warning-only channels; a failure must leave no lock.
+    void subscriptions?.stop();
     ledger.close();
     state.ledger = undefined;
     lock.release();
@@ -286,7 +344,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
         );
   state.resendLoop = resendLoop;
   notifierRef.current = notifier;
-  startHeartbeat(lock, settings.lockLeaseSeconds, deps.heartbeatSchedule ?? unrefSchedule, {
+  const heartbeat: HeartbeatOptions = {
     logger,
     isStopped: () => state.isShuttingDown,
     onLost: () => {
@@ -298,9 +356,16 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
       void loop.stop();
       void resendLoop?.stop();
       void notifier.stop().catch(() => {});
+      void subscriptions?.stop();
       exit(2);
     },
-  });
+  };
+  const heartbeatSchedule = deps.heartbeatSchedule ?? unrefSchedule;
+  startHeartbeat(lock, settings.lockLeaseSeconds, heartbeatSchedule, heartbeat);
+  // The store lock is a lease too; losing it stops the whole service like the state lock.
+  if (subscriptions) {
+    startHeartbeat(subscriptions.lock, settings.lockLeaseSeconds, heartbeatSchedule, heartbeat);
+  }
   let isStarted = false;
   const startNotifier = (): void => {
     notifier.start();
@@ -312,10 +377,15 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
       apiUrl: redactUrl(settings.apiUrl),
     });
   };
-  let listening: Promise<number | undefined> = Promise.resolve(undefined);
-  if (settings.healthPort === undefined) {
+  const startService = (): void => {
+    subscriptions?.startWorkers();
     startNotifier();
-  } else {
+  };
+  const startListeners = (): Promise<number | undefined> => {
+    if (settings.healthPort === undefined) {
+      startService();
+      return Promise.resolve(undefined);
+    }
     const { healthHost, healthPort, healthMaxFailedPolls } = settings;
     // Liveness is the lifecycle only: a failing feed must not get a working notifier restarted.
     const liveness = (): Readiness => {
@@ -332,7 +402,7 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
         : { ready: true };
     };
     // The notifier starts only once the listener is bound, so a bind error does no service work.
-    listening = startOpsServer({
+    return startOpsServer({
       host: healthHost,
       port: healthPort,
       live: liveness,
@@ -345,11 +415,12 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
         if (state.isShuttingDown) {
           void server.close();
         } else {
-          startNotifier();
+          startService();
         }
         return server.port;
       },
       (err: unknown) => {
+        void state.subscriptions?.stop();
         lock.release();
         throw new StartupError(
           `cannot listen on ${healthHost}:${healthPort} (PULSE_HEALTH_HOST/PULSE_HEALTH_PORT): ${bindReason(err)}`,
@@ -357,6 +428,25 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
         );
       },
     );
+  };
+  let listening: Promise<number | undefined>;
+  let subscriptionsListening: Promise<number | undefined> = Promise.resolve(undefined);
+  if (subscriptions === undefined) {
+    listening = startListeners();
+  } else {
+    // The subscription listener binds before the health listener and the notifier (R4).
+    const bound = subscriptions.listen();
+    subscriptionsListening = bound;
+    listening = bound.then(
+      () => (state.isShuttingDown ? undefined : startListeners()),
+      async (err: unknown) => {
+        state.isShuttingDown = true;
+        await finish();
+        throw err;
+      },
+    );
+    // Callers that await only `listening` still see the failure; this copy must not be unhandled.
+    subscriptionsListening.catch(() => {});
   }
   const stop = async (): Promise<void> => {
     state.isShuttingDown = true;
@@ -366,12 +456,222 @@ export function main(env: Env = process.env, deps: MainDeps = {}): Running {
     start: () => notifier.start(),
     stop,
     listening,
-    releaseLock: () => state.lock?.release(),
+    subscriptionsListening,
+    subscriberGuardSize: () => subscriptions?.guard.size() ?? 0,
+    releaseLock: () => {
+      state.lock?.release();
+      state.subscriptions?.lock.release();
+    },
   };
   if (notifier.pollHealth) {
     running.pollHealth = () => notifier.pollHealth?.() ?? { consecutiveFailedPolls: 0 };
   }
   return running;
+}
+
+/** A sleep that ends early, without error, when the signal aborts. */
+const realSleep: Sleep = (ms, signal) =>
+  new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+    signal.addEventListener("abort", done, { once: true });
+  });
+
+/** The running subscription service (R3-R5): store, lock, workers, listener. */
+export interface Subscriptions {
+  /** Hands each good manual read to detection; the notifier's `onManualRead`. */
+  onManualRead: (read: ManualRead) => void;
+  /** Binds the listener; rejects with a `StartupError`. */
+  listen: () => Promise<number>;
+  /** Starts both workers, after the listener is bound. */
+  startWorkers: () => void;
+  guard: MailboxGuard;
+  /** The store's lease lock `<store>.lock`. */
+  lock: LedgerLock;
+  /** Guard stopping, workers, listener, cleanup, store, then the store lock. Runs once. */
+  stop: () => Promise<void>;
+}
+
+interface SubscriptionDeps {
+  settings: Settings;
+  logger: Logger;
+  metrics: Metrics;
+  now: () => number;
+  lock: LockDeps;
+  sendMail: SendMail;
+  sleep: Sleep;
+}
+
+/**
+ * Opens the store under its own lock, runs the first cleanup and builds the workers and the
+ * listener. Nothing answers or sends until `listen` and `startWorkers`. A failure unwinds.
+ */
+function openSubscriptions(subs: SubscriptionsOn, deps: SubscriptionDeps): Subscriptions {
+  const { logger, now } = deps;
+  const logError = (message: string, fields?: Record<string, unknown>): void =>
+    logger.error(message, fields);
+  const lock = acquireLock(subs.statePath, deps.lock);
+  let store: SubscriberStore;
+  try {
+    // The shared lock code keeps the umask mode; the store's lock is private like the store (R3).
+    chmodSync(`${subs.statePath}.lock`, 0o600);
+    store = SubscriberStore.open(subs.statePath, { logger });
+  } catch (err) {
+    lock.release();
+    throw new ConfigError(`cannot use subscription store ${subs.statePath}: ${errorName(err)}`, {
+      cause: err,
+    });
+  }
+  const guard = createMailboxGuard();
+  const clientName = subs.smtp.clientName ?? deps.settings.smtpClientName;
+  const smtp = clientName === undefined ? subs.smtp : { ...subs.smtp, clientName };
+  const mail = { from: subs.from, subjectPrefix: subs.subjectPrefix, statusUrl: subs.statusUrl };
+  const retry = {
+    retryDelayMs: deps.settings.retryDelayMs,
+    retryMaxDelayMs: deps.settings.retryMaxDelayMs,
+  };
+  const refs: { worker?: ConfirmationWorker } = {};
+  const series = deps.metrics.enableSubscriptions({
+    subscribers: () => {
+      const c = store.counts();
+      return { pending: c.pending, confirmed: c.total - c.pending };
+    },
+    eventsPending: () => store.pendingEventCount(),
+    confirmationsQueued: () => refs.worker?.size() ?? 0,
+  });
+  const worker = new ConfirmationWorker({
+    readRow: (id) => store.subscriptionById(id),
+    guard,
+    sendMail: deps.sendMail,
+    smtp,
+    timeoutMs: subs.sendTimeoutMs,
+    mail,
+    now,
+    sleep: deps.sleep,
+    ...retry,
+    onOutcome: (o) => series.mailDone("confirmation", o),
+    logError,
+  });
+  refs.worker = worker;
+  const incidents = new IncidentWorker({
+    store,
+    guard,
+    sendMail: deps.sendMail,
+    smtp,
+    timeoutMs: subs.sendTimeoutMs,
+    mail,
+    key: subs.key,
+    now,
+    sleep: deps.sleep,
+    retryAttempts: deps.settings.retryAttempts,
+    ...retry,
+    onOutcome: (o) => series.mailDone("incident", o),
+    logError,
+  });
+  const detection = createSubscriberDetection({
+    store,
+    wake: () => incidents.wake(),
+    onDetected: () => series.detectionDone(),
+    logError,
+  });
+  // Cleanup runs once here, before the listener answers (R3), then on its own timer.
+  const cleanup: CleanupTimer = startCleanup({
+    store,
+    now,
+    retentionMs: deps.settings.stateRetentionDays * 86_400_000,
+    listedIds: detection.listedIds,
+    onDeleted: (ids) => {
+      for (const id of ids) worker.cancel(id);
+    },
+    setTimeout: (fn, ms) => {
+      const t = setTimeout(fn, ms);
+      t.unref();
+      return t;
+    },
+    clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    logError,
+  });
+  const ops = createSubscriptionOperations({
+    store,
+    queue: worker,
+    key: subs.key,
+    max: subs.max,
+    maxPending: subs.maxPending,
+    confirmPerHour: subs.confirmPerHour,
+    onLimited: (limit) => series.limited(limit),
+  });
+  let server: SubscriptionServer | undefined;
+  let stopping: Promise<void> | undefined;
+  const stop = (): Promise<void> => {
+    stopping ??= (async () => {
+      // The guard stops first, so no worker takes a mailbox while the others end.
+      guard.stop();
+      await Promise.all([incidents.stop(), worker.stop()]);
+      await server?.close();
+      cleanup.stop();
+      try {
+        store.close();
+      } catch (err) {
+        logger.error("subscription store close failed", { error: errorName(err) });
+      }
+      lock.release();
+    })();
+    return stopping;
+  };
+  return {
+    onManualRead: detection.onManualRead,
+    guard,
+    lock,
+    startWorkers: () => {
+      worker.start();
+      incidents.start();
+    },
+    listen: () =>
+      startSubscriptionServer({
+        host: subs.host,
+        port: subs.port,
+        token: subs.token,
+        ops,
+        now,
+        logError,
+        onRequest: (route, outcome) => series.requestDone(route, outcome),
+      }).then(
+        (s) => {
+          server = s;
+          if (stopping !== undefined) void s.close();
+          return s.port;
+        },
+        (err: unknown) => {
+          throw new StartupError(
+            `cannot listen on ${subs.host}:${subs.port} (PULSE_NOTIFY_SUBSCRIPTIONS_HOST/PULSE_NOTIFY_SUBSCRIPTIONS_PORT): ${bindReason(err)}`,
+            { cause: err },
+          );
+        },
+      ),
+    stop,
+  };
+}
+
+function errorName(err: unknown): string {
+  return err instanceof Error ? err.name : "unknown";
+}
+
+/** Reads the subscription settings; a refusal is a `ConfigError` (exit 2) before any file. */
+function readSubscriptionSettings(env: Env): SubscriptionSettings {
+  try {
+    return loadSubscriptionSettings(env, { readFile: (path) => readFileSync(path, "utf8") });
+  } catch (err) {
+    if (err instanceof StartupError) throw new ConfigError(err.message, { cause: err });
+    throw err;
+  }
 }
 
 /** Longest time between two service reports (R1). */
@@ -743,10 +1043,39 @@ export function run(env: Env = process.env, deps: RunDeps = {}): Promise<void> {
   });
 }
 
+/**
+ * Runs `pulse-notify subscribers delete <address>` (D18) under the store lock and returns the
+ * exit code: 0 done, 1 bad arguments or address, 2 store in use or unusable.
+ */
+export function runSubscribersCli(
+  args: string[],
+  env: Env = process.env,
+  deps: CliDeps = {},
+): number {
+  const write = deps.write ?? ((line: string) => process.stdout.write(line));
+  const writeError = deps.writeError ?? ((line: string) => process.stderr.write(line));
+  let result: ReturnType<typeof runSubscribers>;
+  try {
+    result = runSubscribers(args, {
+      storePath: subscriptionStorePath(env),
+      lock: lockDeps(deps.lock, loadLockLeaseSeconds(env)),
+    });
+  } catch (err) {
+    if (!(err instanceof ConfigError || err instanceof StartupError)) throw err;
+    writeError(`pulse-notify: ${err.message}\n`);
+    return 2;
+  }
+  const out = result.code === 0 ? write : writeError;
+  for (const line of result.lines) out(`${line}\n`);
+  return result.code;
+}
+
 if (import.meta.main) {
   try {
     if (process.argv[2] === "failed") {
       process.exitCode = await runCli(process.argv.slice(3));
+    } else if (process.argv[2] === "subscribers") {
+      process.exitCode = runSubscribersCli(process.argv.slice(3));
     } else {
       await run();
     }

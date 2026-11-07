@@ -2,7 +2,16 @@ import { Database } from "bun:sqlite";
 import { afterAll, test } from "bun:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -758,4 +767,185 @@ test("token mode: a claimed resend sends once over HTTP, posts its results with 
     await api.close();
     await receiver.close();
   }
+});
+
+const SUB_TOKEN = "s".repeat(40);
+const SUB_KEY = "0123456789abcdef".repeat(4);
+const ROOT_LINE =
+  "PULSE_NOTIFY_SUBSCRIPTIONS_STATUS_URL: must be an origin without a path (root hosting)";
+
+function subscriptionEnv(sub: string, extra: Record<string, string> = {}) {
+  const d = join(dir, sub);
+  mkdirSync(d);
+  const configPath = join(d, "config.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({ channels: [{ id: "log", type: "file", path: join(d, "o.jsonl") }] }),
+  );
+  const secrets = mkdtempSync(join(tmpdir(), "notify-main-secrets-"));
+  afterAll(() => rmSync(secrets, { recursive: true, force: true }));
+  writeFileSync(join(secrets, "token"), `${SUB_TOKEN}\n`);
+  writeFileSync(join(secrets, "key"), `${SUB_KEY}\n`);
+  return {
+    dir: d,
+    env: {
+      PULSE_NOTIFY_CONFIG: configPath,
+      PULSE_NOTIFY_STATE: join(d, "state.json"),
+      PULSE_NOTIFY_SUBSCRIPTIONS: "on",
+      PULSE_NOTIFY_SUBSCRIPTIONS_STATUS_URL: "https://status.example.com",
+      PULSE_NOTIFY_SUBSCRIPTIONS_FROM: "status@example.com",
+      PULSE_NOTIFY_SUBSCRIPTIONS_SMTP_HOST: "127.0.0.1",
+      PULSE_NOTIFY_SUBSCRIPTIONS_SMTP_TLS: "none",
+      PULSE_NOTIFY_SUBSCRIPTIONS_TOKEN_FILE: join(secrets, "token"),
+      PULSE_NOTIFY_SUBSCRIPTIONS_KEY_FILE: join(secrets, "key"),
+      PULSE_NOTIFY_SUBSCRIPTIONS_HOST: "127.0.0.1",
+      PULSE_NOTIFY_SUBSCRIPTIONS_PORT: "0",
+      ...extra,
+    } as Record<string, string>,
+  };
+}
+
+function countingNotifier(starts: { n: number }): () => Stoppable {
+  return () => ({
+    start() {
+      starts.n += 1;
+    },
+    stop: async () => {},
+  });
+}
+
+test("subscriptions off: main opens no store, lock or listener and leaves only the ledger files", async () => {
+  const d = join(dir, "subs-off");
+  mkdirSync(d);
+  const configPath = join(d, "config.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({ channels: [{ id: "log", type: "file", path: join(d, "o.jsonl") }] }),
+  );
+  const running = main(
+    { PULSE_NOTIFY_CONFIG: configPath, PULSE_NOTIFY_STATE: join(d, "state.json") },
+    { write: () => {}, createNotifier: countingNotifier({ n: 0 }) },
+  );
+  assert.equal(await running.subscriptionsListening, undefined);
+  assert.equal(running.subscriberGuardSize(), 0);
+  await running.stop();
+  assert.deepEqual(
+    readdirSync(d).sort((a, b) => a.localeCompare(b)),
+    ["config.json", "state.json"],
+  );
+});
+
+test("subscriptions on: authenticated listener before the notifier, private store and lock, stop frees both", async () => {
+  const { dir: d, env } = subscriptionEnv("subs-on");
+  const starts = { n: 0 };
+  const lines: string[] = [];
+  const running = main(env, {
+    write: (line) => lines.push(line),
+    createNotifier: countingNotifier(starts),
+  });
+  const port = await running.subscriptionsListening;
+  assert.equal(typeof port, "number");
+  const res = await fetch(`http://127.0.0.1:${port}/subscriptions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "a@example.com" }),
+  });
+  assert.equal(res.status, 401);
+  assert.deepEqual(await res.json(), { error: "unauthorized" });
+  await running.listening;
+  assert.equal(starts.n, 1);
+  const store = join(d, "notify-subscriptions.db");
+  assert.equal(statSync(store).mode & 0o777, 0o600);
+  assert.equal(statSync(`${store}.lock`).mode & 0o777, 0o600);
+  await running.stop();
+  assert.equal(running.subscriberGuardSize(), 0);
+  assert.equal(existsSync(`${store}.lock`), false);
+  const second = main(env, { write: () => {}, createNotifier: countingNotifier({ n: 0 }) });
+  await second.listening;
+  await second.stop();
+  assert.equal(lines.join("\n").includes(SUB_TOKEN), false);
+  assert.equal(lines.join("\n").includes(SUB_KEY), false);
+});
+
+test("subscriptions on: a status url with a path stops startup with the R9 line before any store", () => {
+  const { dir: d, env } = subscriptionEnv("subs-r9", {
+    PULSE_NOTIFY_SUBSCRIPTIONS_STATUS_URL: "https://status.example.com/pulse",
+  });
+  assert.throws(
+    () => main(env, { write: () => {}, createNotifier: countingNotifier({ n: 0 }) }),
+    (err: unknown) => err instanceof ConfigError && err.message === ROOT_LINE,
+  );
+  assert.deepEqual(
+    readdirSync(d).sort((a, b) => a.localeCompare(b)),
+    ["config.json"],
+  );
+});
+
+test("subscriptions on: an occupied listener port exits 2 and unwinds the store, both locks and the notifier", async () => {
+  const blocker = createServer();
+  await listen(blocker);
+  afterAll(() => close(blocker));
+  const busy = (blocker.address() as AddressInfo).port;
+  const { dir: d, env } = subscriptionEnv("subs-bind", {
+    PULSE_NOTIFY_SUBSCRIPTIONS_PORT: String(busy),
+  });
+  const starts = { n: 0 };
+  const running = main(env, { write: () => {}, createNotifier: countingNotifier(starts) });
+  await assert.rejects(
+    running.listening,
+    (err: unknown) =>
+      err instanceof StartupError &&
+      err.message.startsWith(
+        `cannot listen on 127.0.0.1:${busy} (PULSE_NOTIFY_SUBSCRIPTIONS_HOST/PULSE_NOTIFY_SUBSCRIPTIONS_PORT): `,
+      ),
+  );
+  assert.equal(starts.n, 0);
+  assert.deepEqual(
+    readdirSync(d).sort((a, b) => a.localeCompare(b)),
+    ["config.json", "notify-subscriptions.db", "state.json"],
+  );
+});
+
+function spawnEntry(args: string[], env: Record<string, string>) {
+  const child = spawn(process.execPath, [join(import.meta.dirname, "../src/index.ts"), ...args], {
+    env: { ...process.env, ...env },
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (d) => {
+    stdout += d;
+  });
+  child.stderr.on("data", (d) => {
+    stderr += d;
+  });
+  return new Promise<{ code: unknown; stdout: string; stderr: string }>((resolve) =>
+    child.once("close", (code) => resolve({ code, stdout, stderr })),
+  );
+}
+
+test("entry point: subscribers without arguments prints the usage and exits 1", async () => {
+  const d = join(dir, "subs-cli-usage");
+  mkdirSync(d);
+  const out = await spawnEntry(["subscribers"], { PULSE_NOTIFY_STATE: join(d, "state.json") });
+  assert.equal(out.code, 1);
+  assert.equal(out.stdout, "");
+  assert.equal(out.stderr, "usage: pulse-notify subscribers delete <address>\n");
+  assert.deepEqual(readdirSync(d), []);
+});
+
+test("entry point: subscribers delete exits 2 while a running service holds the store lock", async () => {
+  const { env } = subscriptionEnv("subs-cli-held");
+  const running = main(env, { write: () => {}, createNotifier: countingNotifier({ n: 0 }) });
+  try {
+    await running.listening;
+    const out = await spawnEntry(["subscribers", "delete", "a@example.com"], env);
+    assert.equal(out.code, 2);
+    assert.equal(out.stdout, "");
+    assert.equal(out.stderr.includes("a@example.com"), false);
+  } finally {
+    await running.stop();
+  }
+  const out = await spawnEntry(["subscribers", "delete", "a@example.com"], env);
+  assert.equal(out.code, 0);
+  assert.equal(out.stdout, "deleted 0\n");
 });

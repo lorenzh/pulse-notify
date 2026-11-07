@@ -40,9 +40,9 @@ The schedule is in [channels.md](channels.md#delivery-and-retries).
 - Example: `PULSE_NOTIFY_POLL_MS=30000` polls every 30 seconds.
 - Service reads (`/service/*`) use a timeout of 5000 ms, follow no redirect and read at most 1048576 bytes, whatever `PULSE_NOTIFY_API_MAX_BYTES` says.
 
-## Email subscriptions (in progress)
+## Email subscriptions
 
-Email subscriptions for status page visitors are being built. This version reads and checks the settings below and has the subscriber store, the listener and the confirmation mail queue, but the service does not start a listener, store or worker yet, whatever `PULSE_NOTIFY_SUBSCRIPTIONS` says.
+Status page visitors can subscribe to incident mail. With `PULSE_NOTIFY_SUBSCRIPTIONS=on`, notify opens the subscriber store under its own lock, runs the first cleanup, binds the private subscription listener, and only then starts the notifier and the two mail workers. With `off` (the default), no store, lock, listener or worker starts and `/metrics` is unchanged. The Docker image sets `PULSE_NOTIFY_SUBSCRIPTIONS_HOST=0.0.0.0`, so status can reach the listener on the container network; the listener stays off until `PULSE_NOTIFY_SUBSCRIPTIONS=on` and always needs the bearer token. Do not publish its port on the host.
 
 | Variable                                        | Default                                               | Rule                                                                                                                                                              |
 | ----------------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
