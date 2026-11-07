@@ -81,6 +81,15 @@ export interface NotifierOptions {
   hostname?: (() => string) | undefined;
   /** A budget-low warning fires below this percent of error budget left. Default 25. */
   budgetThreshold?: number | undefined;
+  /**
+   * Called after the channel work of each poll whose manual read answered and was not a 404,
+   * with the public incidents and every listed id (subscriber detection, R5).
+   */
+  onManualRead?: (read: {
+    incidents: ManualIncident[];
+    listedIds: ReadonlySet<number>;
+    nowMs: number;
+  }) => void;
 }
 
 export class IncidentDropError extends Error {
@@ -522,7 +531,24 @@ export class Notifier {
       this.#runAlerts(checksResult, components, nowMs);
       this.#pruneAlerts(nowMs);
     }
+    if (manualResult && !manualResult.isAbsent) this.#handManualRead(manualResult, nowMs);
     return isOk;
+  }
+
+  /** Subscriber detection never fails a poll or the channel work before it. */
+  #handManualRead(manual: ManualIncidentsResult, nowMs: number): void {
+    try {
+      this.#opts.onManualRead?.({
+        incidents: manual.incidents,
+        listedIds: manual.listedIds,
+        nowMs,
+      });
+    } catch (err) {
+      // Only the name: a message could hold subscriber data.
+      this.#opts.logger.error("subscriber detection failed", {
+        error: err instanceof Error ? err.name : "unknown",
+      });
+    }
   }
 
   /** The value of a feed read, or `undefined` after logging (once per kind) and counting its failure. */

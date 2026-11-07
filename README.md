@@ -61,6 +61,8 @@ Settings, channels, routing, reminders, secrets, signing, payload, delivery, ope
 
 Settings (environment variables) are listed in [docs/configuration.md](docs/configuration.md); the channel config keys are there too.
 
+Email subscriptions for status page visitors are opt-in with `PULSE_NOTIFY_SUBSCRIPTIONS=on` (default `off`; with `off` nothing of them starts and `/metrics` is unchanged). Then notify opens a private subscriber store (`notify-subscriptions.db` beside the ledger, mode `0600`, its own lock), answers status on a private listener (`PULSE_NOTIFY_SUBSCRIPTIONS_HOST:PORT`, default `127.0.0.1:9300`, Bearer token required) that binds before the notifier starts, sends confirmation mail, and sends each new public manual incident event to every confirmed subscriber, one email per mailbox at a time. Email subscriptions need the status page at the root of its origin, for example `https://status.example.com`. A path such as `/pulse` is refused at startup while subscriptions are on. The settings are in [docs/configuration.md](docs/configuration.md#email-subscriptions); the store, its data inventory and 25-hour cleanup of unconfirmed addresses, `bun src/index.ts subscribers delete <address>`, backups, key rotation and the known limits D-R1..D-R13 are in [docs/operation.md](docs/operation.md#subscriber-store).
+
 ## Development
 
 `bun run check` runs lint, typecheck and tests. See [docs/development.md](docs/development.md).

@@ -1,6 +1,7 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { Metrics } from "../src/metrics.ts";
+import { letLoopRun, subscriptionFixture } from "./subscriptions-support.ts";
 
 test("metrics render counters per channel and escape labels", () => {
   let pending = 2;
@@ -82,4 +83,90 @@ test("skipped items count per feed", () => {
   const text = metrics.render();
   assert.match(text, /^pulse_notify_skipped_items_total\{feed="checks"\} 2$/m);
   assert.match(text, /^pulse_notify_skipped_items_total\{feed="incidents"\} 0$/m);
+});
+
+test("subscription series render with names, help texts and labels when on", () => {
+  const metrics = new Metrics(["log"], () => 0);
+  const subs = metrics.enableSubscriptions({
+    subscribers: () => ({ pending: 3, confirmed: 7 }),
+    eventsPending: () => 1,
+    confirmationsQueued: () => 2,
+  });
+  subs.limited("capacity");
+  subs.limited("capacity");
+  subs.requestDone("subscribe", "queued");
+  subs.mailDone("confirmation", "success");
+  subs.detectionDone();
+  const text = metrics.render();
+  for (const line of [
+    "# HELP pulse_notify_subscribers Subscriber rows by state.",
+    "# TYPE pulse_notify_subscribers gauge",
+    'pulse_notify_subscribers{state="pending"} 3',
+    'pulse_notify_subscribers{state="confirmed"} 7',
+    "# HELP pulse_notify_subscriber_events_pending Incident events whose subscriber fan-out is not finished.",
+    "pulse_notify_subscriber_events_pending 1",
+    "# TYPE pulse_notify_subscriber_detections_total counter",
+    "pulse_notify_subscriber_detections_total 1",
+    'pulse_notify_subscriber_mails_total{kind="confirmation",outcome="success"} 1',
+    'pulse_notify_subscriber_mails_total{kind="incident",outcome="failure"} 0',
+    "# HELP pulse_notify_subscriber_confirmations_queued Confirmation mails queued or in flight.",
+    "pulse_notify_subscriber_confirmations_queued 2",
+    'pulse_notify_subscription_requests_total{route="subscribe",outcome="queued"} 1',
+    'pulse_notify_subscription_requests_total{route="confirm",outcome="ok"} 0',
+    'pulse_notify_subscription_requests_total{route="unsubscribe",outcome="unauthorized"} 0',
+    'pulse_notify_subscription_limited_total{limit="capacity"} 2',
+    'pulse_notify_subscription_limited_total{limit="queue"} 0',
+  ]) {
+    assert.ok(text.split("\n").includes(line), line);
+  }
+});
+
+test("a held confirmation gives gauge 1; success grows by 1 before the gauge is 0", async () => {
+  const f = subscriptionFixture();
+  const metrics = new Metrics([], () => 0);
+  const subs = metrics.enableSubscriptions({
+    subscribers: () => ({ pending: 0, confirmed: 0 }),
+    eventsPending: () => 0,
+    confirmationsQueued: () => f.worker.size(),
+  });
+  const seen: string[] = [];
+  const line = (text: string, name: string): string =>
+    text.split("\n").find((l) => l.startsWith(name)) ?? "";
+  try {
+    f.outcomes.push = (o: string): number => {
+      subs.mailDone("confirmation", o === "success" ? "success" : "failure");
+      seen.push(line(metrics.render(), "pulse_notify_subscriber_confirmations_queued "));
+      return 0;
+    };
+    f.ops.subscribe("a@example.com", 0);
+    await letLoopRun();
+    assert.equal(
+      line(metrics.render(), "pulse_notify_subscriber_confirmations_queued "),
+      "pulse_notify_subscriber_confirmations_queued 1",
+    );
+    f.mailer.calls[0]?.resolve();
+    await letLoopRun();
+    assert.deepEqual(seen, ["pulse_notify_subscriber_confirmations_queued 1"]);
+    const text = metrics.render();
+    assert.ok(
+      text.includes(
+        'pulse_notify_subscriber_mails_total{kind="confirmation",outcome="success"} 1\n',
+      ),
+    );
+    assert.ok(text.includes("pulse_notify_subscriber_confirmations_queued 0\n"));
+  } finally {
+    await f.close();
+  }
+});
+
+test("a store read that fails at scrape keeps the scrape working", () => {
+  const metrics = new Metrics([], () => 0);
+  metrics.enableSubscriptions({
+    subscribers: () => {
+      throw new Error("closed");
+    },
+    eventsPending: () => 0,
+    confirmationsQueued: () => 0,
+  });
+  assert.ok(metrics.render().includes('pulse_notify_subscribers{state="pending"} 0'));
 });
