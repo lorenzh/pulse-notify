@@ -202,7 +202,7 @@ export function recordingSleep(): RecordingSleep {
 }
 
 /** Lets the event loop run: `turns` rounds of `setImmediate`. */
-export async function letLoopRun(turns = 100): Promise<void> {
+export async function letLoopRun(turns = 20): Promise<void> {
   for (let i = 0; i < turns; i += 1) await new Promise((r) => setImmediate(r));
 }
 
@@ -397,14 +397,16 @@ export function insertConfirmed(
   store: SubscriberStore,
   row: { id: string; email: string; confirmedAt: number },
 ): void {
-  store.insertPending({
-    id: row.id,
-    email: row.email,
-    now: row.confirmedAt,
-    digest: `digest-${row.id}`,
-    expiresAt: row.confirmedAt + 86_400_000,
+  store.transaction(() => {
+    store.insertPending({
+      id: row.id,
+      email: row.email,
+      now: row.confirmedAt,
+      digest: `digest-${row.id}`,
+      expiresAt: row.confirmedAt + 86_400_000,
+    });
+    store.confirm(row.id, row.confirmedAt);
   });
-  store.confirm(row.id, row.confirmedAt);
 }
 
 /** The orphan invariant of D21: delivery rows without a subscription row. */

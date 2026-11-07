@@ -40,8 +40,11 @@ interface Case {
   limited?: string;
 }
 
+/** Setup in one transaction: a durable commit per filler would only cost test time. */
 const fill = (f: SubscriptionFixture, n: number, from: number): void => {
-  for (let i = 0; i < n; i += 1) f.ops.subscribe(`filler${i}@example.com`, from + i);
+  f.store.transaction(() => {
+    for (let i = 0; i < n; i += 1) f.ops.subscribe(`filler${i}@example.com`, from + i);
+  });
 };
 
 const CASES: Case[] = [

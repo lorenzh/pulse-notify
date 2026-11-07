@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { validateNotifyServiceReport } from "@lorenzh/pulse-contract";
 import { StartupError } from "@lorenzh/pulse-kit";
 import { ConfigError } from "../src/config.ts";
-import { main, run, type Stoppable } from "../src/index.ts";
+import { main, run, runSubscribersCli, type Stoppable } from "../src/index.ts";
 import { Ledger } from "../src/ledger.ts";
 import type { Schedule } from "../src/types.ts";
 import { close, listen, startFakeApi, startReceiver } from "./support.ts";
@@ -933,19 +933,25 @@ test("entry point: subscribers without arguments prints the usage and exits 1", 
   assert.deepEqual(readdirSync(d), []);
 });
 
-test("entry point: subscribers delete exits 2 while a running service holds the store lock", async () => {
+test("subscribers delete exits 2 while a running service holds the store lock", async () => {
   const { env } = subscriptionEnv("subs-cli-held");
   const running = main(env, { write: () => {}, createNotifier: countingNotifier({ n: 0 }) });
+  const out: string[] = [];
+  const err: string[] = [];
+  // Another process on this host: its own pid, and the service pid counts as alive.
+  const deps = {
+    write: (l: string) => out.push(l),
+    writeError: (l: string) => err.push(l),
+    lock: { pid: process.pid + 1, isPidAlive: () => true },
+  };
   try {
     await running.listening;
-    const out = await spawnEntry(["subscribers", "delete", "a@example.com"], env);
-    assert.equal(out.code, 2);
-    assert.equal(out.stdout, "");
-    assert.equal(out.stderr.includes("a@example.com"), false);
+    assert.equal(runSubscribersCli(["delete", "a@example.com"], env, deps), 2);
+    assert.deepEqual(out, []);
+    assert.equal(err.join("").includes("a@example.com"), false);
   } finally {
     await running.stop();
   }
-  const out = await spawnEntry(["subscribers", "delete", "a@example.com"], env);
-  assert.equal(out.code, 0);
-  assert.equal(out.stdout, "deleted 0\n");
+  assert.equal(runSubscribersCli(["delete", "a@example.com"], env, deps), 0);
+  assert.deepEqual(out, ["deleted 0\n"]);
 });

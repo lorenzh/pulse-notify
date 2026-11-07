@@ -250,7 +250,9 @@ describe("worker 1", () => {
   test("the queue holds at most 100 jobs", async () => {
     const f = subscriptionFixture({ confirmPerHour: 1000 });
     fx = f;
-    for (let i = 0; i < 101; i += 1) f.ops.subscribe(`u${i}@example.com`, i);
+    f.store.transaction(() => {
+      for (let i = 0; i < 101; i += 1) f.ops.subscribe(`u${i}@example.com`, i);
+    });
     expect(f.worker.size()).toBe(100);
     expect(f.limited).toEqual(["queue"]);
   });
@@ -321,9 +323,11 @@ describe("Expired jobs hold no queue capacity (R5 Subscribe step 1, selection)",
       retryMaxDelayMs: 90_000_000,
     });
     fx = f;
-    for (let i = 0; i < jobs; i += 1) {
-      expect(f.ops.subscribe(`sub-${i}@example.com`, 0)).toBe("queued");
-    }
+    f.store.transaction(() => {
+      for (let i = 0; i < jobs; i += 1) {
+        expect(f.ops.subscribe(`sub-${i}@example.com`, 0)).toBe("queued");
+      }
+    });
     for (let i = 0; i < jobs; i += 1) {
       await letLoopRun();
       f.mailer.calls[i]?.reject(new Error("try later"));
@@ -804,9 +808,12 @@ describe("Fan-out failures", () => {
     const f = subscriptionFixture();
     fx = f;
     const ids = Array.from({ length: 250 }, (_, i) => `r${String(i).padStart(21, "0")}`);
-    for (const [i, id] of ids.entries()) {
-      insertConfirmed(f.store, { id, email: `row-${i}@example.com`, confirmedAt: 0 });
-    }
+    // One setup transaction: 250 durable commits would only cost test time.
+    f.store.transaction(() => {
+      for (const [i, id] of ids.entries()) {
+        insertConfirmed(f.store, { id, email: `row-${i}@example.com`, confirmedAt: 0 });
+      }
+    });
     const pages: string[] = [];
     const eligibleIds = f.store.eligibleIds.bind(f.store);
     f.store.eligibleIds = (key, after, limit) => {
