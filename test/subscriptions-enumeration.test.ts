@@ -9,6 +9,7 @@ import {
   subscriptionFixture,
   TEST_BEARER,
 } from "./subscriptions-support.ts";
+import { manualIncident } from "./support.ts";
 
 const K = "known@example.com";
 const U = "unknown@example.com";
@@ -178,6 +179,18 @@ async function runOne(c: Case, email: string, closeStore = false): Promise<Run> 
     await c.setup(f);
     await letLoopRun();
     const kBefore = f.store.subscriptionByEmail(K);
+    // With K confirmed, an incident send to K is held by worker 2 during the request too.
+    const isFanoutHeld = kBefore?.state === "confirmed";
+    if (isFanoutHeld) {
+      f.detection.onManualRead({ incidents: [], listedIds: new Set(), nowMs: 2 });
+      f.detection.onManualRead({
+        incidents: [manualIncident({ id: 1 })],
+        listedIds: new Set([1]),
+        nowMs: 3,
+      });
+      await letLoopRun();
+      expect(f.mailer.calls.at(-1)?.message.subject).toContain("New incident");
+    }
     const callsBefore = f.mailer.calls.length;
     const limitedBefore = f.limited.length;
     f.clock.t = c.at;
@@ -207,6 +220,10 @@ async function runOne(c: Case, email: string, closeStore = false): Promise<Run> 
       // Immediate class: answered under a frozen clock while every mail stays held.
       expect(f.clock.t).toBe(c.at);
       expect(f.mailer.calls.slice(callsBefore).every((call) => !call.isSettled)).toBe(true);
+      if (isFanoutHeld) {
+        expect(f.mailer.calls[callsBefore - 1]?.isSettled).toBe(false);
+        if (!closeStore) expect(f.store.pendingEventCount()).toBe(1);
+      }
       await letLoopRun();
       const kAfter = closeStore ? undefined : f.store.subscriptionByEmail(K);
       if (!closeStore && kBefore?.state === "confirmed") {

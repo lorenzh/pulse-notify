@@ -5,6 +5,7 @@ import {
   SUBSCRIPTION_UNSUBSCRIBE_TOKEN_PATTERN,
 } from "@lorenzh/pulse-contract";
 import { envelopeAddress, type MailMessage } from "./channels/mailer.ts";
+import { cleanText, MAX_MANUAL_MESSAGE_LENGTH } from "./channels/message.ts";
 
 const HOUR_MS = 3_600_000;
 
@@ -95,5 +96,64 @@ export function confirmationMessage(input: ConfirmationInput): MailMessage {
     text,
     date: input.date,
     messageId: messageId(`confirm:${input.id}:${input.confirmSends}`, input.from),
+  };
+}
+
+/** The stored payload of a pending event: only public fields of the manual incident. */
+export interface IncidentPayload {
+  event: "opened" | "update" | "resolved";
+  title: string;
+  impact: string;
+  status: string;
+  message: string;
+  /** ISO 8601 UTC time of the event. */
+  time: string;
+}
+
+const STATE_LABELS: Record<IncidentPayload["event"], string> = {
+  opened: "New incident",
+  update: "Update",
+  resolved: "Resolved",
+};
+
+export interface IncidentInput {
+  from: string;
+  subjectPrefix: string;
+  statusUrl: string;
+  address: string;
+  id: string;
+  eventKey: string;
+  payload: IncidentPayload;
+  unsubscribeToken: string;
+  date: Date;
+}
+
+/** The incident mail of R5 "Fan-out": one `To` address, no other subscriber, no private field. */
+export function incidentMessage(input: IncidentInput): MailMessage {
+  const url = input.statusUrl;
+  const p = input.payload;
+  const state = STATE_LABELS[p.event];
+  const title = cleanText(p.title);
+  const text = [
+    `${state}: ${title}`,
+    "",
+    `Impact: ${cleanText(p.impact, 40)}`,
+    `Status: ${cleanText(p.status, 40)}`,
+    cleanText(p.message, MAX_MANUAL_MESSAGE_LENGTH),
+    `Time: ${p.time}`,
+    "",
+    `Status page: ${url}`,
+    `You get this email because you subscribed at ${url}.`,
+    `Unsubscribe: ${url}/unsubscribe?token=${input.unsubscribeToken}`,
+    "",
+  ].join("\n");
+  return {
+    from: input.from,
+    to: [input.address],
+    envelopeTo: [input.address],
+    subject: `${input.subjectPrefix} ${state}: ${title}`,
+    text,
+    date: input.date,
+    messageId: messageId(`${input.eventKey}:${input.id}`, input.from),
   };
 }

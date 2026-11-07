@@ -6,7 +6,12 @@ import { join } from "node:path";
 import type { MailMessage, SendMail, SendMailResult, SmtpOptions } from "../src/channels/mailer.ts";
 import type { LockDeps } from "../src/ledger-lock.ts";
 import { createMailboxGuard, type MailboxGuard } from "../src/mailbox-guard.ts";
-import { ConfirmationWorker } from "../src/subscriber-fanout.ts";
+import {
+  ConfirmationWorker,
+  createSubscriberDetection,
+  IncidentWorker,
+  type SubscriberDetection,
+} from "../src/subscriber-fanout.ts";
 import { SubscriberStore } from "../src/subscriber-store.ts";
 import {
   createSubscriptionOperations,
@@ -115,8 +120,8 @@ export interface FakeMailer {
   /** Start and settle order, as `start:<to>` and `settle:<to>`. */
   order: string[];
   maxInFlight: Map<string, number>;
-  /** When set, a call resolves at once with this result instead of being held. */
-  auto?: "success" | undefined;
+  /** When set, a call settles at once (success, or a temporary `421` error) instead of being held. */
+  auto?: "success" | "temporary" | undefined;
 }
 
 export function fakeMailer(): FakeMailer {
@@ -156,6 +161,7 @@ export function fakeMailer(): FakeMailer {
           once: true,
         });
         if (mailer.auto === "success") call.resolve();
+        else if (mailer.auto === "temporary") call.reject(new Error("421 try again later"));
       });
     },
   };
@@ -223,6 +229,10 @@ export interface FixtureOptions {
   timeoutMs?: number;
   retryDelayMs?: number;
   retryMaxDelayMs?: number;
+  /** `PULSE_NOTIFY_RETRY_ATTEMPTS` of worker 2; default 3. */
+  retryAttempts?: number;
+  /** Replaces the shared guard, for the self-checks with a wrong guard. */
+  guard?: MailboxGuard;
 }
 
 /** A store in its own temp dir, worker 1, the operations and fakes, wired as `main` will wire them. */
@@ -237,6 +247,12 @@ export interface SubscriptionFixture {
   ops: SubscriptionOperations;
   limited: string[];
   outcomes: string[];
+  /** Worker 2 and the detection hook, sharing the guard, store, clock, mailer and sleep. */
+  incidents: IncidentWorker;
+  detection: SubscriberDetection;
+  incidentOutcomes: string[];
+  /** `pulse_notify_subscriber_detections_total`. */
+  detections: { n: number };
   /** Stops the worker, closes the store and removes the directory. */
   close: () => Promise<void>;
 }
@@ -248,7 +264,7 @@ export function subscriptionFixture(opts: FixtureOptions = {}): SubscriptionFixt
   const clock = manualClock(0);
   const mailer = fakeMailer();
   const sleep = recordingSleep();
-  const guard = createMailboxGuard();
+  const guard = opts.guard ?? createMailboxGuard();
   const outcomes: string[] = [];
   const limited: string[] = [];
   const worker = new ConfirmationWorker({
@@ -277,7 +293,19 @@ export function subscriptionFixture(opts: FixtureOptions = {}): SubscriptionFixt
     confirmPerHour: opts.confirmPerHour ?? 100,
     onLimited: (l) => limited.push(l),
   });
+  const harness = incidentHarness({
+    store,
+    guard,
+    clock,
+    mailer,
+    sleep,
+    timeoutMs: opts.timeoutMs ?? 5000,
+    retryAttempts: opts.retryAttempts ?? 3,
+    retryDelayMs: opts.retryDelayMs ?? 1000,
+    retryMaxDelayMs: opts.retryMaxDelayMs ?? 60_000,
+  });
   worker.start();
+  harness.worker.start();
   let isClosed = false;
   return {
     path,
@@ -290,10 +318,15 @@ export function subscriptionFixture(opts: FixtureOptions = {}): SubscriptionFixt
     ops,
     limited,
     outcomes,
+    incidents: harness.worker,
+    detection: harness.detection,
+    incidentOutcomes: harness.outcomes,
+    detections: harness.detections,
     close: async () => {
       if (isClosed) return;
       isClosed = true;
       guard.stop();
+      await harness.worker.stop();
       await worker.stop();
       try {
         store.close();
@@ -303,4 +336,81 @@ export function subscriptionFixture(opts: FixtureOptions = {}): SubscriptionFixt
       tmp.remove();
     },
   };
+}
+
+export const TEST_MAIL = {
+  from: "Pulse <pulse@example.org>",
+  subjectPrefix: "[status.example.com]",
+  statusUrl: "https://status.example.com",
+} as const;
+
+export interface IncidentHarnessInput {
+  store: SubscriberStore;
+  guard: MailboxGuard;
+  clock: ManualClock;
+  mailer: FakeMailer;
+  sleep: RecordingSleep;
+  timeoutMs?: number;
+  retryAttempts: number;
+  retryDelayMs?: number;
+  retryMaxDelayMs?: number;
+}
+
+export interface IncidentHarness {
+  worker: IncidentWorker;
+  detection: SubscriberDetection;
+  outcomes: string[];
+  detections: { n: number };
+}
+
+/** Worker 2 and its detection hook over a store, wired as `main` will wire them (not started). */
+export function incidentHarness(input: IncidentHarnessInput): IncidentHarness {
+  const outcomes: string[] = [];
+  const detections = { n: 0 };
+  const worker = new IncidentWorker({
+    store: input.store,
+    guard: input.guard,
+    sendMail: input.mailer.sendMail,
+    smtp: { host: "127.0.0.1", port: 2525, tls: "none" },
+    timeoutMs: input.timeoutMs ?? 5000,
+    mail: TEST_MAIL,
+    key: TEST_KEY,
+    now: input.clock.now,
+    sleep: input.sleep.sleep,
+    retryAttempts: input.retryAttempts,
+    retryDelayMs: input.retryDelayMs ?? 1000,
+    retryMaxDelayMs: input.retryMaxDelayMs ?? 60_000,
+    onOutcome: (o) => outcomes.push(o),
+  });
+  const detection = createSubscriberDetection({
+    store: input.store,
+    wake: () => worker.wake(),
+    onDetected: () => {
+      detections.n += 1;
+    },
+  });
+  return { worker, detection, outcomes, detections };
+}
+
+/** A `confirmed` row with an id the test picks, written through the store. */
+export function insertConfirmed(
+  store: SubscriberStore,
+  row: { id: string; email: string; confirmedAt: number },
+): void {
+  store.insertPending({
+    id: row.id,
+    email: row.email,
+    now: row.confirmedAt,
+    digest: `digest-${row.id}`,
+    expiresAt: row.confirmedAt + 86_400_000,
+  });
+  store.confirm(row.id, row.confirmedAt);
+}
+
+/** The orphan invariant of D21: delivery rows without a subscription row. */
+export function orphanDeliveries(path: string): number {
+  return countRows(
+    path,
+    "SELECT count(*) AS n FROM deliveries d WHERE NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = d.subscription_id)",
+  );
 }

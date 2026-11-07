@@ -1,9 +1,21 @@
+import type { ManualIncident } from "@lorenzh/pulse-contract";
 import type { MailMessage, SendMail, SmtpOptions } from "./channels/mailer.ts";
 import { retryDelay } from "./delivery.ts";
+import { type DetectedManualEvent, detectManualEvents } from "./detector.ts";
 import { PermanentDeliveryError } from "./errors.ts";
 import type { MailboxGuard } from "./mailbox-guard.ts";
-import { confirmationMessage } from "./subscriber-mail.ts";
-import type { SubscriptionRow } from "./subscriber-store.ts";
+import {
+  confirmationMessage,
+  type IncidentPayload,
+  incidentMessage,
+  unsubscribeToken,
+} from "./subscriber-mail.ts";
+import {
+  ELIGIBLE_PAGE_SIZE,
+  type EventRow,
+  type SubscriberStore,
+  type SubscriptionRow,
+} from "./subscriber-store.ts";
 
 /** The confirmation queue holds at most this many jobs, in flight included (L6). */
 export const CONFIRMATION_QUEUE_MAX = 100;
@@ -140,7 +152,7 @@ export class ConfirmationWorker {
   }
 
   async #run(): Promise<void> {
-    while (!this.#isStopping) {
+    while (!this.#isStopping && !this.#deps.guard.isStopped()) {
       const attempt = this.#selectStep();
       if (attempt === undefined) await this.#waitRound();
       else await attempt;
@@ -267,5 +279,318 @@ export class ConfirmationWorker {
     controller.abort();
     this.#round = undefined;
     this.#wake = () => {};
+  }
+}
+
+/** A notifier read of `/manual-incidents` that answered and was not a 404. */
+export interface ManualRead {
+  incidents: ManualIncident[];
+  listedIds: ReadonlySet<number>;
+  nowMs: number;
+}
+
+function incidentPayload(detected: DetectedManualEvent): IncidentPayload {
+  const { incident, event, updateIndex, timeMs } = detected;
+  const update = incident.updates[updateIndex];
+  const message =
+    event === "resolved" ? (incident.updates.at(-1)?.message ?? "") : (update?.message ?? "");
+  return {
+    event,
+    title: incident.title,
+    impact: incident.impact,
+    status: event === "resolved" ? "resolved" : (update?.status ?? incident.status),
+    message,
+    time: new Date(timeMs).toISOString(),
+  };
+}
+
+const PAYLOAD_EVENTS: readonly string[] = ["opened", "update", "resolved"];
+
+/** The stored payload of an event, or `undefined` when the row does not hold one. */
+export function parsePayload(text: string | null): IncidentPayload | undefined {
+  if (text === null) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof value !== "object" || value === null) return undefined;
+  const v = value as Record<string, unknown>;
+  const fields = [v.title, v.impact, v.status, v.message, v.time];
+  if (!PAYLOAD_EVENTS.includes(String(v.event))) return undefined;
+  if (!fields.every((f) => typeof f === "string")) return undefined;
+  return value as IncidentPayload;
+}
+
+export interface SubscriberDetectionDeps {
+  store: SubscriberStore;
+  /** Wakes worker 2 after new pending events committed. */
+  wake: () => void;
+  /** `pulse_notify_subscriber_detections_total`, after the transaction committed. */
+  onDetected?: () => void;
+  logError?: (message: string, fields?: Record<string, unknown>) => void;
+}
+
+/** R5 "Detection": the notifier hook for each good, non-404 manual read. */
+export interface SubscriberDetection {
+  onManualRead: (read: ManualRead) => void;
+  /** Manual ids of the last good read; `undefined` before the first one (cleanup prunes nothing). */
+  listedIds: () => ReadonlySet<number> | undefined;
+}
+
+export function createSubscriberDetection(deps: SubscriberDetectionDeps): SubscriberDetection {
+  let listed: ReadonlySet<number> | undefined;
+  return {
+    listedIds: () => listed,
+    onManualRead: (read) => {
+      listed = read.listedIds;
+      const { store } = deps;
+      try {
+        if (store.metaValue("manual_baseline_at") === undefined) {
+          const seeded = detectManualEvents(read.incidents, () => false);
+          store.seedEvents(
+            seeded.map((e) => ({ key: e.key, manualId: e.incident.id })),
+            read.nowMs,
+          );
+        } else {
+          const found = detectManualEvents(read.incidents, (key) => store.hasEvent(key));
+          store.addPendingEvents(
+            found.map((e) => ({
+              key: e.key,
+              manualId: e.incident.id,
+              payload: JSON.stringify(incidentPayload(e)),
+            })),
+            read.nowMs,
+          );
+        }
+      } catch (err) {
+        deps.logError?.("subscriber detection could not write the store", {
+          error: err instanceof Error ? err.name : "unknown",
+        });
+        return;
+      }
+      deps.onDetected?.();
+      deps.wake();
+    },
+  };
+}
+
+export interface IncidentWorkerDeps {
+  store: SubscriberStore;
+  guard: MailboxGuard;
+  sendMail: SendMail;
+  smtp: Omit<SmtpOptions, "timeoutMs" | "signal">;
+  /** `min(PULSE_NOTIFY_TIMEOUT_MS, 60000)` (D12). */
+  timeoutMs: number;
+  mail: { from: string; subjectPrefix: string; statusUrl: string };
+  /** The HMAC key (64 hex) of the unsubscribe links. */
+  key: string;
+  now: () => number;
+  sleep: Sleep;
+  /** `PULSE_NOTIFY_RETRY_ATTEMPTS`; `0` means 12 passes. */
+  retryAttempts: number;
+  retryDelayMs: number;
+  retryMaxDelayMs: number;
+  /** Each settled attempt: `pulse_notify_subscriber_mails_total{kind="incident"}`. */
+  onOutcome?: (outcome: MailOutcome) => void;
+  logError?: (message: string, fields?: Record<string, unknown>) => void;
+}
+
+/** Passes per event when `PULSE_NOTIFY_RETRY_ATTEMPTS` is 0, so one address never holds the queue. */
+export const UNLIMITED_PASSES = 12;
+
+type SendResult = "sent" | "failed" | "retry" | "stopped";
+
+/**
+ * Worker 2 (R5 "Fan-out"): one pending event at a time, ordered by `detected_at` and `key`. The
+ * pass count and the next pass time are stored, so a restart never resets the pass budget.
+ */
+export class IncidentWorker {
+  readonly #deps: IncidentWorkerDeps;
+  #isStopping = false;
+  #wake: () => void = () => {};
+  #isWoken = false;
+  readonly #stop = new AbortController();
+  #loop: Promise<void> | undefined;
+
+  constructor(deps: IncidentWorkerDeps) {
+    this.#deps = deps;
+  }
+
+  get #passLimit(): number {
+    return this.#deps.retryAttempts === 0 ? UNLIMITED_PASSES : this.#deps.retryAttempts;
+  }
+
+  start(): void {
+    this.#loop ??= this.#run();
+  }
+
+  /** New pending events were committed. */
+  wake(): void {
+    this.#isWoken = true;
+    this.#wake();
+  }
+
+  /** Aborts the sleep, the mailbox wait and the send in flight; the event stays `pending`. */
+  async stop(): Promise<void> {
+    this.#isStopping = true;
+    this.#stop.abort();
+    this.#wake();
+    await this.#loop;
+  }
+
+  get #isOver(): boolean {
+    return this.#isStopping || this.#deps.guard.isStopped();
+  }
+
+  async #run(): Promise<void> {
+    while (!this.#isOver) {
+      this.#isWoken = false;
+      let next: EventRow | undefined;
+      try {
+        next = this.#deps.store.pendingEvents()[0];
+        if (next !== undefined) await this.#runEvent(next.key);
+      } catch (err) {
+        this.#deps.logError?.("incident worker could not use the store", {
+          error: err instanceof Error ? err.name : "unknown",
+        });
+        await this.#sleep(Math.max(1, this.#deps.retryDelayMs));
+        continue;
+      }
+      if (next === undefined) await this.#waitWake();
+    }
+  }
+
+  async #waitWake(): Promise<void> {
+    if (this.#isWoken || this.#isOver) return;
+    await new Promise<void>((resolve) => {
+      this.#wake = resolve;
+    });
+    this.#wake = () => {};
+  }
+
+  async #sleep(ms: number): Promise<void> {
+    // Deliberately ignored: an aborted sleep only means stop.
+    await this.#deps.sleep(ms, this.#stop.signal).catch(() => {});
+  }
+
+  /** Steps 1-4 of R5 "Pass budget" for one event, until it is `done` or the worker stops. */
+  async #runEvent(key: string): Promise<void> {
+    const { store } = this.#deps;
+    while (!this.#isOver) {
+      const event = store.event(key);
+      if (event?.status !== "pending") return;
+      if (event.passes >= this.#passLimit) {
+        store.finalizeEvent(key, this.#deps.now());
+        return;
+      }
+      const now = this.#deps.now();
+      if (event.nextPassAt !== null && now < event.nextPassAt) {
+        await this.#sleep(event.nextPassAt - now);
+        continue;
+      }
+      const passes = store.startPass(key);
+      const payload = parsePayload(event.payload);
+      if (payload === undefined) {
+        // An event without a readable payload can never be sent; it must not hold the queue.
+        this.#deps.logError?.("incident event has no readable payload; skipped");
+        store.finalizeEvent(key, this.#deps.now());
+        return;
+      }
+      await this.#runPass(event, payload, passes);
+      if (this.#isOver) return;
+      if (store.eligibleIds(key, "", 1).length === 0) {
+        store.markDone(key, this.#deps.now());
+        return;
+      }
+      const { retryDelayMs, retryMaxDelayMs } = this.#deps;
+      store.setNextPassAt(
+        key,
+        this.#deps.now() + retryDelay(passes, retryDelayMs, retryMaxDelayMs),
+      );
+    }
+  }
+
+  /** One pass: every eligible id, in pages of 100 by id, one send at a time. */
+  async #runPass(event: EventRow, payload: IncidentPayload, passes: number): Promise<void> {
+    let after = "";
+    for (;;) {
+      const ids = this.#deps.store.eligibleIds(event.key, after);
+      for (const id of ids) {
+        if (this.#isOver) return;
+        await this.#sendTo(event, payload, passes, id);
+      }
+      const last = ids.at(-1);
+      if (last === undefined || ids.length < ELIGIBLE_PAGE_SIZE) return;
+      after = last;
+    }
+  }
+
+  /** Reads the row, takes the mailbox and starts the send in one synchronous step (D12, D20). */
+  async #sendTo(
+    event: EventRow,
+    payload: IncidentPayload,
+    passes: number,
+    id: string,
+  ): Promise<void> {
+    const { store, guard } = this.#deps;
+    while (!this.#isOver) {
+      const row = store.subscriptionById(id);
+      if (row?.state !== "confirmed") return;
+      const key = guard.key(row.email);
+      const owner = guard.tryAcquire(key);
+      if (owner === undefined) {
+        // Only the row id and the key are held while another send to this mailbox is open.
+        await guard.waitFor(key, this.#stop.signal);
+        continue;
+      }
+      const result = await this.#attempt(event, payload, row, key, owner);
+      const status = result === "sent" || result === "failed" ? result : undefined;
+      if (status !== undefined) {
+        store.completeDelivery({
+          eventKey: event.key,
+          subscriptionId: id,
+          status,
+          attempts: passes,
+          at: this.#deps.now(),
+        });
+      }
+      return;
+    }
+  }
+
+  async #attempt(
+    event: EventRow,
+    payload: IncidentPayload,
+    row: SubscriptionRow,
+    key: string,
+    owner: number,
+  ): Promise<SendResult> {
+    const d = this.#deps;
+    const message = incidentMessage({
+      ...d.mail,
+      address: row.email,
+      id: row.id,
+      eventKey: event.key,
+      payload,
+      unsubscribeToken: unsubscribeToken(row.id, d.key),
+      date: new Date(d.now()),
+    });
+    try {
+      const result = await d.sendMail(
+        { ...d.smtp, timeoutMs: d.timeoutMs, signal: this.#stop.signal },
+        message,
+      );
+      const isAccepted = result.accepted.length > 0;
+      d.onOutcome?.(isAccepted ? "success" : "failure");
+      return isAccepted ? "sent" : "failed";
+    } catch (err) {
+      if (this.#isStopping) return "stopped";
+      d.onOutcome?.("failure");
+      return isPermanent(err) ? "failed" : "retry";
+    } finally {
+      d.guard.release(key, owner);
+    }
   }
 }

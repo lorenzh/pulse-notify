@@ -16,6 +16,8 @@ export interface MailboxGuard {
   size: () => number;
   /** No `tryAcquire` succeeds after this. */
   stop: () => void;
+  /** True after `stop`; a worker then ends instead of waiting for a key it can never take. */
+  isStopped: () => boolean;
 }
 
 interface Entry {
@@ -63,5 +65,6 @@ export function createMailboxGuard(salt: Buffer = randomBytes(32)): MailboxGuard
     stop: () => {
       isStopping = true;
     },
+    isStopped: () => isStopping,
   };
 }
