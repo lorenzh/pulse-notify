@@ -153,6 +153,8 @@ export class SubscriberStore {
   readonly #db: Database;
   readonly #logger: StoreLogger | undefined;
   #needsCheckpoint = false;
+  #depth = 0;
+  #isCheckpointDeferred = false;
 
   private constructor(db: Database, logger: StoreLogger | undefined) {
     this.#db = db;
@@ -205,7 +207,20 @@ export class SubscriberStore {
 
   /** Runs `fn` in one transaction; the operations of R5 compose the methods below with it. */
   transaction<T>(fn: () => T): T {
-    return this.#db.transaction(fn)();
+    this.#depth += 1;
+    let result: T;
+    try {
+      result = this.#db.transaction(fn)();
+    } finally {
+      this.#depth -= 1;
+    }
+    // A checkpoint inside an open transaction fails with SQLITE_LOCKED, so it waits for the
+    // outermost commit. A rollback throws above and leaves the request for the next cleanup.
+    if (this.#depth === 0 && this.#isCheckpointDeferred) {
+      this.#isCheckpointDeferred = false;
+      this.checkpoint();
+    }
+    return result;
   }
 
   subscriptionByEmail(email: string): SubscriptionRow | undefined {
@@ -477,6 +492,11 @@ export class SubscriberStore {
 
   /** `wal_checkpoint(TRUNCATE)`; false and a warning (no address) when it was busy. */
   checkpoint(): boolean {
+    if (this.#depth > 0) {
+      this.#isCheckpointDeferred = true;
+      this.#needsCheckpoint = true;
+      return false;
+    }
     const r = this.#db.query<{ busy: number }, []>("PRAGMA wal_checkpoint(TRUNCATE)").get();
     const isDone = r?.busy === 0;
     this.#needsCheckpoint = !isDone;

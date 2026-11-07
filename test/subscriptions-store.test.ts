@@ -475,3 +475,35 @@ describe("cleanup", () => {
     assert.equal(countRows(path, "SELECT count(*) AS n FROM subscriptions"), 1);
   });
 });
+
+describe("deletion inside an enclosing transaction", () => {
+  const cases: { name: string; remove: (s: SubscriberStore) => void }[] = [
+    { name: "deleteSubscription", remove: (s) => assert.equal(s.deleteSubscription("A"), true) },
+    { name: "deleteByEmail", remove: (s) => assert.equal(s.deleteByEmail("a@example.com"), 1) },
+    {
+      name: "cleanup",
+      remove: (s) =>
+        assert.deepEqual(s.cleanup({ now: 10 * DAY, retentionMs: DAY, listedIds: undefined }), [
+          "A",
+        ]),
+    },
+  ];
+  for (const c of cases) {
+    test(`${c.name} composes with a replacement insert and checkpoints after commit`, () => {
+      const s = openStore();
+      s.insertPending({ id: "A", email: "a@example.com", now: 1, digest: "d-A", expiresAt: 2 });
+      s.transaction(() => {
+        c.remove(s);
+        s.insertPending({
+          id: "B",
+          email: "a@example.com",
+          now: 10 * DAY,
+          digest: "d-B",
+          expiresAt: 11 * DAY,
+        });
+      });
+      assert.equal(s.subscriptionByEmail("a@example.com")?.id, "B");
+      assert.equal(walSize(), 0);
+    });
+  }
+});
