@@ -127,7 +127,10 @@ test("security: compressed and chunked oversized bodies fail on all feeds", asyn
     for (const compressedCase of [true, false]) {
       isCompressed = compressedCase;
       for (const read of readers) {
-        await assert.rejects(read({ baseUrl: url, maxBytes: 512 }), /larger than 512 bytes/);
+        const expected = compressedCase
+          ? /content-encoding is not supported/
+          : /larger than 512 bytes/;
+        await assert.rejects(read({ baseUrl: url, maxBytes: 512 }), expected);
       }
     }
     console.log("security limits: gzip and chunked x 3 feeds rejected above 512 decoded bytes");
