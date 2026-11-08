@@ -834,8 +834,9 @@ interface LoopDeps {
 
 /**
  * Polls the channel file and the database channels, installs the effective set, and reports
- * after every attempt plus at most every `REPORT_HEARTBEAT_MS`. Without a token it only re-reads
- * the file.
+ * after every attempt plus at least every `REPORT_HEARTBEAT_MS`, measured from start to start.
+ * Reports run one at a time: a report due while one is in flight waits, and all waiting reports
+ * are sent as one follow-up built when it starts. Without a token it only re-reads the file.
  */
 function startChannelLoop(sources: ChannelSources, deps: LoopDeps): ChannelLoop {
   const { sync, service } = sources;
@@ -843,7 +844,8 @@ function startChannelLoop(sources: ChannelSources, deps: LoopDeps): ChannelLoop 
   let cancelPoll: (() => void) | undefined;
   let cancelBeat: (() => void) | undefined;
   let running: Promise<void> | undefined;
-  const beats = new Set<Promise<void>>();
+  let inFlight: Promise<void> | undefined;
+  let followUp: Promise<void> | undefined;
   const report = async (): Promise<void> => {
     if (service === undefined) return;
     const view = sync.state();
@@ -871,9 +873,35 @@ function startChannelLoop(sources: ChannelSources, deps: LoopDeps): ChannelLoop 
       deps.logger.warn("service report failed", errorFields(err));
     }
   };
+  /** Starts a report in the free slot; the promise never rejects. */
+  const startReport = (): Promise<void> => {
+    const sent: Promise<void> = report()
+      .catch((err: unknown) => {
+        deps.logger.warn("service report failed", errorFields(err));
+      })
+      .finally(() => {
+        if (inFlight === sent) inFlight = undefined;
+      });
+    inFlight = sent;
+    return sent;
+  };
+  /** Starts a report, or joins the one follow-up that waits for the report in flight. */
+  const requestReport = (): Promise<void> => {
+    // After stop no report starts, also when a poll that began before stop ends now.
+    if (service === undefined || !isRunning) return Promise.resolve();
+    const current = inFlight;
+    if (current === undefined) return startReport();
+    followUp ??= current.then(() => {
+      followUp = undefined;
+      // A stop drops the waiting report; its callers resolve without a send.
+      if (!isRunning) return;
+      return inFlight ?? startReport();
+    });
+    return followUp;
+  };
   const cycle = async (): Promise<void> => {
     await sync.poll();
-    await report();
+    await requestReport();
   };
   const nextPoll = (ms: number): void => {
     if (!isRunning) return;
@@ -887,11 +915,9 @@ function startChannelLoop(sources: ChannelSources, deps: LoopDeps): ChannelLoop 
   const nextBeat = (): void => {
     if (!isRunning || service === undefined) return;
     cancelBeat = deps.schedule(() => {
-      const beat = report().finally(() => {
-        beats.delete(beat);
-        nextBeat();
-      });
-      beats.add(beat);
+      // The next tick is armed before the report, so a slow report never stretches the cadence.
+      nextBeat();
+      void requestReport();
     }, REPORT_HEARTBEAT_MS);
   };
   return {
@@ -905,8 +931,8 @@ function startChannelLoop(sources: ChannelSources, deps: LoopDeps): ChannelLoop 
       isRunning = false;
       cancelPoll?.();
       cancelBeat?.();
-      // A heartbeat report in flight must end before the ledger closes and the lock is released.
-      await Promise.all([running, ...beats]);
+      // A report in flight must end before the ledger closes and the lock is released.
+      await Promise.all([running, inFlight, followUp]);
     },
   };
 }
