@@ -87,11 +87,12 @@ test("security remote: GET POST PUT bound decoded chunked and gzip answers", asy
     for (const compressed of [false, true]) {
       isGzip = compressed;
       const opts = { baseUrl, token: TOKEN };
-      await assert.rejects(getService(opts, "service/notify/channels", accept), /1048576 bytes/);
+      const expected = compressed ? /content-encoding is not supported/ : /1048576 bytes/;
+      await assert.rejects(getService(opts, "service/notify/channels", accept), expected);
       for (const method of ["POST", "PUT"] as const) {
         const result = await sendService(opts, method, "service/notify/report", {}, accept);
         assert.equal(result.ok, false);
-        if (!result.ok) assert.equal(result.error.kind, "too-large");
+        if (!result.ok) assert.equal(result.error.kind, compressed ? "network" : "too-large");
       }
     }
   } finally {
