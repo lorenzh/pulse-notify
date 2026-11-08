@@ -887,7 +887,8 @@ function startChannelLoop(sources: ChannelSources, deps: LoopDeps): ChannelLoop 
   };
   /** Starts a report, or joins the one follow-up that waits for the report in flight. */
   const requestReport = (): Promise<void> => {
-    if (service === undefined) return Promise.resolve();
+    // After stop no report starts, also when a poll that began before stop ends now.
+    if (service === undefined || !isRunning) return Promise.resolve();
     const current = inFlight;
     if (current === undefined) return startReport();
     followUp ??= current.then(() => {

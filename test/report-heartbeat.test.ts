@@ -84,6 +84,7 @@ async function withService(
   pollMs: number,
   answer: Answer,
   body: (h: Harness) => Promise<void>,
+  channelsAnswer?: (time: number) => Promise<Response> | undefined,
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "notify-report-heartbeat-"));
   const clock = new VirtualClock();
@@ -96,6 +97,8 @@ async function withService(
     (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const url = String(input instanceof Request ? input.url : input);
       if (!url.includes("service/notify/report")) {
+        const held = channelsAnswer?.(clock.time);
+        if (held !== undefined) return held;
         return Promise.resolve(
           Response.json({ revision: REVISION, channels: [] }, { headers: { etag: '"r1"' } }),
         );
@@ -247,4 +250,27 @@ test("7: stop drops the waiting report and waits for the one in flight", async (
     assert.equal(h.maxConcurrency(), 1);
     assert.equal(h.clock.loopTimersAfterStop, 0);
   });
+});
+
+test("8: a channel poll that ends after stop starts no report", async () => {
+  const held = Promise.withResolvers<Response>();
+  const channels = (time: number): Promise<Response> | undefined =>
+    time === 53_000 ? held.promise : undefined;
+  await withService(
+    53_000,
+    after(0),
+    async (h) => {
+      await h.clock.advanceTo(53_000);
+      const stopped = h.stop();
+      await drain();
+      held.resolve(
+        Response.json({ revision: REVISION, channels: [] }, { headers: { etag: '"r1"' } }),
+      );
+      await stopped;
+      await h.clock.advanceTo(600_000);
+      assert.deepEqual(h.starts, [0]);
+      assert.equal(h.clock.loopTimersAfterStop, 0);
+    },
+    channels,
+  );
 });
